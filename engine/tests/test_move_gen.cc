@@ -1110,6 +1110,7 @@ TEST(SearchConfigTest, ProgressiveWideningScheduleIsExplicit) {
     SearchParams::RuntimeConfig config;
     config.pwCoefficient = 1.0f;
     config.rootPwCoefficient = 4.0f;
+    config.pwExponent = 0.4f;
 
     EXPECT_EQ(SearchParams::get_allowed_children(
                   1000, config.pwCoefficient, config.pwExponent), 16);
@@ -1399,8 +1400,10 @@ TEST(NodeTest, AtomicVirtualLossDivertsNextSelection) {
     auto& [secondChild, secondIdx, secondReserved, secondPending] = secondSelection;
     ASSERT_NE(firstChild, nullptr);
     ASSERT_NE(secondChild, nullptr);
-    EXPECT_EQ(firstIdx, 0);
-    EXPECT_EQ(secondIdx, 1);
+    // Which child goes first depends on FPU and cpuct defaults; the property
+    // under test is that the first selection's virtual loss diverts the second.
+    EXPECT_TRUE(firstIdx == 0 || firstIdx == 1);
+    EXPECT_EQ(secondIdx, 1 - firstIdx);
     EXPECT_TRUE(firstReserved);
     EXPECT_TRUE(secondReserved);
     EXPECT_EQ(firstPending, nullptr);

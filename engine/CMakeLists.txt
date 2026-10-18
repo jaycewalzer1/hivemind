@@ -60,7 +60,10 @@ if(HIVEMIND_FAST_BUILD OR MSVC)
     endif()
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 else()
-    list(APPEND HIVEMIND_COMMON_FLAGS -Ofast -flto)
+    # Search seeds argmax scans with -infinity and uses infinity as a solver
+    # sentinel; -ffinite-math-only (part of -Ofast) lets Clang fold those
+    # comparisons away, which starves MCTS selection.
+    list(APPEND HIVEMIND_COMMON_FLAGS -Ofast -fno-finite-math-only -flto)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()

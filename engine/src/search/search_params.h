@@ -3,6 +3,14 @@
 #include <cmath>
 #include <cstdint>
 
+// Selection seeds argmax scans with -infinity and the solver ranks proven
+// losses as +infinity. Under -ffinite-math-only (implied by -Ofast/-ffast-math)
+// the compiler may fold those comparisons away; on Clang that leaves MCTS
+// selection unable to pick any child.
+#if defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__
+#error "Search requires IEEE infinities: build with -fno-finite-math-only"
+#endif
+
 /**
  * @file search_params.h
  * @brief Centralized search hyperparameters for MCGS tuning.
