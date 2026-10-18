@@ -7,7 +7,7 @@ import uuid
 
 from hivemind.domain.board import BughouseBoard
 from hivemind.domain.board2planes import board2planes
-from hivemind.domain.move2planes import mirrorMoveUCI, make_map
+from hivemind.domain.move2planes import make_label_index, policy_label
 from hivemind.constants import NUM_BUGHOUSE_CHANNELS, NUM_BUGHOUSE_CHANNELS_PER_BOARD
 from hivemind.data.game_reader import process_parquet_file
 
@@ -98,7 +98,7 @@ def generate_planes(
     seed=42,
     max_samples=None,
 ):
-    label_to_index = {label: index for index, label in enumerate(make_map())}
+    label_to_index = make_label_index()
     data_dir = 'data'
     if games_path is None:
         games_path = os.path.join(data_dir, 'games.parquet')
@@ -166,11 +166,7 @@ def generate_planes(
                     current_action["ply_index"] = ply_index
 
                 # Canonicalize the move
-                move_uci = move.uci()
-                if side == chess.BLACK:
-                    move_uci = mirrorMoveUCI(move_uci)
-                if len(move_uci) == 5 and move_uci[-1] != 'n':
-                    move_uci = move_uci[:-1]
+                move_uci = policy_label(board.boards[board_num], move)
 
                 # Store the move in the buffer for the correct board
                 current_action["moves"][board_num] = move_uci

@@ -77,6 +77,36 @@ def mirrorMove(move):
     )
 
 
+def policy_label(board, move):
+    """Policy label for ``move`` on ``board`` (the position before the move).
+
+    Matches the engine's get_fast_policy_index: castling is encoded king to
+    rook square (e1h1/e1a1, as Fairy-Stockfish stores it), Black's moves are
+    mirrored, and queen promotions drop their suffix.
+    """
+    if board.is_castling(move):
+        label = board.uci(move, chess960=True)
+    else:
+        label = move.uci()
+    if board.turn == chess.BLACK:
+        label = mirrorMoveUCI(label)
+    if len(label) == 5 and label[-1] != 'n':
+        label = label[:-1]
+    return label
+
+
+def make_label_index():
+    """Label -> policy index, keeping each label's first slot.
+
+    make_map() repeats 'pass' across the first 64 slots; the engine and
+    self-play data use slot 0.
+    """
+    label_to_index = {}
+    for index, label in enumerate(make_map()):
+        label_to_index.setdefault(label, index)
+    return label_to_index
+
+
 def make_map():
     moves = []
 
