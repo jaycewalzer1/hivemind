@@ -98,6 +98,10 @@ class BughouseBoard(object):
             partner_pocket.add(captured)
 
         board.push(move)
+        if move.drop == chess.PAWN:
+            # A pawn drop is a pawn move: the engine (Fairy-Stockfish) resets
+            # the fifty-move counter, python-chess does not.
+            board.halfmove_clock = 0
         if is_capture:
             opponent_pocket = board.pockets[not board.turn]
             opponent_pocket.remove(captured)

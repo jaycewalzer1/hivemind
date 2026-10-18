@@ -34,6 +34,25 @@ def _orient_square(square: int, needs_vertical_flip: bool) -> int:
     return int(_SQUARE_FLIP_VERTICAL[square])
 
 
+def _ep_square(single_board):
+    # python-chess keeps ep_square after every double push; the engine
+    # (Fairy-Stockfish) only sets it when an en passant capture is legal.
+    return single_board.ep_square if single_board.has_legal_en_passant() else None
+
+
+def _last_move_to_square(board: BughouseBoard, board_idx: int, move: chess.Move) -> int:
+    # The engine records castling as king to rook square (e1h1/e1a1); a king
+    # that moved two files can only have castled.
+    king_square = move.to_square
+    single_board = board.boards[board_idx]
+    if (move.drop is None
+            and single_board.piece_type_at(king_square) == chess.KING
+            and abs(chess.square_file(move.from_square) - chess.square_file(king_square)) == 2):
+        rook_file = 7 if chess.square_file(king_square) > chess.square_file(move.from_square) else 0
+        return chess.square(rook_file, chess.square_rank(king_square))
+    return king_square
+
+
 def _last_move_for_board(board: BughouseBoard, board_idx: int):
     for idx in range(len(board.board_order) - 1, -1, -1):
         if board.board_order[idx] == board_idx:
@@ -113,13 +132,15 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False) -> np
         c += 1
 
     # en passant square
-    if board_a.ep_square is not None:
-        sq = board_a.ep_square
+    ep_a = _ep_square(board_a)
+    if ep_a is not None:
+        sq = ep_a
         if flip_board_a:
             sq = int(_SQUARE_FLIP_VERTICAL[sq])
         planes[24].flat[sq] = 1.0
-    if board_b.ep_square is not None:
-        sq = board_b.ep_square
+    ep_b = _ep_square(board_b)
+    if ep_b is not None:
+        sq = ep_b
         if flip_board_b:
             sq = int(_SQUARE_FLIP_VERTICAL[sq])
         planes[offset + 24].flat[sq] = 1.0
@@ -143,7 +164,7 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False) -> np
         if last_move_a.drop is None:
             sq = _orient_square(last_move_a.from_square, flip_board_a)
             planes[_LAST_MOVE_FROM_CHANNEL].flat[sq] = 1.0
-        sq = _orient_square(last_move_a.to_square, flip_board_a)
+        sq = _orient_square(_last_move_to_square(board, BOARD_A, last_move_a), flip_board_a)
         planes[_LAST_MOVE_TO_CHANNEL].flat[sq] = 1.0
 
     last_move_b = _last_move_for_board(board, BOARD_B)
@@ -151,7 +172,7 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False) -> np
         if last_move_b.drop is None:
             sq = _orient_square(last_move_b.from_square, flip_board_b)
             planes[offset + _LAST_MOVE_FROM_CHANNEL].flat[sq] = 1.0
-        sq = _orient_square(last_move_b.to_square, flip_board_b)
+        sq = _orient_square(_last_move_to_square(board, BOARD_B, last_move_b), flip_board_b)
         planes[offset + _LAST_MOVE_TO_CHANNEL].flat[sq] = 1.0
 
     # halfmove clock and repetition context
