@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
-"""Convert native HVM3-HVM5 self-play chunks to Parquet training shards."""
+"""Convert native HVM3-HVM6 self-play chunks to Parquet training shards.
+
+HVM6 (custom engine spec v2) is HVM5 plus one trailing block per sample.
+Chunk layout, little endian, no padding:
+
+    header   '<4sIHHQ'  magic b"HVM6", version 6, input channels, policy values, sample count
+    sample   the HVM5 sample unchanged: '<QIHHBBbBf' metadata, planes, policyA,
+             policyB, jointPolicy
+    trailing '<2f2B20f' (90 bytes):
+             think_gain_a, think_gain_b      float32 labels (1 = a 4x longer search
+                                             plays a different move on that board)
+             think_gain_mask_a, _mask_b      uint8, 1 = label present, 0 = absent
+                                             (the float is then ignored, written 0)
+             arrivals[20]                    float32 counts of pieces arriving within
+                                             5 s, pocket-major: ours A, theirs A,
+                                             ours B, theirs B; each P, N, B, R, Q
+
+The trailing block is present exactly when the header version is >= 6 (the
+version marker); HVM3-HVM5 chunks are read as before. Every sample becomes one
+Parquet row with the columns think_gain_a, think_gain_b, think_gain_mask_a,
+think_gain_mask_b, arrivals (20 float32 as bytes) and arrivals_mask; samples
+from older chunks carry zero labels and zero masks. An arrivals block that
+holds a NaN is treated as absent (arrivals_mask 0).
+"""
 
 import argparse
 import hashlib
@@ -17,6 +40,7 @@ from tqdm import tqdm
 from hivemind.constants import (
     NUM_BUGHOUSE_CHANNELS,
     NUM_CLOCK_BUGHOUSE_CHANNELS,
+    NUM_ELAPSED_BUGHOUSE_CHANNELS,
     NUM_MOVE_CHANNELS,
 )
 
@@ -24,8 +48,11 @@ from hivemind.constants import (
 NB_INPUT_CHANNELS = NUM_BUGHOUSE_CHANNELS
 BOARD_SIZE = 8
 NB_INPUT_VALUES = NB_INPUT_CHANNELS * BOARD_SIZE * BOARD_SIZE
-# Plane widths a chunk header may declare: 74 (stock) or 82 (clock planes).
-SUPPORTED_INPUT_CHANNELS = (NB_INPUT_CHANNELS, NUM_CLOCK_BUGHOUSE_CHANNELS)
+# Plane widths a chunk header may declare: 74 (stock), 82 (clock planes) or
+# 86 (clock and elapsed-time planes, spec v2).
+SUPPORTED_INPUT_CHANNELS = (
+    NB_INPUT_CHANNELS, NUM_CLOCK_BUGHOUSE_CHANNELS, NUM_ELAPSED_BUGHOUSE_CHANNELS,
+)
 NB_POLICY_VALUES = NUM_MOVE_CHANNELS * BOARD_SIZE * BOARD_SIZE
 HEADER = struct.Struct('<4sIHHQ')
 SAMPLE_METADATA_V3 = struct.Struct('<QIHHBBbB')
@@ -33,6 +60,17 @@ SAMPLE_METADATA_V4 = struct.Struct('<QIHHBBbBf')
 SAMPLE_METADATA = SAMPLE_METADATA_V4
 POLICY_ENTRY = struct.Struct('<Hf')
 JOINT_POLICY_ENTRY = struct.Struct('<HHf')
+# Spec v2 trailing block per sample (HVM6): see the module docstring.
+AUX_LABEL_VERSION = 6
+AUX_LABEL_MAGIC = b'HVM6'
+NB_ARRIVAL_VALUES = 20
+AUX_LABELS = struct.Struct('<2f2B20f')
+SUPPORTED_CHUNKS = {
+    b'HVM3': (3,),
+    b'HVM4': (4,),
+    b'HVM5': (5,),
+    b'HVM6': (6,),
+}
 PASS_POLICY_INDEX = NB_POLICY_VALUES
 MAX_JOINT_POLICY_ENTRIES = 256
 DEFAULT_RL_VALIDATION_FRACTION = 0.05
@@ -115,8 +153,44 @@ def empty_joint_policy() -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     )
 
 
+def empty_aux_labels() -> dict:
+    """Aux-head columns of a sample without labels (all masked)."""
+    return {
+        'think_gain_a': 0.0,
+        'think_gain_b': 0.0,
+        'think_gain_mask_a': 0,
+        'think_gain_mask_b': 0,
+        'arrivals': np.zeros(NB_ARRIVAL_VALUES, dtype=np.float32).tobytes(),
+        'arrivals_mask': 0,
+    }
+
+
+def read_aux_labels(f) -> dict:
+    """Read one HVM6 trailing block into the aux-head columns."""
+    values = AUX_LABELS.unpack(read_exact(f, AUX_LABELS.size))
+    think = values[0:2]
+    masks = values[2:4]
+    arrivals = np.asarray(values[4:], dtype=np.float32)
+    for mask in masks:
+        if mask not in (0, 1):
+            raise ValueError(f"think_gain mask byte {mask}, expected 0 or 1")
+    labels = {}
+    for board, label, mask in zip('ab', think, masks):
+        if mask and not (0.0 <= label <= 1.0):
+            raise ValueError(f"think_gain_{board} label {label} outside [0, 1]")
+        labels[f'think_gain_{board}'] = float(label) if mask else 0.0
+        labels[f'think_gain_mask_{board}'] = int(mask)
+    if np.isnan(arrivals).any():
+        labels['arrivals'] = np.zeros(NB_ARRIVAL_VALUES, dtype=np.float32).tobytes()
+        labels['arrivals_mask'] = 0
+    else:
+        labels['arrivals'] = arrivals.tobytes()
+        labels['arrivals_mask'] = 1
+    return labels
+
+
 def read_shard_channels(filepath: str | Path) -> int:
-    """Input channels declared in a chunk header (74 stock, 82 with clocks)."""
+    """Input channels declared in a chunk header (74 stock, 82 clocks, 86 v2)."""
     with open(filepath, 'rb') as f:
         _, _, channels, _, _ = HEADER.unpack(read_exact(f, HEADER.size))
     return int(channels)
@@ -127,9 +201,9 @@ def read_binary_shard(
     q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
     input_channels: int | None = None,
 ) -> list[dict]:
-    """Read one HVM3, HVM4, or HVM5 chunk and return its samples.
+    """Read one HVM3, HVM4, HVM5 or HVM6 chunk and return its samples.
 
-    The plane width comes from the chunk header and may be 74 or 82 channels.
+    The plane width comes from the chunk header and may be 74, 82 or 86 channels.
     input_channels, when given, makes any other width an error.
     """
     samples = []
@@ -138,7 +212,7 @@ def read_binary_shard(
         magic, version, channels, policy_values, num_samples = HEADER.unpack(
             read_exact(f, HEADER.size)
         )
-        if magic not in (b'HVM3', b'HVM4', b'HVM5') or version not in (3, 4, 5):
+        if version not in SUPPORTED_CHUNKS.get(magic, ()):
             raise ValueError(
                 f"Unsupported self-play chunk {filepath}: {magic!r} v{version}"
             )
@@ -195,6 +269,11 @@ def read_binary_shard(
                 if version >= 5
                 else empty_joint_policy()
             )
+            aux_labels = (
+                read_aux_labels(f)
+                if version >= AUX_LABEL_VERSION
+                else empty_aux_labels()
+            )
 
             blended_value = (1.0 - q_value_ratio) * float(outcome) + q_value_ratio * float(root_q)
 
@@ -216,6 +295,7 @@ def read_binary_shard(
                 'team': int(team),
                 'has_time_advantage': bool(has_time_advantage),
                 'search_nodes': int(nodes),
+                **aux_labels,
             })
         if f.read(1):
             raise ValueError(f"Trailing bytes in chunk {filepath}")

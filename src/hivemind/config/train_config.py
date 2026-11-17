@@ -195,6 +195,16 @@ class TrainConfig:
     info_wdl_loss_factor: str = "wdl_loss_factor defines the weighting factor for the wdl-loss."
     wdl_loss_factor: float = 0.01
 
+    info_think_gain_loss_factor: str = "think_gain_loss_factor weights the masked binary cross-entropy of the" \
+                                       " think_gain head (custom engine spec v2, B); used only where labels exist."
+    think_gain_loss_factor: float = 0.1
+    info_arrivals_loss_factor: str = "arrivals_loss_factor weights the mean squared error of the arrivals head" \
+                                     " (custom engine spec v2, C); used only where labels exist."
+    arrivals_loss_factor: float = 0.1
+    info_aux_head_labels: str = "aux_head_labels: RL batches end with (think_gain, think_gain_mask, arrivals," \
+                                " arrivals_mask); set by train_rl when the model has the spec v2 aux heads."
+    aux_head_labels: bool = False
+
     info_wd: str = "wd defines the weight decay value for regularization as a measure to prevent overfitting."
     wd: float = 1e-4
 

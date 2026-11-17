@@ -21,10 +21,20 @@ NB_POLICY_CHANNELS = 73
 NB_POLICY_VALUES = NB_POLICY_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 4672
 NB_JOINT_POLICY_VALUES = NB_POLICY_VALUES + 1  # dedicated pass action
 MAX_JOINT_POLICY_ENTRIES = 256
+NB_ARRIVAL_VALUES = 20
+ARRIVALS_PER_BOARD = NB_ARRIVAL_VALUES // 2  # ours + theirs pockets x 5 piece types
+AUX_LABEL_COLUMNS = (
+    'think_gain_a',
+    'think_gain_b',
+    'think_gain_mask_a',
+    'think_gain_mask_b',
+    'arrivals',
+    'arrivals_mask',
+)
 
 
 def infer_input_channels(encoded_planes_column) -> int:
-    """Input channels of a shard's planes: 74 (default) or 82 (clock planes).
+    """Input channels of a shard's planes: 74 (default), 82 (clock planes) or 86 (v2).
 
     An empty column keeps the default. Every row must have the same width,
     which _decode_fixed_width_binary_column checks.
@@ -108,6 +118,24 @@ def flip_bughouse_sample(x, policy_a, policy_b):
     return flipped_x, flipped_policy_a, flipped_policy_b
 
 
+def flip_aux_labels(think_gain, think_gain_mask, arrivals, arrivals_mask):
+    """Board-swap augmentation for the spec v2 aux labels.
+
+    Swapping boards A and B swaps the two think_gain entries and the two board
+    halves of arrivals (ours A, theirs A | ours B, theirs B): the B block's
+    "ours" is the partner, which becomes our seat on the new board A.
+    """
+    flipped_arrivals = torch.cat(
+        (arrivals[ARRIVALS_PER_BOARD:], arrivals[:ARRIVALS_PER_BOARD])
+    )
+    return (
+        think_gain.flip(0),
+        think_gain_mask.flip(0),
+        flipped_arrivals,
+        arrivals_mask.clone(),
+    )
+
+
 def load_parquet_shard(file_path, include_auxiliary=False):
     """
     Loads a single supervised learning parquet shard and converts it to PyTorch tensors.
@@ -152,7 +180,8 @@ def load_parquet_shard(file_path, include_auxiliary=False):
     return x_tensor, y_val_tensor, y_pol_tensor
 
 
-def load_rl_parquet_shard(file_path, include_joint_policy=False):
+def load_rl_parquet_shard(file_path, include_joint_policy=False,
+                          include_aux_labels=False):
     """
     Loads a single RL/self-play parquet shard and converts it to PyTorch tensors.
     
@@ -164,8 +193,13 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False):
     - y_wdl: int in {0, 1, 2}
     - y_moves_left: remaining team decisions
     
+    With include_aux_labels, four more tensors follow (after the joint ones):
+    think_gain (N, 2), think_gain_mask (N, 2), arrivals (N, 20) and
+    arrivals_mask (N,), all float32. A shard without those columns (converted
+    from HVM3-HVM5 chunks before spec v2) gives zero labels and zero masks.
+
     Returns:
-        x_tensor: (N, 74, 8, 8) float32 input planes
+        x_tensor: (N, C, 8, 8) float32 input planes, C = 74, 82 or 86
         y_val_tensor: (N,) float32 value targets
         policy_a_tensor: (N, 4672) float32 policy distribution for board A
         policy_b_tensor: (N, 4672) float32 policy distribution for board B
@@ -181,6 +215,9 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False):
     has_joint_policy = all(column in available_columns for column in joint_columns)
     if include_joint_policy and has_joint_policy:
         columns.extend(joint_columns)
+    has_aux_labels = all(column in available_columns for column in AUX_LABEL_COLUMNS)
+    if include_aux_labels and has_aux_labels:
+        columns.extend(AUX_LABEL_COLUMNS)
     df = pl.read_parquet(file_path, columns=columns)
 
     x_values = df['x'].to_list()
@@ -223,10 +260,13 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False):
         wdl_tensor,
         moves_left_tensor,
     )
-    if not include_joint_policy:
-        return base
-
     sample_count = len(x_tensor)
+    aux = ()
+    if include_aux_labels:
+        aux = _aux_label_tensors(df, sample_count, has_aux_labels)
+    if not include_joint_policy:
+        return base + aux
+
     if has_joint_policy:
         joint_a_array = _decode_fixed_width_binary_column(
             df['joint_policy_a'].to_list(),
@@ -261,7 +301,33 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False):
         torch.from_numpy(joint_b_array.astype(np.int64)),
         torch.from_numpy(joint_probability_array.copy()),
         joint_count,
+    ) + aux
+
+
+def _aux_label_tensors(df, sample_count, has_aux_labels):
+    """(think_gain, think_gain_mask, arrivals, arrivals_mask) float32 tensors."""
+    if not has_aux_labels:
+        return (
+            torch.zeros(sample_count, 2),
+            torch.zeros(sample_count, 2),
+            torch.zeros(sample_count, NB_ARRIVAL_VALUES),
+            torch.zeros(sample_count),
+        )
+    think_gain = torch.tensor(
+        np.stack([df['think_gain_a'].to_numpy(), df['think_gain_b'].to_numpy()], axis=1)
+        if sample_count else np.zeros((0, 2)),
+        dtype=torch.float32,
     )
+    think_gain_mask = torch.tensor(
+        np.stack([df['think_gain_mask_a'].to_numpy(), df['think_gain_mask_b'].to_numpy()], axis=1)
+        if sample_count else np.zeros((0, 2)),
+        dtype=torch.float32,
+    )
+    arrivals = torch.from_numpy(_decode_fixed_width_binary_column(
+        df['arrivals'].to_list(), dtype=np.float32, width=NB_ARRIVAL_VALUES,
+    ).copy())
+    arrivals_mask = torch.tensor(df['arrivals_mask'].to_numpy(), dtype=torch.float32)
+    return think_gain, think_gain_mask, arrivals, arrivals_mask
 
 
 class RLDataset(torch.utils.data.Dataset):
@@ -333,6 +399,7 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         augment_flip: bool = False,
         shuffle_samples: bool = True,
         include_joint_policy: bool = False,
+        include_aux_labels: bool = False,
     ):
         """
         Args:
@@ -352,6 +419,7 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         self.augment_flip = augment_flip
         self.shuffle_samples = shuffle_samples
         self.include_joint_policy = include_joint_policy
+        self.include_aux_labels = include_aux_labels
         
     def __iter__(self):
         files = self.parquet_files.copy()
@@ -362,19 +430,31 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         def iter_shard(pf):
             """Keep decoded shard tensors scoped to one exhausted generator."""
             buffer = []
-            shard = (
-                load_rl_parquet_shard(pf, include_joint_policy=True)
-                if self.include_joint_policy
-                else load_rl_parquet_shard(pf)
-            )
+            if self.include_aux_labels:
+                shard = load_rl_parquet_shard(
+                    pf,
+                    include_joint_policy=self.include_joint_policy,
+                    include_aux_labels=True,
+                )
+            elif self.include_joint_policy:
+                shard = load_rl_parquet_shard(pf, include_joint_policy=True)
+            else:
+                shard = load_rl_parquet_shard(pf)
             x, y_val, pol_a, pol_b, wdl, moves_left = shard[:6]
-            joint = shard[6:]
+            extras = shard[6:]
+            aux = ()
+            if self.include_aux_labels:
+                aux = extras[-4:]
+                extras = extras[:-4]
+            joint = extras
             
             # Add samples to buffer (both original and flipped if augmentation is enabled)
             for i in range(len(x)):
                 sample = (
                     x[i], y_val[i], pol_a[i], pol_b[i], wdl[i], moves_left[i]
-                ) + tuple(values[i] for values in joint)
+                ) + tuple(values[i] for values in joint) + tuple(
+                    values[i] for values in aux
+                )
                 if self.shuffle_samples:
                     buffer.append(sample)
                 else:
@@ -399,6 +479,10 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
                             joint[0][i],
                             joint[2][i],
                             joint[3][i],
+                        )
+                    if aux:
+                        flipped_sample += flip_aux_labels(
+                            *(values[i] for values in aux)
                         )
                     if self.shuffle_samples:
                         buffer.append(flipped_sample)

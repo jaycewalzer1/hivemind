@@ -36,7 +36,10 @@ from hivemind.training.train_util import get_metrics
 from hivemind.constants import (
     NUM_BUGHOUSE_CHANNELS,
     NUM_CLOCK_BUGHOUSE_CHANNELS,
+    NUM_ELAPSED_BUGHOUSE_CHANNELS,
 )
+
+AUX_HEAD_KEY_PREFIXES = ("think_gain_head.", "arrivals_head.")
 
 
 SUPERVISED_WEIGHTS_DIR = TRAINING_OUTPUT_DIR / "weights" / "supervised"
@@ -298,7 +301,7 @@ def train_supervised(
 
 
 def rl_parquet_input_channels(parquet_file) -> int:
-    """Input channels of an RL Parquet shard: 74 stock, 82 with clock planes."""
+    """Input channels of an RL Parquet shard: 74 stock, 82 clock planes, 86 v2."""
     first = pl.scan_parquet(parquet_file).select("x").head(1).collect()
     return infer_input_channels(first["x"].to_list())
 
@@ -314,11 +317,18 @@ def checkpoint_input_channels(state_dict) -> int | None:
     return None
 
 
+def checkpoint_has_aux_heads(state_dict) -> bool:
+    """True when the checkpoint carries the spec v2 think_gain/arrivals heads."""
+    return any(key.startswith(AUX_HEAD_KEY_PREFIXES) for key in state_dict)
+
+
 def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
              augment_flip: bool = True, architecture: str = "risev33",
              batch_size: int = None, precision: str = None,
              iteration_label: str = None, shuffle_buffer_size: int = 10000,
-             resume_training: bool = False):
+             resume_training: bool = False, aux_heads: bool | None = None,
+             joint_policy_rank: int | None = None,
+             joint_policy_loss_factor: float | None = None):
     """
     Run RL training on self-play data.
     
@@ -330,11 +340,21 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         iteration_label: Optional label for iteration (e.g. "9" or "it09")
         shuffle_buffer_size: Samples retained for shuffling within each shard
         resume_training: Restore optimizer and progress from an interrupted run
+        aux_heads: Train the spec v2 think_gain and arrivals heads. None: on
+            when the checkpoint has them, or, without a checkpoint, when the
+            data has 86 channels. Their losses only use labelled samples.
+        joint_policy_rank / joint_policy_loss_factor: override the RL config
+            (both default off, see docs in rl_train_config). The joint loss
+            needs a model with joint_factors heads AND a factor above 0.
     """
     if shuffle_buffer_size <= 0:
         raise ValueError("shuffle_buffer_size must be positive")
 
     tc = rl_train_config()
+    if joint_policy_rank is not None:
+        tc.joint_policy_rank = int(joint_policy_rank)
+    if joint_policy_loss_factor is not None:
+        tc.joint_policy_loss_factor = float(joint_policy_loss_factor)
     configure_batch_size(tc, architecture, batch_size)
     configure_precision(tc, architecture, precision, is_rl=True)
     to = TrainObjects()
@@ -388,6 +408,34 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
     if validation_samples == 0:
         raise ValueError(f"No validation samples found in {val_data_dir}")
 
+    # The input width follows the data: 74 channels (stock), 82 with clock
+    # planes, 86 with clock and elapsed planes; train and validation agree.
+    input_channels = rl_parquet_input_channels(parquet_files[0])
+    val_input_channels = rl_parquet_input_channels(val_parquet_files[0])
+    if val_input_channels != input_channels:
+        raise ValueError(
+            f"Training data has {input_channels} input channels but "
+            f"validation data has {val_input_channels}"
+        )
+
+    # Load the checkpoint first: it decides whether the aux heads are trained.
+    checkpoint = None
+    if checkpoint_path:
+        print(f"Loading checkpoint from {checkpoint_path}")
+        # Stage on CPU so a CUDA-saved checkpoint cannot create a second,
+        # transient GPU copy during deserialization.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    elif resume_training:
+        raise ValueError("resume_training requires checkpoint_path")
+    if aux_heads is None:
+        aux_heads = (
+            checkpoint_has_aux_heads(checkpoint['model_state_dict'])
+            if checkpoint is not None
+            else input_channels == NUM_ELAPSED_BUGHOUSE_CHANNELS
+        )
+    tc.aux_head_labels = bool(aux_heads)
+    print(f"Aux heads (think_gain, arrivals): {'ON' if aux_heads else 'off'}")
+
     # Stream validation one shard at a time. Dense dual-policy targets make a
     # fully materialized validation set tens of gigabytes at RL scale.
     val_dataset = StreamingRLDataset(
@@ -396,6 +444,7 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         augment_flip=augment_flip,
         shuffle_samples=False,
         include_joint_policy=tc.joint_policy_rank > 0,
+        include_aux_labels=tc.aux_head_labels,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -431,6 +480,7 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         shuffle_buffer_size=shuffle_buffer_size,
         augment_flip=augment_flip,
         include_joint_policy=tc.joint_policy_rank > 0,
+        include_aux_labels=tc.aux_head_labels,
     )
     train_loader = DataLoader(train_dataset, batch_size=tc.batch_size, num_workers=0)
     
@@ -446,29 +496,31 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
     to.lr_schedule = LinearWarmUp(cosine_schedule, start_lr=tc.min_lr, length=int(tc.total_it * 0.25))
     to.momentum_schedule = MomentumSchedule(to.lr_schedule, tc.min_lr, tc.max_lr, tc.min_momentum, tc.max_momentum)
     
-    # Load model. The input width follows the data: 74 channels (stock) or
-    # 82 with clock planes; train and validation shards must agree.
-    input_channels = rl_parquet_input_channels(parquet_files[0])
-    val_input_channels = rl_parquet_input_channels(val_parquet_files[0])
-    if val_input_channels != input_channels:
-        raise ValueError(
-            f"Training data has {input_channels} input channels but "
-            f"validation data has {val_input_channels}"
-        )
-    clock_planes = input_channels == NUM_CLOCK_BUGHOUSE_CHANNELS
-    args = get_model_args(tc, architecture, clock_planes=clock_planes)
-    print(f"Input planes: {input_channels} channels"
-          f"{' (clock planes)' if clock_planes else ''}")
+    # Load model.
+    args = get_model_args(
+        tc, architecture, input_channels=input_channels, aux_heads=aux_heads
+    )
+    layout = {
+        NUM_CLOCK_BUGHOUSE_CHANNELS: " (clock planes)",
+        NUM_ELAPSED_BUGHOUSE_CHANNELS: " (clock and elapsed planes)",
+    }.get(input_channels, "")
+    print(f"Input planes: {input_channels} channels{layout}")
     model = create_model(args)
+    joint_active = (
+        getattr(model, "joint_policy_heads", None) is not None
+        and tc.joint_policy_loss_factor > 0
+    )
+    print(
+        "Joint-policy loss: "
+        + ("ON" if joint_active else
+           f"off (joint_policy_rank={tc.joint_policy_rank}, "
+           f"joint_policy_loss_factor={tc.joint_policy_loss_factor}; it needs "
+           "joint_factors heads and a factor above 0)")
+    )
     
     # Optionally load checkpoint
-    checkpoint = None
     resume_iteration = None
-    if checkpoint_path:
-        print(f"Loading checkpoint from {checkpoint_path}")
-        # Stage on CPU so a CUDA-saved checkpoint cannot create a second,
-        # transient GPU copy during deserialization.
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint is not None:
         checkpoint_channels = checkpoint_input_channels(
             checkpoint['model_state_dict']
         )
@@ -482,9 +534,11 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
             checkpoint['model_state_dict'], strict=False
         )
         unexpected = list(incompatible.unexpected_keys)
+        # Heads the checkpoint lacks start fresh: joint heads, and the aux
+        # heads (whose output layers start at 0, so nothing else changes).
         non_joint_missing = [
             key for key in incompatible.missing_keys
-            if not key.startswith('joint_policy_heads.')
+            if not key.startswith(('joint_policy_heads.', *AUX_HEAD_KEY_PREFIXES))
         ]
         if unexpected or non_joint_missing:
             raise RuntimeError(
@@ -504,8 +558,6 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
             del checkpoint
             checkpoint = None
         print("Checkpoint loaded successfully")
-    elif resume_training:
-        raise ValueError("resume_training requires checkpoint_path")
     
     # Train with streaming RL data loader
     trainer = TrainerAgentPytorch(model, val_loader, tc, to, use_rtpt=True, 
@@ -634,6 +686,21 @@ def main():
                         help='Supervised validation Parquet shard')
     parser.add_argument('--iteration', type=str, default=None,
                         help='RL iteration label for model naming (e.g. "9" or "it09", default: auto-detected from selfplay-dir)')
+    aux_group = parser.add_mutually_exclusive_group()
+    aux_group.add_argument(
+        '--aux-heads', dest='aux_heads', action='store_true', default=None,
+        help='RL: train the spec v2 think_gain/arrivals heads (default: when '
+             'the checkpoint has them, or the data has 86 channels)')
+    aux_group.add_argument(
+        '--no-aux-heads', dest='aux_heads', action='store_false',
+        help='RL: do not train the think_gain/arrivals heads')
+    parser.add_argument(
+        '--joint-policy-rank', type=int, default=None,
+        help='RL: rank of the joint_factors heads (default 0 = none). Heads the '
+             'checkpoint lacks start from random init and change engine search.')
+    parser.add_argument(
+        '--joint-policy-loss-factor', type=float, default=None,
+        help='RL: weight of the joint-policy loss (default 0.0 = off)')
     parser.add_argument(
         '--q-value-ratio',
         type=float,
@@ -667,6 +734,9 @@ def main():
                 iteration_label=args.iteration,
                 shuffle_buffer_size=args.shuffle_buffer_size,
                 resume_training=args.resume_training,
+                aux_heads=args.aux_heads,
+                joint_policy_rank=args.joint_policy_rank,
+                joint_policy_loss_factor=args.joint_policy_loss_factor,
             )
         else:
             selfplay_path = Path(args.selfplay_dir).expanduser().resolve()
@@ -721,6 +791,9 @@ def main():
                 iteration_label=iter_label,
                 shuffle_buffer_size=args.shuffle_buffer_size,
                 resume_training=args.resume_training,
+                aux_heads=args.aux_heads,
+                joint_policy_rank=args.joint_policy_rank,
+                joint_policy_loss_factor=args.joint_policy_loss_factor,
             )
 
 

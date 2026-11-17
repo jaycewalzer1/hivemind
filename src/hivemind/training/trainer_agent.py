@@ -485,13 +485,13 @@ class TrainerAgentPytorch:
         with autocast_context(self._ctx, self.tc.mixed_precision):
             model_out = self._model(data)
         if self.tc.use_wdl and self.tc.use_plys_to_end:
-            value_out, policy_out, _, wdl_out, plys_out = model_out
+            value_out, policy_out, _, wdl_out, plys_out = model_out[:5]
             wdl_loss = self.wdl_loss(wdl_out.float(), wdl_label, sample_weights)
             ply_loss = self.ply_loss(
                 torch.flatten(plys_out.float()), plys_label, sample_weights
             )
         else:
-            value_out, policy_out = model_out
+            value_out, policy_out = model_out[:2]
         # policy_out = policy_out.softmax(dim=1)
         value_loss = self.value_loss(
             torch.flatten(value_out.float()), value_label, sample_weights
@@ -538,7 +538,9 @@ class TrainerAgentPytorch:
         self.optimizer.zero_grad()
 
         data, value_label, policy_a, policy_b, wdl_label, moves_left_label = batch[:6]
-        joint_targets = batch[6:] if len(batch) > 6 else None
+        joint_targets, aux_labels = split_rl_batch_extras(
+            batch, self.tc.aux_head_labels
+        )
         data = data.to(self._ctx)
         value_label = value_label.to(self._ctx)
         policy_a = policy_a.to(self._ctx)
@@ -547,6 +549,8 @@ class TrainerAgentPytorch:
         moves_left_label = moves_left_label.to(self._ctx)
         if joint_targets:
             joint_targets = tuple(target.to(self._ctx) for target in joint_targets)
+        if aux_labels:
+            aux_labels = tuple(label.to(self._ctx) for label in aux_labels)
         sample_weights = torch.ones(len(value_label), device=self._ctx)
 
         self.old_label = value_label
@@ -573,13 +577,14 @@ class TrainerAgentPytorch:
         moves_left_loss = self.ply_loss(
             torch.flatten(moves_left_out.float()), moves_left_label, sample_weights
         )
+        joint_factors, aux_out = split_model_extras(self._model, model_out)
         joint_loss = value_loss.new_zeros(())
-        if joint_targets and len(model_out) >= 7:
+        if joint_targets and joint_factors is not None:
             joint_loss = joint_policy_cross_entropy(
                 policy_out_1.float(),
                 policy_out_2.float(),
-                model_out[5].float(),
-                model_out[6].float(),
+                joint_factors[0].float(),
+                joint_factors[1].float(),
                 *joint_targets,
                 rank=self.tc.joint_policy_rank,
                 top_k=self.tc.joint_policy_top_k,
@@ -591,6 +596,13 @@ class TrainerAgentPytorch:
             + self.tc.plys_to_end_loss_factor * moves_left_loss
             + self.tc.joint_policy_loss_factor * joint_loss
         )
+        if aux_out is not None and aux_labels:
+            think_loss, _, arrivals_loss, _ = aux_head_losses(*aux_out, *aux_labels)
+            combined_loss = (
+                combined_loss
+                + self.tc.think_gain_loss_factor * think_loss
+                + self.tc.arrivals_loss_factor * arrivals_loss
+            )
         combined_loss.backward()
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = self.to.lr_schedule(self.cur_it)
@@ -630,11 +642,16 @@ class TrainerAgentPytorch:
         self._model.eval()
         joint_loss_sum = 0.0
         joint_loss_batches = 0
+        aux_sums = [0.0, 0.0]  # think_gain BCE * labelled boards, arrivals MSE * labelled samples
+        aux_counts = [0.0, 0.0]
+        model_has_aux = getattr(self._model, "aux_heads", False)
 
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
                 data, value_label, policy_a, policy_b, wdl_label, moves_left_label = batch[:6]
-                joint_targets = batch[6:] if len(batch) > 6 else None
+                joint_targets, aux_labels = split_rl_batch_extras(
+                    batch, self.tc.aux_head_labels
+                )
                 data = data.to(self._ctx)
                 value_label = value_label.to(self._ctx)
                 policy_a = policy_a.to(self._ctx)
@@ -654,10 +671,19 @@ class TrainerAgentPytorch:
                 policy_out = tuple(output.float() for output in policy_out)
                 wdl_out = wdl_out.float()
                 moves_left_out = moves_left_out.float()
-                if joint_targets and len(model_out) >= 7:
+                joint_factors, aux_out = split_model_extras(self._model, model_out)
+                if aux_out is not None and aux_labels:
+                    think_loss, think_count, arrivals_loss, arrivals_count = aux_head_losses(
+                        *aux_out, *(label.to(self._ctx) for label in aux_labels)
+                    )
+                    aux_sums[0] += float(think_loss) * float(think_count)
+                    aux_sums[1] += float(arrivals_loss) * float(arrivals_count)
+                    aux_counts[0] += float(think_count)
+                    aux_counts[1] += float(arrivals_count)
+                if joint_targets and joint_factors is not None:
                     joint_loss_sum += float(joint_policy_cross_entropy(
                         policy_out[0], policy_out[1],
-                        model_out[5].float(), model_out[6].float(),
+                        joint_factors[0].float(), joint_factors[1].float(),
                         *joint_targets,
                         rank=self.tc.joint_policy_rank,
                         top_k=self.tc.joint_policy_top_k,
@@ -717,8 +743,23 @@ class TrainerAgentPytorch:
                     * self.to.metrics["plys_to_end_loss"].compute()
                 + self.tc.joint_policy_loss_factor * joint_loss_value
             ),
-            "joint_policy_loss": joint_loss_value,
         }
+        # Reported only when the model has joint_factors heads: without them
+        # the joint loss cannot be computed and a 0.0000 would mislead.
+        if getattr(self._model, "joint_policy_heads", None) is not None:
+            metric_values["joint_policy_loss"] = joint_loss_value
+        if model_has_aux:
+            think_value = torch.tensor(aux_sums[0] / max(1.0, aux_counts[0]), device=self._ctx)
+            arrivals_value = torch.tensor(aux_sums[1] / max(1.0, aux_counts[1]), device=self._ctx)
+            metric_values["loss"] = (
+                metric_values["loss"]
+                + self.tc.think_gain_loss_factor * think_value
+                + self.tc.arrivals_loss_factor * arrivals_value
+            )
+            metric_values["think_gain_loss"] = think_value
+            metric_values["think_gain_labels"] = torch.tensor(aux_counts[0], device=self._ctx)
+            metric_values["arrivals_loss"] = arrivals_value
+            metric_values["arrivals_labels"] = torch.tensor(aux_counts[1], device=self._ctx)
         for metric_name in self.to.metrics:
             metric_values[metric_name] = self.to.metrics[metric_name].compute()
         return metric_values
@@ -878,6 +919,72 @@ class SoftCrossEntropyLoss(_Loss):
         elif self.reduction == 'sum':
             return torch.sum(loss)
         return torch.mean(loss)
+
+
+AUX_LABEL_FIELDS = 4  # think_gain [2], think_gain_mask [2], arrivals [20], arrivals_mask []
+
+
+def split_rl_batch_extras(batch, aux_head_labels: bool):
+    """Split an RL batch after its six base fields.
+
+    Layout: (data, value, policy_a, policy_b, wdl, moves_left), then the four
+    joint-policy targets when the loader includes them, then, when
+    aux_head_labels is set, (think_gain, think_gain_mask, arrivals,
+    arrivals_mask). Returns (joint_targets or None, aux_labels or None).
+    """
+    extras = tuple(batch[6:])
+    aux_labels = None
+    if aux_head_labels:
+        if len(extras) < AUX_LABEL_FIELDS:
+            raise ValueError("RL batch has no aux-head label fields")
+        aux_labels = extras[-AUX_LABEL_FIELDS:]
+        extras = extras[:-AUX_LABEL_FIELDS]
+    return (extras or None), aux_labels
+
+
+def split_model_extras(model, model_out):
+    """(joint factors or None, (think_gain, arrivals) or None) from a model's outputs.
+
+    Output order: value, policy, auxiliary, wdl, moves_left, then
+    joint_factors_a/b when the model has joint heads, then think_gain and
+    arrivals when it has the spec v2 aux heads.
+    """
+    index = 5
+    joint = None
+    if getattr(model, "joint_policy_heads", None) is not None:
+        joint = tuple(model_out[index:index + 2])
+        index += 2
+    aux = None
+    if getattr(model, "aux_heads", False):
+        aux = tuple(model_out[index:index + 2])
+    return joint, aux
+
+
+def aux_head_losses(think_logits: Tensor, arrivals_pred: Tensor,
+                    think_label: Tensor, think_mask: Tensor,
+                    arrivals_label: Tensor, arrivals_mask: Tensor):
+    """Masked losses of the spec v2 aux heads.
+
+    think_gain: binary cross-entropy on the logits, averaged over the boards
+    that carry a label (think_mask 1). arrivals: squared error averaged over
+    the 20 values, then over the samples that carry a label (arrivals_mask 1).
+    With no labels a loss is exactly 0 and passes no gradient.
+    Returns (think_loss, labelled boards, arrivals_loss, labelled samples).
+    """
+    think_mask = think_mask.float()
+    think_terms = nn.functional.binary_cross_entropy_with_logits(
+        think_logits.float(), think_label.float(), reduction="none"
+    ) * think_mask
+    think_count = think_mask.sum()
+    think_loss = think_terms.sum() / think_count.clamp_min(1.0)
+
+    arrivals_mask = arrivals_mask.float().reshape(-1)
+    arrivals_terms = (
+        (arrivals_pred.float() - arrivals_label.float()) ** 2
+    ).mean(dim=1) * arrivals_mask
+    arrivals_count = arrivals_mask.sum()
+    arrivals_loss = arrivals_terms.sum() / arrivals_count.clamp_min(1.0)
+    return think_loss, think_count, arrivals_loss, arrivals_count
 
 
 def joint_policy_cross_entropy(
@@ -1136,6 +1243,10 @@ def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path,
 
     if getattr(model, "joint_policy_rank", 0) > 0:
         output_names.extend(("joint_factors_a", "joint_factors_b"))
+    if getattr(model, "aux_heads", False):
+        # Spec v2: think_gain = one logit per board (A, B); arrivals = 20
+        # predicted counts (ours A, theirs A, ours B, theirs B) x (P N B R Q).
+        output_names.extend(("think_gain", "arrivals"))
 
     dynamic_axes = None
     if dynamic_batch_size:
@@ -1259,7 +1370,7 @@ def evaluate_metrics(metrics, data_iterator, model, nb_batches, ctx, phase_weigh
             with autocast_context(ctx, precision):
                 model_out = model(data)
             if use_wdl and use_plys_to_end:
-                value_out, policy_out, _, wdl_out, plys_out = model_out
+                value_out, policy_out, _, wdl_out, plys_out = model_out[:5]
                 wdl_out = wdl_out.float()
                 plys_out = plys_out.float()
                 metrics["wdl_loss"].update(preds=wdl_out, labels=wdl_label, sample_weights=sample_weights)
