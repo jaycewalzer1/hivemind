@@ -12,12 +12,15 @@ constexpr int NB_POLICY_CHANNELS = 73;
 constexpr int NB_LEGACY_INPUT_CHANNELS_PER_BOARD = 37;
 // Channels per board of a v1 clock network (37 + 4 clock planes).
 constexpr int NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 4;
+// Channels per board of a v2 clock network (41 + 2 elapsed-time planes).
+constexpr int NB_V2_CLOCK_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 6;
 #ifdef HIVEMIND_CLOCK_PLANES
-// hivemind-clock build (-DHIVEMIND_CLOCK_PLANES=ON), spec v2: four clock planes
-// (channels 37..40) and two elapsed-time planes (41..42) follow the 37 stock
-// channels of each board, 43 per board block. A v1 network (41 per board) is
-// still accepted by the ONNX Runtime backend, which drops channels 41..42.
-constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 6;
+// hivemind-clock build (-DHIVEMIND_CLOCK_PLANES=ON): four clock planes
+// (channels 37..40, spec v1), two elapsed-time planes (41..42, spec v2) and
+// the diagonal clock plane (43, spec v3) follow the 37 stock channels of each
+// board, 44 per board block. v1 (41) and v2 (43 per board) networks are still
+// accepted by the ONNX Runtime backend, which drops the trailing channels.
+constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 7;
 #else
 constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD;
 #endif
@@ -25,6 +28,14 @@ constexpr bool HAS_CLOCK_PLANES =
     NB_INPUT_CHANNELS_PER_BOARD > NB_LEGACY_INPUT_CHANNELS_PER_BOARD;
 constexpr bool HAS_ELAPSED_PLANES =
     NB_INPUT_CHANNELS_PER_BOARD > NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD;
+constexpr bool HAS_DIAGONAL_PLANE =
+    NB_INPUT_CHANNELS_PER_BOARD > NB_V2_CLOCK_INPUT_CHANNELS_PER_BOARD;
+// Scale s (seconds) of the diagonal plane tanh((t_ourA - t_oppB) / s), spec v3.
+// 15 by default; ablation builds pass -DHIVEMIND_DIAGONAL_SCALE_S=10 or 20.
+#ifndef HIVEMIND_DIAGONAL_SCALE_S
+#define HIVEMIND_DIAGONAL_SCALE_S 15
+#endif
+constexpr double DIAGONAL_PLANE_SCALE_S = HIVEMIND_DIAGONAL_SCALE_S;
 constexpr int NB_INPUT_CHANNELS = 2 * NB_INPUT_CHANNELS_PER_BOARD;
 constexpr int BOARD_HEIGHT = 8; 
 constexpr int BOARD_WIDTH = 8; 

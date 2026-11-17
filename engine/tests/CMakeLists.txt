@@ -24,6 +24,7 @@ add_executable(
   test_search_memory.cc
   test_root_scan_stop.cc
   test_custom_engine.cc
+  test_diagonal_plane.cc
 )
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
 # Tiny ONNX fixtures (tests/data/make_think_gain_fixtures.py).

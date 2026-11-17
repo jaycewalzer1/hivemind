@@ -4,7 +4,8 @@ Each graph takes `data` [batch, C, 8, 8] and has the stock heads (value, pi_a,
 pi_b, wdl_out, moves_left, all zero-valued) plus the spec v2 heads:
   think_gain [batch, 2]: logits (mean of channel 40, mean of channel C-1)
   arrivals   [batch, 20]: zeros (the engine must tolerate and ignore it)
-With C = 86 the second logit reads board B's last elapsed plane; with C = 82
+With C = 88 (spec v3) the second logit reads board B's diagonal plane, with
+C = 86 board B's last elapsed plane; with C = 82
 (a v1 clock network) it reads board B's last clock plane, which checks the
 engine packs 43-channel planes into the 41-channel layout correctly.
 
@@ -74,7 +75,7 @@ def make(channels: int, path: str, extra_heads: bool = True) -> None:
 
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
-    for channels in (74, 82, 86):
+    for channels in (74, 82, 86, 88):
         make(channels, os.path.join(here, f"think_gain_{channels}.onnx"))
-    for channels in (74, 86):
+    for channels in (74, 86, 88):
         make(channels, os.path.join(here, f"plain_{channels}.onnx"), extra_heads=False)

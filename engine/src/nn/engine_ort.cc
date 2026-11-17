@@ -88,8 +88,9 @@ struct Engine::OrtState {
     int thinkGainIdx = -1;
 
     // Channels per board the network reads. Equal to the build's
-    // NB_INPUT_CHANNELS_PER_BOARD, except a v1 clock network (41) in the
-    // 43-channel clock build, whose input drops each block's last 2 planes.
+    // NB_INPUT_CHANNELS_PER_BOARD, except a v1 (41) or v2 (43) clock network
+    // in the 44-channel clock build, whose input drops each block's trailing
+    // planes.
     int netChannelsPerBoard = NB_INPUT_CHANNELS_PER_BOARD;
     bool dynamicBatch = false;
 
@@ -184,8 +185,8 @@ bool Engine::loadNetwork(const std::string& onnxFile,
                 << std::endl;
         }
 
-        // The network's input channels: the build's layout, or a v1 clock
-        // network (41 per board) in the 43-channel clock build.
+        // The network's input channels: the build's layout, or a v1 (41 per
+        // board) or v2 (43 per board) clock network in the clock build.
         {
             const auto inputShape = state.session->GetInputTypeInfo(0)
                                         .GetTensorTypeAndShapeInfo()
@@ -199,6 +200,12 @@ bool Engine::loadNetwork(const std::string& onnxFile,
                 state.netChannelsPerBoard = NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD;
                 std::cout << "info string v1 clock network (" << channels
                           << " input channels): elapsed planes are not given to it"
+                          << std::endl;
+            } else if (HAS_DIAGONAL_PLANE
+                       && channels == 2 * NB_V2_CLOCK_INPUT_CHANNELS_PER_BOARD) {
+                state.netChannelsPerBoard = NB_V2_CLOCK_INPUT_CHANNELS_PER_BOARD;
+                std::cout << "info string v2 clock network (" << channels
+                          << " input channels): the diagonal plane is not given to it"
                           << std::endl;
             } else {
                 std::cerr << "Network expects " << channels

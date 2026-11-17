@@ -253,6 +253,30 @@ inline void set_plane_elapsed_board(PlaneData<T>& p, int boardIdx) {
     p.set_plane_to_value(static_cast<float>(1.0 - std::exp(-seconds / 2.0)));
 }
 
+// Diagonal clock plane (spec v3, 44-channel clock build): channel 43 of each
+// board block, identical in both blocks.
+//   43: tanh((t_ourA - t_oppB) / s)
+// t_ourA is teamSide's clock on board A, t_oppB the clock of our partner's
+// opponent on board B (teamSide's colour there), both clamped at 0 like the
+// clock planes; s = DIAGONAL_PLANE_SCALE_S seconds (15 unless built with
+// -DHIVEMIND_DIAGONAL_SCALE_S). Positive: we are ahead of the diagonal and may
+// sit. 0 when no clocks were given.
+inline float diagonal_plane_value(const Board& board, Stockfish::Color teamSide) {
+    const int64_t ours = std::max<int64_t>(0, board.clock_ms(BOARD_A, teamSide));
+    const int64_t diagonal = std::max<int64_t>(0, board.clock_ms(BOARD_B, teamSide));
+    return static_cast<float>(
+        std::tanh(static_cast<double>(ours - diagonal) / (1000.0 * DIAGONAL_PLANE_SCALE_S)));
+}
+
+template <typename T>
+inline void set_plane_diagonal_board(PlaneData<T>& p) {
+    if (!p.board.has_clocks()) {
+        p.increment_channel();
+        return;
+    }
+    p.set_plane_to_value(diagonal_plane_value(p.board, p.teamSide));
+}
+
 template <typename T>
 void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSide, bool hasTimeAdvantage) {
     // Initialize all to 0 using SIMD when available
@@ -292,6 +316,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     if constexpr (HAS_ELAPSED_PLANES) {
         set_plane_elapsed_board(planeData, 0);
     }
+    if constexpr (HAS_DIAGONAL_PLANE) {
+        set_plane_diagonal_board(planeData);
+    }
     
     // Process Board 1
     set_plane_pieces_board(planeData, 1);           
@@ -308,6 +335,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     }
     if constexpr (HAS_ELAPSED_PLANES) {
         set_plane_elapsed_board(planeData, 1);
+    }
+    if constexpr (HAS_DIAGONAL_PLANE) {
+        set_plane_diagonal_board(planeData);
     }
 }
 
