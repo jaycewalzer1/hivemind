@@ -11,6 +11,39 @@ NUM_BUGHOUSE_CHANNELS_PER_BOARD = (
     NUM_BASE_BUGHOUSE_CHANNELS_PER_BOARD + NUM_EXTRA_BUGHOUSE_CHANNELS_PER_BOARD
 )
 NUM_BUGHOUSE_CHANNELS = 2 * NUM_BUGHOUSE_CHANNELS_PER_BOARD
+
+# Optional clock planes (custom engine, off by default). With them every board
+# block has 41 channels: the 37 above plus four clock planes at 37..40.
+NUM_CLOCK_CHANNELS_PER_BOARD = 4
+NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD = (
+    NUM_BUGHOUSE_CHANNELS_PER_BOARD + NUM_CLOCK_CHANNELS_PER_BOARD
+)
+NUM_CLOCK_BUGHOUSE_CHANNELS = 2 * NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
+CLOCK_CHANNEL_OFFSET = NUM_BUGHOUSE_CHANNELS_PER_BOARD
+SUPPORTED_CHANNELS_PER_BOARD = (
+    NUM_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
+)
+
+
+def channels_per_board(clock_planes: bool = False) -> int:
+    """Channels in one board block: 37 by default, 41 with clock planes."""
+    return (
+        NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
+        if clock_planes
+        else NUM_BUGHOUSE_CHANNELS_PER_BOARD
+    )
+
+
+def board_channels_from_total(total_channels: int) -> int:
+    """Per-board channel count for a two-board input of total_channels."""
+    per_board, remainder = divmod(int(total_channels), 2)
+    if remainder or per_board not in SUPPORTED_CHANNELS_PER_BOARD:
+        raise ValueError(
+            f"Unsupported bughouse input with {total_channels} channels; "
+            f"expected {[2 * c for c in SUPPORTED_CHANNELS_PER_BOARD]}"
+        )
+    return per_board
 NUM_POSITIONS_PER_CHUNK = 512
 
 POLICY_LABELS = [
