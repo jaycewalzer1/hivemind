@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -4529,6 +4530,12 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         lastInternalMateProbeStats_ = {};
     }
     mateCandidateHints_.clear();
+    // Spec v3 E1: under tree clocks the time advantage is read from the
+    // clocks at every node, the root included, so plane 31 and the node keys
+    // agree with planes 37-40 all the way down.
+    teamHasTimeAdvantage = board.node_time_advantage(
+        teamSide, teamSide, teamHasTimeAdvantage);
+    lastPlayedAction_.reset();
     const auto searchStart = chrono::steady_clock::now();
     JointActionCandidate result;
     if (options.background) {
@@ -4627,6 +4634,10 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         budget.deadline = MateSearchBudget::Clock::now()
             + chrono::milliseconds(SearchParams::MATE_RACE_VETO_MAX_MS);
         budget.cancelled = &stopRequested_;
+        // Spec v3 E1: MateRacePessimism off (ablation) drops the veto.
+        if (!options.search.mateRacePessimism) {
+            return false;
+        }
         return action_loses_mate_race(
             target, action, teamSide, teamHasTimeAdvantage, &budget);
     };
@@ -4634,7 +4645,15 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     // Try to reuse tree from previous search (if enabled)
     std::shared_ptr<Node> reusedRoot = nullptr;
     if (SearchParams::ENABLE_TREE_REUSE) {
-        reusedRoot = try_reuse_tree(positionHash, teamSide, positionSignature);
+        // Spec v3 E1: retained candidates are filed under a key without the
+        // clocks, which the next real search never reproduces exactly.
+        reusedRoot = try_reuse_tree(
+            board.reuse_key(teamSide, teamHasTimeAdvantage), teamSide,
+            positionSignature);
+        if (reusedRoot) {
+            refresh_reused_subtree(reusedRoot, board, teamSide,
+                                   teamHasTimeAdvantage, positionHash);
+        }
     }
     if (reusedRoot && mustPlayDespiteTeamMate
         && reusedRoot->get_node_type() == NodeType::LOSS) {
@@ -6241,11 +6260,48 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             
             result = rootNode->get_joint_action(bestIdx);
 
+            // Spec v3 E3 MoveTemperaturePermille: an unsolved root plays an
+            // action drawn with probability visits^(1/T), never one the
+            // solver proved lost when an alternative exists.
+            if (options.search.moveTemperature > 0.0f && !options.background
+                && rootNode->get_node_type() == NodeType::UNSOLVED) {
+                const size_t generated = std::min(
+                    numChildren, rootNode->get_num_generated());
+                bool hasNonLosing = false;
+                for (size_t i = 0; i < generated; ++i) {
+                    if (visits[i] > 0 && children[i]
+                        && children[i]->get_node_type() != NodeType::WIN) {
+                        hasNonLosing = true;
+                    }
+                }
+                std::vector<double> weights(generated, 0.0);
+                double total = 0.0;
+                const double inverseT =
+                    1.0 / static_cast<double>(options.search.moveTemperature);
+                for (size_t i = 0; i < generated; ++i) {
+                    if (visits[i] <= 0 || !children[i]
+                        || (hasNonLosing
+                            && children[i]->get_node_type() == NodeType::WIN)) {
+                        continue;
+                    }
+                    weights[i] = std::pow(static_cast<double>(visits[i]), inverseT);
+                    total += weights[i];
+                }
+                if (total > 0.0 && std::isfinite(total)) {
+                    std::mt19937_64 sampler(options.search.moveTemperatureSeed);
+                    std::discrete_distribution<size_t> pick(
+                        weights.begin(), weights.end());
+                    result = rootNode->get_joint_action(
+                        static_cast<int>(pick(sampler)));
+                }
+            }
+
             // A win the tree proved during this search answers to the same
             // test the scans above passed. The proof is what put this action
             // ahead of the rest, so when the race is lost the move is the best
             // of the alternatives the search actually looked at.
             if (const std::optional<JointActionCandidate> safer =
+                    !options.search.mateRacePessimism ? std::nullopt :
                     race_safe_alternative(
                         board, *rootNode, teamSide, teamHasTimeAdvantage,
                         options.search.qVetoDelta, options.search.qValueWeight,
@@ -6479,6 +6535,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             nextRootCandidates_.clear();
             retain_reuse_candidates(rootNode, board, teamHasTimeAdvantage);
         } else {
+            // A move drawn with a temperature is not the best child, and the
+            // subtree worth keeping is the one below the move played.
+            lastPlayedAction_ = result;
             store_next_root_candidates(board, teamHasTimeAdvantage);
         }
         lastSearchHash_ = board.search_hash_key(
@@ -6538,13 +6597,16 @@ void Agent::run_permanent_brain(Board& board, const vector<Engine*>& engines,
     }
 }
 
-vector<RootEdgeStats> Agent::root_edge_stats() const {
+vector<RootEdgeStats> Agent::root_edge_stats(bool raw) const {
     vector<RootEdgeStats> stats;
     if (!rootNode || !rootNode->is_expanded()) {
         return stats;
     }
 
-    const auto visits = rootNode->get_child_visits();
+    // Spec v3 E3: forced pass playouts are pruned back out of the policy
+    // target (a no-op unless pass exploration is on).
+    const auto visits = raw ? rootNode->get_child_visits()
+                            : rootNode->get_policy_target_visits(lastRuntimeConfig_);
     const size_t edgeCount = min(visits.size(), rootNode->get_num_generated());
     stats.reserve(edgeCount);
     for (size_t index = 0; index < edgeCount; ++index) {
@@ -6929,6 +6991,56 @@ std::string Agent::board_signature(Board& board) {
     return board.fen(BOARD_A) + "|" + board.fen(BOARD_B);
 }
 
+void Agent::refresh_reused_subtree(const std::shared_ptr<Node>& reusedRoot,
+                                   Board& board,
+                                   Stockfish::Color rootTeam,
+                                   bool rootTeamHasTimeAdvantage,
+                                   uint64_t rootHash) {
+    if (!reusedRoot || !board.clocks_affect_search()) {
+        return;
+    }
+    // Clocks are part of every node key, and the retained keys hold the
+    // clocks the earlier tree predicted. Walk the subtree from the real root
+    // clocks and key every node again, so reindex_reused_subtree files the
+    // nodes where this search will look for them. Under tree clocks a flag
+    // or sit-off proved on the predicted clocks need not hold on these, so
+    // when the clocks moved the solver verdicts are dropped as well.
+    const bool resetSolver = board.tree_clocks_active()
+        && reusedRoot->get_hash() != rootHash;
+    std::unordered_set<const Node*> visited;
+    std::function<void(Node*)> walk = [&](Node* node) {
+        if (!node || visited.size() >= SearchParams::TREE_REUSE_REINDEX_MAX_NODES
+            || !visited.insert(node).second) {
+            return;
+        }
+        if (resetSolver) {
+            node->reset_solver_state();
+        }
+        if (node->get_hash() != 0) {
+            const Stockfish::Color team = node->get_team_to_play();
+            node->set_hash(board.search_hash_key(
+                team, board.node_time_advantage(
+                          team, rootTeam, rootTeamHasTimeAdvantage)));
+        }
+        if (!node->is_expanded()) {
+            return;
+        }
+        const auto children = node->get_children();
+        const size_t generated = std::min(children.size(), node->get_num_generated());
+        for (size_t index = 0; index < generated; ++index) {
+            if (!children[index]) {
+                continue;
+            }
+            const JointActionCandidate action =
+                node->get_joint_action(static_cast<int>(index));
+            board.make_moves(action.moveA, action.moveB);
+            walk(children[index].get());
+            board.unmake_moves(action.moveA, action.moveB);
+        }
+    };
+    walk(reusedRoot.get());
+}
+
 void Agent::reindex_reused_subtree(const std::shared_ptr<Node>& reusedRoot) {
     if (!transpositionTable || !reusedRoot) {
         return;
@@ -7020,6 +7132,20 @@ void Agent::store_next_root_candidates(Board& board,
         }
     }
     
+    if (lastPlayedAction_) {
+        const size_t generated = std::min(
+            children.size(), rootNode->get_num_generated());
+        for (size_t index = 0; index < generated; ++index) {
+            const JointActionCandidate action =
+                rootNode->get_joint_action(static_cast<int>(index));
+            if (action.moveA == lastPlayedAction_->moveA
+                && action.moveB == lastPlayedAction_->moveB) {
+                bestIdx = static_cast<int>(index);
+                break;
+            }
+        }
+    }
+
     if (bestIdx < 0 || static_cast<size_t>(bestIdx) >= children.size()) {
         return;
     }
@@ -7085,7 +7211,9 @@ void Agent::retain_reuse_level(const std::shared_ptr<Node>& node,
     }
 
     if (depth == level) {
-        const uint64_t positionHash = board.search_hash_key(
+        // The reuse key (spec v3 E1): the search key itself unless clocks are
+        // in it, in which case the predicted clocks are left out.
+        const uint64_t positionHash = board.reuse_key(
             node->get_team_to_play(), teamHasTimeAdvantage);
         // Shallower levels run first, so a transposition already indexed keeps
         // the shallower node, whose signature is already built.

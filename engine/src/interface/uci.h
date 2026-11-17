@@ -45,6 +45,18 @@ private:
     // TreeMoveMs option: ms each macro-ply charges inside the search tree
     // when 'position ... clocks' gave clocks. 0 keeps clocks frozen.
     int treeMoveMs = 0;
+    // Spec v3 E3 exploration options (all off by default).
+    bool rootNoiseAllGame = false;
+    int moveTemperaturePermille = 0;
+    int moveTemperaturePlies = 0;
+
+    // TimeAdvantage as the search uses it: read from the clocks under tree
+    // clocks (spec v3 E1), the TimeAdvantage option otherwise.
+    bool effective_time_advantage() const {
+        return board.tree_clocks_active()
+            ? board.team_time_edge(teamSide) > 0
+            : teamHasTimeAdvantage;
+    }
 
     // Prints 'info string sample <base64>' for the finished search
     // ('go ... sample'): one HVM5 TrainingSample record, as selfplay writes it.

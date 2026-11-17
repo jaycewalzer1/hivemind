@@ -42,6 +42,10 @@ struct WaitingMateContinuation {
  *        nominally mated team still has a legal move on its partner board. This
  *        permits one neural expansion to rank that seat's moves; descendants
  *        use normal terminal adjudication.
+ * @param mateRacePessimism RuntimeConfig::mateRacePessimism. True (the
+ *        default) keeps the root team losing every simultaneous mate race on
+ *        the waiting board, from either side; false lets a reply that mates
+ *        first win the race for whichever team plays it (ablation, spec v3 E1).
  */
 TerminalOutcome classify_terminal_position(Board& board,
                                              Stockfish::Color teamToPlay,
@@ -51,7 +55,8 @@ TerminalOutcome classify_terminal_position(Board& board,
                                              int* endInPly = nullptr,
                                              bool partnerBoardAgnostic = false,
                                              bool allowMatedTeamToMove = false,
-                                             WaitingMateContinuation* waitingMate = nullptr);
+                                             WaitingMateContinuation* waitingMate = nullptr,
+                                             bool mateRacePessimism = true);
 
 TerminalOutcome classify_terminal_position(Board& board,
                                              Stockfish::Color teamToPlay,
@@ -61,7 +66,8 @@ TerminalOutcome classify_terminal_position(Board& board,
                                              int* endInPly = nullptr,
                                              bool partnerBoardAgnostic = false,
                                              bool allowMatedTeamToMove = false,
-                                             WaitingMateContinuation* waitingMate = nullptr);
+                                             WaitingMateContinuation* waitingMate = nullptr,
+                                             bool mateRacePessimism = true);
 
 /**
  * @brief Entry in an MCTS selection trajectory.

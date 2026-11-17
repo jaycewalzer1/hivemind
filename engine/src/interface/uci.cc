@@ -23,6 +23,16 @@
 
 using namespace std;
 
+namespace {
+
+// Keywords that end the FEN or the move list of a 'position' command.
+bool is_position_section(const std::string& token) {
+    return token == "moves" || token == "clocks" || token == "elapsed"
+        || token == "pace" || token == "reps";
+}
+
+}  // namespace
+
 UCI::UCI() : mainSearchThread(nullptr) {
     std::random_device entropy;
     const uint64_t clockSeed = static_cast<uint64_t>(
@@ -126,8 +136,7 @@ void UCI::position(istringstream& is) {
     else if (tokens[at] == "fen") {
         // Build the FEN string until we hit "moves", "clocks", "elapsed" or the end
         std::string fen;
-        for (++at; at < tokens.size() && tokens[at] != "moves"
-                    && tokens[at] != "clocks" && tokens[at] != "elapsed"; ++at) {
+        for (++at; at < tokens.size() && !is_position_section(tokens[at]); ++at) {
             fen += tokens[at] + " ";
         }
         board.set(fen);
@@ -140,6 +149,9 @@ void UCI::position(istringstream& is) {
     // 'elapsed <ea> <eb>' (spec v2) is applied once the clocks are known.
     bool elapsedGiven = false;
     int64_t elapsedValues[2] = {0, 0};
+    // Spec v3 'pace <paw> <pab> <pbw> <pbb>', applied once the clocks are known.
+    bool paceGiven = false;
+    int64_t paceValues[4] = {0, 0, 0, 0};
     // Reads up to `count` ms values starting at tokens[at]; returns how many parsed.
     auto parse_ms = [&](int64_t* values, int count) {
         int parsed = 0;
@@ -163,8 +175,7 @@ void UCI::position(istringstream& is) {
         if (section == "moves") {
             // Parse move list (if any)
             int moveCount = 0;
-            for (; at < tokens.size() && tokens[at] != "clocks"
-                    && tokens[at] != "elapsed"; ++at) {
+            for (; at < tokens.size() && !is_position_section(tokens[at]); ++at) {
                 const std::string& token = tokens[at];
                 if (token.empty() || token[0] < '1' || token[0] > '2') {
                     std::cerr << "Error: Invalid board indicator in move '" << token
@@ -190,8 +201,7 @@ void UCI::position(istringstream& is) {
                 moveCount++;
             }
             // After an invalid move the rest of the list is skipped, as before.
-            while (at < tokens.size() && tokens[at] != "clocks"
-                   && tokens[at] != "elapsed") {
+            while (at < tokens.size() && !is_position_section(tokens[at])) {
                 ++at;
             }
         } else if (section == "clocks") {
@@ -204,6 +214,29 @@ void UCI::position(istringstream& is) {
                 board.clear_clocks();
                 std::cout << "info string clocks needs four ms values"
                           << " (A_white A_black B_white B_black); ignored" << std::endl;
+            }
+        } else if (section == "pace") {
+            // Each seat's expected move time in ms (spec v3 shared contract 1).
+            if (parse_ms(paceValues, 4) == 4) {
+                paceGiven = true;
+            } else {
+                paceGiven = false;
+                std::cout << "info string pace needs four ms values"
+                          << " (A_white A_black B_white B_black); ignored" << std::endl;
+            }
+        } else if (section == "reps") {
+            // Spec v3 E1: occurrences of the current position on board A and
+            // on board B as the game history counts them (>= 1), for the
+            // repetition planes when no move list is sent.
+            int64_t reps[2] = {1, 1};
+            if (parse_ms(reps, 2) == 2) {
+                for (int b = 0; b < 2; ++b) {
+                    board.set_repetition_count(b, static_cast<uint32_t>(
+                        std::clamp<int64_t>(reps[b], 1, 1000)));
+                }
+            } else {
+                std::cout << "info string reps needs two counts"
+                          << " (board A, board B); ignored" << std::endl;
             }
         } else if (section == "elapsed") {
             // ms since the last move landed on board A and on board B.
@@ -222,6 +255,14 @@ void UCI::position(istringstream& is) {
             board.set_elapsed(elapsedValues[0], elapsedValues[1]);
         } else {
             std::cout << "info string elapsed needs a clocks suffix; ignored"
+                      << std::endl;
+        }
+    }
+    if (paceGiven) {
+        if (board.has_clocks()) {
+            board.set_pace(paceValues[0], paceValues[1], paceValues[2], paceValues[3]);
+        } else {
+            std::cout << "info string pace needs a clocks suffix; ignored"
                       << std::endl;
         }
     }
@@ -335,8 +376,21 @@ SearchParams::RuntimeConfig UCI::current_search_config() {
     SearchParams::RuntimeConfig config = searchConfig;
     const int currentPly = std::max(
         board.game_ply(BOARD_A), board.game_ply(BOARD_B));
-    if (!openingNoiseEnabled || openingNoisePlies <= 0
-        || currentPly >= openingNoisePlies
+    // Spec v3 E3 move temperature: every ply when MoveTemperaturePlies is 0,
+    // otherwise while both boards are inside that many plies.
+    if (moveTemperaturePermille > 0
+        && (moveTemperaturePlies <= 0 || currentPly < moveTemperaturePlies)) {
+        config.moveTemperature =
+            static_cast<float>(moveTemperaturePermille) / 1000.0f;
+        config.moveTemperatureSeed = openingNoiseGenerator();
+    } else {
+        config.moveTemperature = 0.0f;
+        config.moveTemperatureSeed = 0;
+    }
+    // Spec v3 E3 RootNoiseAllGame lifts the OpeningNoisePlies horizon.
+    if (!openingNoiseEnabled
+        || (!rootNoiseAllGame
+            && (openingNoisePlies <= 0 || currentPly >= openingNoisePlies))
         || openingNoiseAlphaPermille <= 0
         || openingNoiseEpsilonPermille <= 0) {
         config.rootDirichletAlpha = 0.0f;
@@ -356,7 +410,7 @@ SearchParams::RuntimeConfig UCI::current_search_config() {
 void UCI::emit_think_gain() {
     try {
         std::vector<float> planes(NB_INPUT_VALUES());
-        board_to_planes(board, planes.data(), teamSide, teamHasTimeAdvantage);
+        board_to_planes(board, planes.data(), teamSide, effective_time_advantage());
         float logits[2] = {0.0f, 0.0f};
         if (!engines.front()->evaluateThinkGain(planes.data(), logits)) {
             std::cout << "info string think_gain failed" << std::endl;
@@ -399,11 +453,12 @@ void UCI::emit_sample() {
         sample.wdl = 1;
         sample.macroPly = 0;
         sample.team = teamSide == Stockfish::WHITE ? 0 : 1;
-        sample.hasTimeAdvantage = teamHasTimeAdvantage ? 1 : 0;
+        const bool timeAdvantage = effective_time_advantage();
+        sample.hasTimeAdvantage = timeAdvantage ? 1 : 0;
         sample.nodes = static_cast<uint32_t>(std::min<uint64_t>(
             visits, std::numeric_limits<uint32_t>::max()));
         sample.rootQ = agent->root_q();
-        sample.planes = training::encode_planes(board, teamSide, teamHasTimeAdvantage);
+        sample.planes = training::encode_planes(board, teamSide, timeAdvantage);
         sample.policyA = training::marginal_policy(board, BOARD_A, edges);
         sample.policyB = training::marginal_policy(board, BOARD_B, edges);
         sample.jointPolicy = training::joint_policy(board, edges);
@@ -605,6 +660,28 @@ void UCI::setoption(std::istringstream& is) {
             searchConfig.mateProbeAnyTime = value == "true";
             std::cout << "info string MateProbeAnyTime set to " << value << std::endl;
         }
+    } else if (name == "MateRacePessimism") {
+        if (value == "true" || value == "false") {
+            searchConfig.mateRacePessimism = value == "true";
+            std::cout << "info string MateRacePessimism set to " << value << std::endl;
+        }
+    } else if (name == "PassExploration") {
+        searchConfig.passExplorationDepth = std::clamp(std::stoi(value), 0, 2);
+        std::cout << "info string PassExploration set to "
+                  << searchConfig.passExplorationDepth << std::endl;
+    } else if (name == "RootNoiseAllGame") {
+        if (value == "true" || value == "false") {
+            rootNoiseAllGame = value == "true";
+            std::cout << "info string RootNoiseAllGame set to " << value << std::endl;
+        }
+    } else if (name == "MoveTemperaturePermille") {
+        moveTemperaturePermille = std::clamp(std::stoi(value), 0, 10000);
+        std::cout << "info string MoveTemperaturePermille set to "
+                  << moveTemperaturePermille << std::endl;
+    } else if (name == "MoveTemperaturePlies") {
+        moveTemperaturePlies = std::clamp(std::stoi(value), 0, 100000);
+        std::cout << "info string MoveTemperaturePlies set to "
+                  << moveTemperaturePlies << std::endl;
     } else if (name == "TreeMoveMs") {
         treeMoveMs = std::clamp(std::stoi(value), 0, 3600000);
         std::cout << "info string TreeMoveMs set to " << treeMoveMs << std::endl;
@@ -681,6 +758,11 @@ void UCI::send_uci_response() {
     cout << "option name FreePass type check default false" << endl;
     cout << "option name MateProbeAnyTime type check default false" << endl;
     cout << "option name TreeMoveMs type spin default 0 min 0 max 3600000" << endl;
+    cout << "option name MateRacePessimism type check default true" << endl;
+    cout << "option name PassExploration type spin default 0 min 0 max 2" << endl;
+    cout << "option name RootNoiseAllGame type check default false" << endl;
+    cout << "option name MoveTemperaturePermille type spin default 0 min 0 max 10000" << endl;
+    cout << "option name MoveTemperaturePlies type spin default 0 min 0 max 100000" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

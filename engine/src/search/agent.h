@@ -262,6 +262,15 @@ private:
                           size_t workerCount);
     void wait_for_workers();
     void reindex_reused_subtree(const std::shared_ptr<Node>& reusedRoot);
+    void refresh_reused_subtree(const std::shared_ptr<Node>& reusedRoot,
+                                Board& board,
+                                Stockfish::Color rootTeam,
+                                bool rootTeamHasTimeAdvantage,
+                                uint64_t rootHash);
+    // The action the last foreground search played (spec v3 E3: with a move
+    // temperature it need not be the best child), so tree reuse keeps the
+    // subtree below it.
+    std::optional<JointActionCandidate> lastPlayedAction_;
     void retain_reuse_candidates(const std::shared_ptr<Node>& subtreeRoot,
                                  Board& board,
                                  bool teamHasTimeAdvantage);
@@ -307,7 +316,9 @@ public:
                                     const SearchOptions& options);
 
     /** Returns an immutable snapshot of the expanded root edges after search. */
-    std::vector<RootEdgeStats> root_edge_stats() const;
+    /// Root edges with their visits; the policy-target visits (spec v3 E3
+    /// forced pass playouts pruned) unless @p raw.
+    std::vector<RootEdgeStats> root_edge_stats(bool raw = false) const;
 
     /** Returns the evaluated Q-value of the root node after search. */
     float root_q() const;

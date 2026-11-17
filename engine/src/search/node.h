@@ -143,6 +143,11 @@ private:
     std::set<UnvisitedEdge, UnvisitedEdgeOrder> unvisitedEdges;
     std::vector<int> visitedEdges;
     std::vector<int> visitedEdgePositions;
+    // Spec v3 E3: children whose action is a chosen pass (a pass on a board
+    // where the team could move). Forced playouts and policy-target pruning
+    // act on these when pass exploration is on at this node's depth.
+    std::vector<int> passEdges;
+    std::atomic<bool> passExplorationQueued{false};
     std::atomic<float> valueSum{0.0f};
     std::atomic<int> m_depth{0};
     std::atomic<int> m_visits{0};  // Atomic for lock-free read/write
@@ -342,9 +347,69 @@ public:
         return candidateGenerator.hasNext();
     }
 
+    /// Spec v3 E3: whether this node explores its pass actions on purpose.
+    bool pass_exploration_active(const SearchParams::RuntimeConfig& config) const {
+        if (config.passExplorationDepth <= m_depth.load(std::memory_order_relaxed)
+            || rootGumbelEnabled) {
+            return false;
+        }
+        return m_depth.load(std::memory_order_relaxed) == 0
+            || m_visits.load(std::memory_order_relaxed)
+                >= SearchParams::PASS_EXPLORATION_MIN_VISITS_BELOW_ROOT;
+    }
+
+    /**
+     * @brief Spec v3 E3: queue (pass, best other) and (best own, pass) for
+     *        expansion once this node is expanded and explores passes. Runs
+     *        once per node (and again when it becomes a root).
+     */
+    void maybe_queue_pass_exploration(const SearchParams::RuntimeConfig& config) {
+        if (config.passExplorationDepth <= 0
+            || passExplorationQueued.load(std::memory_order_acquire)
+            || !m_is_expanded.load(std::memory_order_acquire)
+            || !pass_exploration_active(config)) {
+            return;
+        }
+        std::unique_lock<std::shared_mutex> guard(nodeMutex);
+        if (passExplorationQueued.load(std::memory_order_relaxed)) {
+            return;
+        }
+        candidateGenerator.queuePassExploration();
+        passExplorationQueued.store(true, std::memory_order_release);
+    }
+
+    /// Forced playouts for an explored pass edge: max(1, floor(sqrt(K P N))).
+    static int forced_pass_playouts(float prior, int parentVisits, float k) {
+        const float value = std::sqrt(std::max(0.0f, k * prior
+            * static_cast<float>(std::max(0, parentVisits))));
+        return std::max(1, static_cast<int>(std::floor(value)));
+    }
+
+    /**
+     * @brief Visit counts for the policy target (spec v3 E3).
+     *
+     * Equal to get_child_visits() unless this node explored its passes. Then
+     * each explored pass edge other than the most visited one gives back the
+     * forced playouts it did not earn: its count drops (by at most its forced
+     * playouts) as far as it can while its PUCT score stays at or below the
+     * best edge's, and a count left at one is dropped to zero (KataGo's
+     * policy-target pruning).
+     */
+    std::vector<int> get_policy_target_visits(
+        const SearchParams::RuntimeConfig& config) const;
+
+    std::vector<int> get_pass_edges() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return passEdges;
+    }
+
     bool should_expand_new_child(const SearchParams::RuntimeConfig& config) const {
         std::shared_lock<std::shared_mutex> guard(nodeMutex);
         if (candidateGenerator.hasPromoted()) {
+            return true;
+        }
+        // Spec v3 E3: queued pass actions go in ahead of progressive widening.
+        if (candidateGenerator.hasForced()) {
             return true;
         }
         const bool allExpandedChildrenLose = !children.empty()
@@ -466,6 +531,9 @@ public:
                 expandedCount,
                 edges.back().visits});
         }
+        if (candidateGenerator.isChoicePass(candidate)) {
+            passEdges.push_back(expandedCount);
+        }
         
         expandedCount++;
         if (outChildIdx) {
@@ -554,6 +622,8 @@ public:
         unvisitedEdges.clear();
         visitedEdges.clear();
         visitedEdgePositions.clear();
+        passEdges.clear();
+        passExplorationQueued.store(false, std::memory_order_relaxed);
         provenWinningChildCount = 0;
         initialize_root_gumbel_locked(config);
         
@@ -572,6 +642,9 @@ public:
             childGumbelScores.push_back(candidate.gumbelScore);
             if (rootGumbelEnabled) {
                 rootGumbelActive.push_back({0, 0});
+            }
+            if (candidateGenerator.isChoicePass(candidate)) {
+                passEdges.push_back(expandedCount);
             }
             
             expandedCount++;
@@ -787,6 +860,16 @@ public:
     void configure_root_search(
         const SearchParams::RuntimeConfig& config,
         bool allowProvenLoss = true);
+
+    /**
+     * @brief Forget every solver verdict on this node (spec v3 E1 reuse).
+     *
+     * A reused subtree searched under other clocks may hold flags and
+     * sit-offs proven on clocks the new search does not have. Visits and
+     * values stay; terminal leaves are classified again when next reached,
+     * and proofs above them propagate again from there.
+     */
+    void reset_solver_state();
     
     // =========================================================================
     // MCTS Solver Methods

@@ -715,6 +715,17 @@ constexpr float ROOT_PW_COEFFICIENT = 4.0f;
 constexpr float PW_EXPONENT = 0.3f;
 
 // =============================================================================
+// Pass exploration (spec v3 E3; off unless RuntimeConfig::passExplorationDepth)
+// =============================================================================
+
+/// Forced playouts on an explored pass action: floor(sqrt(K * P * N)).
+constexpr float PASS_FORCED_PLAYOUT_K = 2.0f;
+/// Visits a node below the root needs before its pass actions are expanded
+/// and forced, so the many replies that only ever get a visit or two are not
+/// spent on passes. The root starts at once.
+constexpr int PASS_EXPLORATION_MIN_VISITS_BELOW_ROOT = 8;
+
+// =============================================================================
 // Solver-aware Gumbel root search
 // =============================================================================
 
@@ -785,6 +796,25 @@ struct RuntimeConfig {
     // MateProbeAnyTime (UCI, default off): run the root Fairy-Stockfish mate
     // probe even when the team is not ahead on time.
     bool mateProbeAnyTime = false;
+    // Spec v3 E1, MateRacePessimism (UCI, default on = unchanged): the root
+    // team loses every simultaneous mate race in the tree and claimed wins
+    // are vetoed when the opponents hold an immediate mate. Off is the
+    // ablation arm; deciding races by landing time waits for the durative
+    // tree (E2).
+    bool mateRacePessimism = true;
+    // Spec v3 E3, PassExploration (UCI, default 0 = off): the deepest node
+    // level whose pass actions are explored on purpose (1 = root, 2 = root and
+    // the replies below it). At such a node the joint actions (pass, best
+    // other board) and (best own board, pass) are expanded right away and
+    // then kept at forced playouts sqrt(k P N); the sample's policy target
+    // prunes those forced visits again.
+    int passExplorationDepth = 0;
+    float passForcedPlayoutK = PASS_FORCED_PLAYOUT_K;
+    // Spec v3 E3, MoveTemperaturePermille (UCI, default 0 = argmax): the
+    // played root action is drawn with probability proportional to
+    // visits^(1/T) when the root is unsolved. The seed is drawn per search.
+    float moveTemperature = 0.0f;
+    uint64_t moveTemperatureSeed = 0;
 };
 
 // =============================================================================

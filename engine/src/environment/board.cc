@@ -99,6 +99,11 @@ Board::Board(const Board& board) {
     elapsedMs[1] = board.elapsedMs[1];
     treePassStreak = board.treePassStreak;
     treeClockUndo = board.treeClockUndo;
+    hasPace = board.hasPace;
+    for (int b = 0; b < 2; ++b) {
+        paceMs[b][0] = board.paceMs[b][0];
+        paceMs[b][1] = board.paceMs[b][1];
+    }
 }
 
 // Executes a move on the board and updates the corresponding state.

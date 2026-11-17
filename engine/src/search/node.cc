@@ -216,10 +216,77 @@ void Node::initialize_root_gumbel_locked(
         1, config.rootGumbelInitialCandidates);
 }
 
+void Node::reset_solver_state() {
+    std::unique_lock<std::shared_mutex> guard(nodeMutex);
+    if (nodeType.load(std::memory_order_relaxed) != NodeType::UNSOLVED) {
+        // mark_as_win/loss overwrote the value sum with a full-certainty
+        // one; start the node from a neutral value instead.
+        valueSum.store(0.0f, std::memory_order_relaxed);
+    }
+    nodeType.store(NodeType::UNSOLVED, std::memory_order_release);
+    std::fill(childNodeTypes.begin(), childNodeTypes.end(), NodeType::UNSOLVED);
+    unsolvedChildCount.store(static_cast<int>(childNodeTypes.size()),
+                             std::memory_order_relaxed);
+    provenWinningChildCount = 0;
+    endInPly.store(0, std::memory_order_relaxed);
+}
+
+std::vector<int> Node::get_policy_target_visits(
+    const SearchParams::RuntimeConfig& config) const {
+    std::shared_lock<std::shared_mutex> guard(nodeMutex);
+    std::vector<int> visits;
+    visits.reserve(edges.size());
+    for (const EdgeStats& edge : edges) {
+        visits.push_back(edge.visits.load(std::memory_order_relaxed));
+    }
+    if (config.passExplorationDepth <= m_depth.load(std::memory_order_relaxed)
+        || rootGumbelEnabled || passEdges.empty() || visits.empty()) {
+        return visits;
+    }
+    const int bestIdx = static_cast<int>(std::distance(
+        visits.begin(), std::max_element(visits.begin(), visits.end())));
+    const int parentVisits = m_visits.load(std::memory_order_relaxed);
+    if (parentVisits <= 0 || visits[bestIdx] <= 0) {
+        return visits;
+    }
+    const float sqrtVisits = std::sqrt(static_cast<float>(parentVisits));
+    const float c = SearchParams::get_cpuct(
+        static_cast<float>(parentVisits), config.cpuctInit, config.cpuctBase);
+    const EdgeStats& best = edges[static_cast<size_t>(bestIdx)];
+    const float bestScore = best.q.load(std::memory_order_relaxed)
+        + c * best.prior * sqrtVisits / (1.0f + static_cast<float>(visits[bestIdx]));
+    for (int index : passEdges) {
+        if (index < 0 || static_cast<size_t>(index) >= visits.size()
+            || index == bestIdx || visits[index] <= 0) {
+            continue;
+        }
+        const EdgeStats& edge = edges[static_cast<size_t>(index)];
+        const int forced = forced_pass_playouts(
+            edge.prior, parentVisits, config.passForcedPlayoutK);
+        const float q = edge.q.load(std::memory_order_relaxed);
+        int pruned = std::max(0, visits[index] - forced);
+        if (bestScore > q) {
+            // Smallest n with q + c P sqrt(N) / (1 + n) <= bestScore.
+            const float needed = c * edge.prior * sqrtVisits / (bestScore - q) - 1.0f;
+            pruned = std::max(pruned, static_cast<int>(std::ceil(std::max(0.0f, needed))));
+        } else {
+            pruned = visits[index];
+        }
+        pruned = std::min(pruned, visits[index]);
+        if (pruned <= 1) {
+            pruned = 0;
+        }
+        visits[index] = pruned;
+    }
+    return visits;
+}
+
 void Node::configure_root_search(
     const SearchParams::RuntimeConfig& config,
     bool allowProvenLoss) {
     std::unique_lock<std::shared_mutex> guard(nodeMutex);
+    // A root queues its pass actions again (spec v3 E3), reused or not.
+    passExplorationQueued.store(false, std::memory_order_relaxed);
     // A live partner board may still need a move after the other board is
     // already mated. In that exceptional root, keep searching even if the
     // combined position is proven lost. Child proofs remain active, so search
@@ -558,7 +625,36 @@ Node::ChildSelection Node::select_child_and_apply_virtual_loss(
             return true;
         };
 
-        if (rootGumbelEnabled) {
+        // Spec v3 E3 forced playouts: an explored pass edge short of
+        // max(1, floor(sqrt(K P N))) visits is taken before PUCT is consulted.
+        int forcedIdx = -1;
+        if (!rootGumbelEnabled && !passEdges.empty()
+            && pass_exploration_active(config)) {
+            int largestDeficit = 0;
+            for (int index : passEdges) {
+                if (index < 0 || static_cast<size_t>(index) >= limit
+                    || !children[index]
+                    || (blockedNodes && blockedNodes->contains(children[index].get()))
+                    || (!unavailableChildren.empty() && unavailableChildren[index])
+                    || (hasNonLosingAlternative
+                        && children[index]->get_node_type() == NodeType::WIN)) {
+                    continue;
+                }
+                const EdgeStats& edge = edges[static_cast<size_t>(index)];
+                const int effective = edge.visits.load(std::memory_order_relaxed)
+                    + edge.virtualLoss.load(std::memory_order_relaxed);
+                const int deficit = forced_pass_playouts(
+                    edge.prior, visits, config.passForcedPlayoutK) - effective;
+                if (deficit > largestDeficit) {
+                    largestDeficit = deficit;
+                    forcedIdx = index;
+                }
+            }
+        }
+        if (forcedIdx >= 0) {
+            selectedIdx = forcedIdx;
+            bestChild = children[forcedIdx];
+        } else if (rootGumbelEnabled) {
             // Sequential-halving scores and visit quotas require considering
             // every active Gumbel candidate.
             for (size_t i = 0; i < limit; ++i) {

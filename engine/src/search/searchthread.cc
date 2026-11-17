@@ -129,29 +129,32 @@ TerminalOutcome classify_terminal_position(Board& board,
                                              int* endInPly,
                                              bool partnerBoardAgnostic,
                                              bool allowMatedTeamToMove,
-                                             WaitingMateContinuation* waitingMate) {
+                                             WaitingMateContinuation* waitingMate,
+                                             bool mateRacePessimism) {
     if (waitingMate) {
         *waitingMate = {};
     }
     if (endInPly) {
         *endInPly = 0;
     }
-    const bool teamToPlayHasTimeAdvantage = teamToPlay == rootTeam
-        ? rootTeamHasTimeAdvantage
-        : !rootTeamHasTimeAdvantage;
+    // Spec v3 E1: with tree clocks the advantage is read from the clocks at
+    // this node; without them it alternates from the root's as before.
+    const bool teamToPlayHasTimeAdvantage = board.node_time_advantage(
+        teamToPlay, rootTeam, rootTeamHasTimeAdvantage);
 
     // TreeMoveMs: a clock that ran out inside the tree ends the game like a
-    // checkmate. Both teams out on the same macro-ply is scored as a draw.
-    if (const int flags = board.flagged_teams()) {
-        const bool weFlagged = flags & (1 << teamToPlay);
-        const bool theyFlagged = flags & (1 << ~teamToPlay);
-        if (weFlagged && theyFlagged) {
+    // checkmate. Spec v3 D4: when both teams are out on the same macro-ply
+    // the most negative seat ran out first and loses; an exact tie is a draw.
+    if (const int losers = board.flag_losers()) {
+        const bool weLose = losers & (1 << teamToPlay);
+        const bool theyLose = losers & (1 << ~teamToPlay);
+        if (weLose && theyLose) {
             return TerminalOutcome::DRAW;
         }
         if (endInPly) {
             *endInPly = 1;
         }
-        return weFlagged ? TerminalOutcome::LOSS : TerminalOutcome::WIN;
+        return weLose ? TerminalOutcome::LOSS : TerminalOutcome::WIN;
     }
     // Spec v2 D1: a full round with no move on either board is a sit-off,
     // decided by which seat on turn would flag first.
@@ -200,7 +203,7 @@ TerminalOutcome classify_terminal_position(Board& board,
         && (boardSearchPlies[BOARD_A] > 0 || boardSearchPlies[BOARD_B] > 0)
         && has_unavoidable_waiting_board_mate(
             board, teamToPlay, teamToPlayHasTimeAdvantage,
-            teamToPlay == rootTeam,
+            mateRacePessimism && teamToPlay == rootTeam,
             boardSearchPlies, waitingMate)) {
         if (endInPly) {
             // One forced reply, then the opponent's mating move. Terminal
@@ -220,11 +223,12 @@ TerminalOutcome classify_terminal_position(Board& board,
                                              int* endInPly,
                                              bool partnerBoardAgnostic,
                                              bool allowMatedTeamToMove,
-                                             WaitingMateContinuation* waitingMate) {
+                                             WaitingMateContinuation* waitingMate,
+                                             bool mateRacePessimism) {
     return classify_terminal_position(
         board, teamToPlay, rootTeam, rootTeamHasTimeAdvantage,
         {searchPly, searchPly}, endInPly, partnerBoardAgnostic,
-        allowMatedTeamToMove, waitingMate);
+        allowMatedTeamToMove, waitingMate, mateRacePessimism);
 }
 
 SearchThread::SearchThread()
@@ -494,7 +498,11 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         ctx.leaf = leaf;
         ctx.hasEvaluationReservation = selection.hasEvaluationReservation;
         ctx.teamToPlay = leaf->get_team_to_play();
-        ctx.sitPlaneActive = (ctx.teamToPlay == root->get_team_to_play()) == teamHasTimeAdvantage;
+        // Spec v3 E1: plane 31 (and the node key's time-advantage bit) from
+        // the clocks at this leaf under tree clocks, so it agrees with planes
+        // 37-40; the legacy alternation from the root otherwise.
+        ctx.sitPlaneActive = board.node_time_advantage(
+            ctx.teamToPlay, root->get_team_to_play(), teamHasTimeAdvantage);
         
         // Check for terminal states
         // Track search moves independently per board. A combined tree depth is
@@ -540,7 +548,8 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         const TerminalOutcome terminalOutcome = classify_terminal_position(
             board, ctx.teamToPlay, root->get_team_to_play(),
             teamHasTimeAdvantage, boardSearchPlies, &terminalEndInPly,
-            false, searchPly == 0 && !teamHasTimeAdvantage);
+            false, searchPly == 0 && !teamHasTimeAdvantage, nullptr,
+            runtimeConfig.mateRacePessimism);
         if (terminalOutcome != TerminalOutcome::NONE) {
             ctx.isTerminal = true;
             if (terminalOutcome == TerminalOutcome::WIN) {
@@ -582,11 +591,8 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             restore_selection();
             continue;
         }
-        bool leafTeamHasTimeAdvantage = (ctx.teamToPlay == root->get_team_to_play())
-            ? teamHasTimeAdvantage
-            : !teamHasTimeAdvantage;
         ctx.leafHash = board.search_hash_key(
-            ctx.teamToPlay, leafTeamHasTimeAdvantage);
+            ctx.teamToPlay, ctx.sitPlaneActive);
 
         ctx.boardAOnTurn = board.side_to_move(BOARD_A) == ctx.teamToPlay;
         ctx.boardBOnTurn = board.side_to_move(BOARD_B) == ~ctx.teamToPlay;
@@ -689,10 +695,9 @@ void SearchThread::process_batch(
                     + inferenceIdx * jointFactorRank * jointVocabularySize
                 : nullptr;
 
-            // Compute whether the team at this leaf has time advantage
-            // Time advantage alternates: if root team has it, opponent team doesn't
-            Stockfish::Color rootTeam = root->get_team_to_play();
-            bool leafTeamHasTimeAdvantage = (ctx.teamToPlay == rootTeam) ? teamHasTimeAdvantage : !teamHasTimeAdvantage;
+            // Whether the team at this leaf has time advantage, as worked out
+            // at the leaf in collect_batch (the board is no longer there).
+            const bool leafTeamHasTimeAdvantage = ctx.sitPlaneActive;
             
             vector<float> priorsA;
             vector<float> priorsB;
@@ -939,10 +944,9 @@ SearchThread::CanonicalChildResult SearchThread::canonicalize_child(
         return {child->is_expanded(), nullptr};
     }
 
-    const bool childTeamHasTimeAdvantage =
-        child->get_team_to_play() == root->get_team_to_play()
-        ? teamHasTimeAdvantage
-        : !teamHasTimeAdvantage;
+    const bool childTeamHasTimeAdvantage = board.node_time_advantage(
+        child->get_team_to_play(), root->get_team_to_play(),
+        teamHasTimeAdvantage);
     const uint64_t childHash = board.search_hash_key(
         child->get_team_to_play(), childTeamHasTimeAdvantage);
     child->set_hash(childHash);
@@ -1059,6 +1063,10 @@ LeafSelection SearchThread::select_and_expand(
                 mateHint = mateCandidateTable->lookup(positionHash);
             }
         }
+
+        // Spec v3 E3: an explored node queues its pass actions once, and
+        // should_expand_new_child then expands them ahead of widening.
+        currentNode->maybe_queue_pass_exploration(runtimeConfig);
 
         // Grow the large Cartesian joint-action space as the node earns visits.
         if (currentNode->should_expand_new_child(runtimeConfig)) {

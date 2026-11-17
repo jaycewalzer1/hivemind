@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -62,6 +63,12 @@ class Board {
             int passStreak;
         };
         std::vector<TreeClockUndo> treeClockUndo;
+        /// Spec v3 'pace <paw> <pab> <pbw> <pbb>': each seat's expected move
+        /// time in ms (an EMA of its observed landings). Parsed and stored
+        /// only with clocks; nothing in the search reads it yet (the
+        /// durative tree, WP-E E2, will).
+        bool hasPace = false;
+        int64_t paceMs[2][2] = {{0, 0}, {0, 0}};  ///< [board][color]
 
         void set_clocks(int64_t aWhite, int64_t aBlack, int64_t bWhite, int64_t bBlack) {
             hasClocks = true;
@@ -82,6 +89,26 @@ class Board {
             treePassStreak = 0;
             treeClockUndo.clear();
             clear_elapsed();
+            clear_pace();
+        }
+
+        void set_pace(int64_t aWhite, int64_t aBlack, int64_t bWhite, int64_t bBlack) {
+            hasPace = true;
+            paceMs[0][Stockfish::WHITE] = std::max<int64_t>(0, aWhite);
+            paceMs[0][Stockfish::BLACK] = std::max<int64_t>(0, aBlack);
+            paceMs[1][Stockfish::WHITE] = std::max<int64_t>(0, bWhite);
+            paceMs[1][Stockfish::BLACK] = std::max<int64_t>(0, bBlack);
+        }
+
+        void clear_pace() {
+            hasPace = false;
+            paceMs[0][0] = paceMs[0][1] = paceMs[1][0] = paceMs[1][1] = 0;
+        }
+
+        bool has_pace() const { return hasPace; }
+
+        int64_t pace_ms(int board_num, Stockfish::Color color) const {
+            return paceMs[board_num][color];
         }
 
         void set_elapsed(int64_t boardA, int64_t boardB) {
@@ -137,6 +164,76 @@ class Board {
                 }
             }
             return flags;
+        }
+
+        /**
+         * @brief Spec v3 D4 double flag: who loses when clocks ran out.
+         *
+         * One team flagged: that team loses. Both teams flagged on the same
+         * macro-ply: the seat that is most negative ran out first, so its team
+         * loses; an exact tie between the two teams' most negative seats is a
+         * draw (the arena's rule, arena/state.py).
+         * @return bit (1 << team) for the losing team, both bits for a draw,
+         *         0 when nobody flagged.
+         */
+        int flag_losers() const {
+            const int flags = flagged_teams();
+            const int both = (1 << Stockfish::WHITE) | (1 << Stockfish::BLACK);
+            if (flags != both) {
+                return flags;
+            }
+            int64_t lowest[2] = {std::numeric_limits<int64_t>::max(),
+                                 std::numeric_limits<int64_t>::max()};
+            for (int b = 0; b < 2; ++b) {
+                for (Stockfish::Color c : {Stockfish::WHITE, Stockfish::BLACK}) {
+                    const int team = team_of_seat(b, c);
+                    lowest[team] = std::min(lowest[team], clockMs[b][c]);
+                }
+            }
+            if (lowest[Stockfish::WHITE] < lowest[Stockfish::BLACK]) {
+                return 1 << Stockfish::WHITE;
+            }
+            if (lowest[Stockfish::BLACK] < lowest[Stockfish::WHITE]) {
+                return 1 << Stockfish::BLACK;
+            }
+            return both;
+        }
+
+        /**
+         * @brief Time edge of @p team: the sum over its two seats of (own
+         *        clock - same-board opponent's clock), which is also the sum
+         *        of its two diagonals (ours on A - theirs on B, ours on B -
+         *        theirs on A). The arena's team_time_edge, read at this
+         *        node's clocks. Zero without clocks.
+         */
+        int64_t team_time_edge(Stockfish::Color team) const {
+            if (!hasClocks) {
+                return 0;
+            }
+            // The team's seat on A has its colour, on B the opposite one.
+            const int64_t onA = clockMs[0][team] - clockMs[0][~team];
+            const int64_t onB = clockMs[1][~team] - clockMs[1][team];
+            return onA + onB;
+        }
+
+        /**
+         * @brief Spec v3 E1: time advantage of @p team at this node.
+         *
+         * With tree clocks the clocks move inside the tree, so the TimeAdvantage
+         * input (plane 31), its hash bit and the sitting rules are read from
+         * the clocks at the node: ahead when the team's time edge is positive;
+         * an exact tie is ahead for neither team. Without tree clocks it is the
+         * legacy value: the root's TimeAdvantage for the root team and its
+         * negation for the other team.
+         */
+        bool node_time_advantage(Stockfish::Color team,
+                                 Stockfish::Color rootTeam,
+                                 bool rootTeamHasTimeAdvantage) const {
+            if (tree_clocks_active()) {
+                return team_time_edge(team) > 0;
+            }
+            return team == rootTeam ? rootTeamHasTimeAdvantage
+                                    : !rootTeamHasTimeAdvantage;
         }
 
         /**
@@ -215,6 +312,32 @@ class Board {
             return teamHasTimeAdvantage ? (combined ^ Stockfish::Zobrist::timeAdvantage) : combined;
         }
 
+        /**
+         * @brief Key that retained tree-reuse candidates are filed under.
+         *
+         * Without clocks in the key this is search_hash_key itself, so the
+         * stock build reuses exactly as before. With clocks in the key the
+         * retained nodes were hashed on the clocks the tree predicted, which
+         * the next real search never reproduces (jitter, our own think time),
+         * so the key leaves out the clocks, elapsed times, pass streak and the
+         * time-advantage bit; the board signature still has to match.
+         */
+        unsigned long reuse_key(Stockfish::Color teamToPlay,
+                                bool teamHasTimeAdvantage = false) {
+            if (!clocks_affect_search()) {
+                return search_hash_key(teamToPlay, teamHasTimeAdvantage);
+            }
+            auto k0 = mix_hash(pos[0]->key(), static_cast<uint64_t>(rule50_count(0)));
+            k0 = mix_hash(k0, static_cast<uint64_t>(last_move(0)));
+            auto k1 = mix_hash(pos[1]->key(), static_cast<uint64_t>(rule50_count(1)));
+            k1 = mix_hash(k1, static_cast<uint64_t>(last_move(1)));
+            auto combined = k0 ^ (k1 + 0x9e3779b97f4a7c15UL + (k0 << 6) + (k0 >> 2));
+            combined = mix_hash(combined, repetitionFingerprint[0]);
+            combined = mix_hash(combined, repetitionFingerprint[1]);
+            return mix_hash(combined, 0x5245555345000000ULL
+                                | static_cast<uint64_t>(teamToPlay));
+        }
+
         /** Hash used for search nodes; team-to-play is part of node semantics. */
         unsigned long search_hash_key(Stockfish::Color teamToPlay,
                                       bool teamHasTimeAdvantage = false) {
@@ -285,6 +408,24 @@ class Board {
             positionHistory[board_num].clear();
             repetitionCounts[board_num].clear();
             repetitionFingerprint[board_num] = 0;
+        }
+
+        /**
+         * @brief Spec v3 E1: how many times the current position of a board
+         *        has occurred, as the game history knows it (the 'reps'
+         *        suffix of 'position'). A bare FEN starts every position at
+         *        one occurrence, which leaves the repetition planes 35-36 at 0.
+         * @param count Occurrences including the current one; clamped to >= 1.
+         */
+        void set_repetition_count(int board_num, uint32_t count) {
+            if (positionHistory[board_num].empty()) {
+                record_position(board_num);
+            }
+            const uint64_t key = positionHistory[board_num].back();
+            uint32_t& current = repetitionCounts[board_num][key];
+            const uint32_t target = std::max<uint32_t>(1, count);
+            update_repetition_fingerprint(board_num, key, current, target);
+            current = target;
         }
 
         static uint64_t mix_hash(uint64_t key, uint64_t value) {
@@ -647,6 +788,9 @@ class Board {
          *        causes are encoded in the graph-safe node key.
          */
         bool is_repetition_draw(const std::array<int, 2>& board_search_plies) {
+            if (tree_clocks_active()) {
+                return false;
+            }
             for (int board_num : {BOARD_A, BOARD_B}) {
                 const int threshold =
                     board_search_plies[board_num] > 0 ? 2 : 3;
@@ -667,6 +811,14 @@ class Board {
          * @return true if the board has reached a draw condition.
          */
         bool is_draw_on_board(int board_num, int ply = 0) {
+            // Spec v3 D4: under tree clocks neither repetition nor the
+            // fifty-move rule ends the game in the tree. The arena has no
+            // fifty-move rule and scores a (threefold, board-only) repetition
+            // itself; in the tree a repeated line is scored by its clocks, so
+            // a perpetual on one board never zeroes a win on the other.
+            if (tree_clocks_active()) {
+                return false;
+            }
             // Check 50-move rule using Fairy-Stockfish's built-in detection
             if (pos[board_num]->rule50_count() >= 100) {
                 return true;

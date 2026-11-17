@@ -240,6 +240,11 @@ private:
     std::vector<JointActionCandidate> gumbelCandidates;
     size_t nextGumbelCandidate = 0;
     std::optional<JointActionCandidate> promotedCandidate;
+    // Spec v3 E3 pass exploration: actions queued to be expanded next, ahead
+    // of the policy order (after a promoted one). Their keys are reserved in
+    // generatedCandidateKeys so the frontier never offers them twice.
+    std::vector<JointActionCandidate> forcedCandidates;
+    size_t nextForcedCandidate = 0;
     size_t jointFactorRank = 0;
     
     // Turn, time and pass context used to reject illegal joint actions
@@ -312,6 +317,8 @@ private:
         gumbelCandidates.clear();
         nextGumbelCandidate = 0;
         promotedCandidate.reset();
+        forcedCandidates.clear();
+        nextForcedCandidate = 0;
 
         std::unordered_map<std::pair<size_t, size_t>, size_t, PairHash>
             generatedIndices;
@@ -500,6 +507,137 @@ public:
 
     bool hasPromoted() const { return promotedCandidate.has_value(); }
 
+    /**
+     * @brief Spec v3 E3: queue the pass actions a search must look at.
+     *
+     * For each board the team could move on, the action that passes there
+     * and plays the other board's best move (a forced pass there when that
+     * board is not on turn, which makes it the double pass) goes to the front
+     * of the expansion order, unless it is illegal under the current pass
+     * rules or already generated. On a board with a legal move the "best
+     * move" is the highest-prior real move, never the pass.
+     * @return how many actions were queued.
+     */
+    size_t queuePassExploration() {
+        if (sortedActionsA.empty() || sortedActionsB.empty()) {
+            return 0;
+        }
+        const auto passIndex = [](const std::vector<Stockfish::Move>& actions)
+            -> std::optional<size_t> {
+            const auto found = std::find(
+                actions.begin(), actions.end(), Stockfish::MOVE_NONE);
+            if (found == actions.end()) {
+                return std::nullopt;
+            }
+            return static_cast<size_t>(std::distance(actions.begin(), found));
+        };
+        const auto bestIndex = [](const std::vector<Stockfish::Move>& actions,
+                                  bool canMove) -> size_t {
+            if (canMove) {
+                for (size_t index = 0; index < actions.size(); ++index) {
+                    if (actions[index] != Stockfish::MOVE_NONE) {
+                        return index;
+                    }
+                }
+            }
+            return 0;
+        };
+        std::vector<std::pair<size_t, size_t>> wanted;
+        if (rules.boardACanMove) {
+            if (const auto pass = passIndex(sortedActionsA)) {
+                wanted.emplace_back(*pass,
+                                    bestIndex(sortedActionsB, rules.boardBCanMove));
+            }
+        }
+        if (rules.boardBCanMove) {
+            if (const auto pass = passIndex(sortedActionsB)) {
+                wanted.emplace_back(bestIndex(sortedActionsA, rules.boardACanMove),
+                                    *pass);
+            }
+        }
+        size_t queued = 0;
+        for (const auto& [idxA, idxB] : wanted) {
+            if (generatedCandidateKeys.contains(idxA, idxB)
+                || (promotedCandidate && promotedCandidate->idxA == idxA
+                    && promotedCandidate->idxB == idxB)) {
+                continue;
+            }
+            JointActionCandidate candidate(
+                sortedActionsA[idxA], sortedPriorsA[idxA], idxA,
+                sortedActionsB[idxB], sortedPriorsB[idxB], idxB,
+                rules, sortedCapturesA[idxA] != 0,
+                sortedCapturesB[idxB] != 0);
+            if (candidate.jointPrior < 0.0f) {
+                continue;
+            }
+            // Take it out of whichever ordered source holds it, keeping the
+            // learned pool's rescored prior when it has one.
+            bool taken = false;
+            for (size_t index = nextJointPolicyCandidate;
+                 index < jointPolicyCandidates.size(); ++index) {
+                if (jointPolicyCandidates[index].idxA == idxA
+                    && jointPolicyCandidates[index].idxB == idxB) {
+                    candidate = jointPolicyCandidates[index];
+                    jointPolicyCandidates.erase(
+                        jointPolicyCandidates.begin()
+                        + static_cast<std::ptrdiff_t>(index));
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken) {
+                for (size_t index = nextGumbelCandidate;
+                     index < gumbelCandidates.size(); ++index) {
+                    if (gumbelCandidates[index].idxA == idxA
+                        && gumbelCandidates[index].idxB == idxB) {
+                        candidate = gumbelCandidates[index];
+                        gumbelCandidates.erase(
+                            gumbelCandidates.begin()
+                            + static_cast<std::ptrdiff_t>(index));
+                        taken = true;
+                        break;
+                    }
+                }
+            }
+            bool removedFromHeap = false;
+            if (!taken) {
+                std::priority_queue<JointActionCandidate> retained;
+                while (!heap.empty()) {
+                    JointActionCandidate queuedCandidate = heap.top();
+                    heap.pop();
+                    if (queuedCandidate.idxA == idxA
+                        && queuedCandidate.idxB == idxB) {
+                        removedFromHeap = true;
+                    } else {
+                        retained.push(queuedCandidate);
+                    }
+                }
+                heap = std::move(retained);
+            }
+            // Reserve the key first: the frontier then steps over this pair
+            // (to its neighbours) whenever it reaches it.
+            generatedCandidateKeys.insert(idxA, idxB);
+            if (removedFromHeap) {
+                pushCandidate(idxA + 1, idxB);
+                pushCandidate(idxA, idxB + 1);
+            }
+            forcedCandidates.push_back(candidate);
+            ++queued;
+        }
+        return queued;
+    }
+
+    bool hasForced() const {
+        return nextForcedCandidate < forcedCandidates.size();
+    }
+
+    /// A pass on a board where the team had a legal move: a choice to sit,
+    /// not the forced wait of a board that is not on turn.
+    bool isChoicePass(const JointActionCandidate& candidate) const {
+        return (candidate.moveA == Stockfish::MOVE_NONE && rules.boardACanMove)
+            || (candidate.moveB == Stockfish::MOVE_NONE && rules.boardBCanMove);
+    }
+
     void restoreFactorizedOrder() {
         for (size_t index = nextGumbelCandidate;
              index < gumbelCandidates.size(); ++index) {
@@ -558,6 +696,8 @@ public:
         gumbelCandidates.clear();
         nextGumbelCandidate = 0;
         promotedCandidate.reset();
+        forcedCandidates.clear();
+        nextForcedCandidate = 0;
         this->jointFactorRank = 0;
         
         // Use explicit on-turn status (not inferred from action count,
@@ -722,6 +862,8 @@ public:
         nextJointPolicyCandidate = 0;
         std::vector<JointActionCandidate>().swap(gumbelCandidates);
         nextGumbelCandidate = 0;
+        std::vector<JointActionCandidate>().swap(forcedCandidates);
+        nextForcedCandidate = 0;
     }
 
     /**
@@ -729,6 +871,7 @@ public:
      */
     bool hasNext() const {
         return promotedCandidate.has_value()
+            || nextForcedCandidate < forcedCandidates.size()
             || nextGumbelCandidate < gumbelCandidates.size()
             || nextJointPolicyCandidate < jointPolicyCandidates.size()
             || !heap.empty();
@@ -748,6 +891,9 @@ public:
     JointActionCandidate peekNext() const {
         if (promotedCandidate) {
             return *promotedCandidate;
+        }
+        if (nextForcedCandidate < forcedCandidates.size()) {
+            return forcedCandidates[nextForcedCandidate];
         }
         if (nextGumbelCandidate < gumbelCandidates.size()) {
             return gumbelCandidates[nextGumbelCandidate];
@@ -784,6 +930,8 @@ public:
         if (promotedCandidate) {
             best = *promotedCandidate;
             promotedCandidate.reset();
+        } else if (nextForcedCandidate < forcedCandidates.size()) {
+            best = forcedCandidates[nextForcedCandidate++];
         } else if (nextGumbelCandidate < gumbelCandidates.size()) {
             best = gumbelCandidates[nextGumbelCandidate++];
         } else {
