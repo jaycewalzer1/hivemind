@@ -17,6 +17,7 @@
 class UCI {
 private:
     friend class UCIOpeningNoiseTestPeer;
+    friend class UCIClockTestPeer;
 
     std::thread* mainSearchThread;
     std::unique_ptr<Agent> agent;
@@ -41,6 +42,13 @@ private:
     int openingNoiseAlphaPermille = 100;
     int openingNoiseEpsilonPermille = 600;
     std::mt19937_64 openingNoiseGenerator;
+    // TreeMoveMs option: ms each macro-ply charges inside the search tree
+    // when 'position ... clocks' gave clocks. 0 keeps clocks frozen.
+    int treeMoveMs = 0;
+
+    // Prints 'info string sample <base64>' for the finished search
+    // ('go ... sample'): one HVM5 TrainingSample record, as selfplay writes it.
+    void emit_sample();
 
     // Rebuilds the engines (and the agent) with the current settings. The batch
     // size is baked into the TensorRT engine, so changing it means reloading.

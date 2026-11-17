@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <cstdint>
 #include <iostream>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include "environment/planes.h"
 #include "common/utils.h"
 #include "common/globals.h"
+#include "tools/training_sample.h"
 
 using namespace std;
 
@@ -104,57 +107,95 @@ void UCI::new_game() {
 void UCI::position(istringstream& is) {
     stop();
 
-    std::string token;
-    is >> token;
-    
+    std::vector<std::string> tokens;
+    for (std::string token; is >> token;) {
+        tokens.push_back(token);
+    }
+    size_t at = 0;
+    if (tokens.empty()) {
+        return;
+    }
+
     // Set the board position
-    if (token == "startpos") {
+    if (tokens[at] == "startpos") {
         // Use a predefined starting FEN for the initial position.
         board.set("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        ++at;
     }
-    else if (token == "fen") {
-        // Build the FEN string until we hit "moves" or end of stream
+    else if (tokens[at] == "fen") {
+        // Build the FEN string until we hit "moves", "clocks" or the end
         std::string fen;
-        while (is >> token && token != "moves") {
-            fen += token + " ";
+        for (++at; at < tokens.size() && tokens[at] != "moves"
+                    && tokens[at] != "clocks"; ++at) {
+            fen += tokens[at] + " ";
         }
         board.set(fen);
-        
-        if (token == "moves") {
-            is.seekg(-6, std::ios_base::cur);  
-        }
     }
     else {
         return;
     }
-    
-    if (is >> token && token == "moves") {
-        // Parse move list (if any)
-        int moveCount = 0;
-        while (is >> token) {
-            if (token.empty() || token[0] < '1' || token[0] > '2') {
-                std::cerr << "Error: Invalid board indicator in move '" << token 
-                          << "' at move " << (moveCount + 1) << std::endl;
-                break;
-            }
-            int boardNum = token[0] - '1'; // '1' becomes 0, '2' becomes 1.
-            std::string moveStr = token.substr(1); // Extract move string without board indicator
-            Stockfish::Move m = Stockfish::UCI::to_move(*board.pos[boardNum], moveStr);
-            if (m == Stockfish::MOVE_NONE) {
-                std::cerr << "Error: Invalid move '" << moveStr << "' on board " 
-                          << (boardNum + 1) << " at move " << (moveCount + 1) << std::endl;
-                std::cerr << "       Current FEN: " << board.fen(boardNum) << std::endl;
-                std::cerr << "       Legal moves: ";
-                auto legalMoves = board.legal_moves(boardNum);
-                for (const auto& lm : legalMoves) {
-                    std::cerr << board.uci_move(boardNum, lm) << " ";
+    // Without a 'clocks' suffix there are no clocks (stock behaviour).
+    board.clear_clocks();
+
+    while (at < tokens.size()) {
+        const std::string& section = tokens[at++];
+        if (section == "moves") {
+            // Parse move list (if any)
+            int moveCount = 0;
+            for (; at < tokens.size() && tokens[at] != "clocks"; ++at) {
+                const std::string& token = tokens[at];
+                if (token.empty() || token[0] < '1' || token[0] > '2') {
+                    std::cerr << "Error: Invalid board indicator in move '" << token
+                              << "' at move " << (moveCount + 1) << std::endl;
+                    break;
                 }
-                std::cerr << std::endl;
-                break;  // Stop if an invalid move is encountered.
+                int boardNum = token[0] - '1'; // '1' becomes 0, '2' becomes 1.
+                std::string moveStr = token.substr(1); // Extract move string without board indicator
+                Stockfish::Move m = Stockfish::UCI::to_move(*board.pos[boardNum], moveStr);
+                if (m == Stockfish::MOVE_NONE) {
+                    std::cerr << "Error: Invalid move '" << moveStr << "' on board "
+                              << (boardNum + 1) << " at move " << (moveCount + 1) << std::endl;
+                    std::cerr << "       Current FEN: " << board.fen(boardNum) << std::endl;
+                    std::cerr << "       Legal moves: ";
+                    auto legalMoves = board.legal_moves(boardNum);
+                    for (const auto& lm : legalMoves) {
+                        std::cerr << board.uci_move(boardNum, lm) << " ";
+                    }
+                    std::cerr << std::endl;
+                    break;  // Stop if an invalid move is encountered.
+                }
+                board.push_move(boardNum, m);
+                moveCount++;
             }
-            board.push_move(boardNum, m);
-            moveCount++;
+            // After an invalid move the rest of the list is skipped, as before.
+            while (at < tokens.size() && tokens[at] != "clocks") {
+                ++at;
+            }
+        } else if (section == "clocks") {
+            // Remaining ms for A_white, A_black, B_white, B_black.
+            int64_t values[4];
+            int parsed = 0;
+            for (; parsed < 4 && at < tokens.size(); ++parsed, ++at) {
+                try {
+                    size_t used = 0;
+                    const double value = std::stod(tokens[at], &used);
+                    if (used != tokens[at].size() || !std::isfinite(value)) {
+                        break;
+                    }
+                    values[parsed] = static_cast<int64_t>(std::llround(value));
+                } catch (const std::exception&) {
+                    break;
+                }
+            }
+            if (parsed == 4) {
+                board.set_clocks(values[0], values[1], values[2], values[3]);
+            } else {
+                board.clear_clocks();
+                std::cout << "info string clocks needs four ms values"
+                          << " (A_white A_black B_white B_black); ignored" << std::endl;
+            }
         }
+        // Anything else after the position is ignored, as before.
     }
 }
 
@@ -163,6 +204,7 @@ void UCI::go(std::istringstream& is) {
     int moveTime = 0;
     size_t nodes = 0;
     bool isPonder = false;
+    bool emitSample = false;
     
     // Parse go parameters
     while (is >> token) {
@@ -172,6 +214,8 @@ void UCI::go(std::istringstream& is) {
             is >> moveTime;
         } else if (token == "nodes") {
             is >> nodes;
+        } else if (token == "sample") {
+            emitSample = true;
         }
     }
     
@@ -206,6 +250,11 @@ void UCI::go(std::istringstream& is) {
     }
     opts.enablePonder = ponderEnabled;
     opts.search = current_search_config();
+    if (emitSample) {
+        opts.beforeBestmove = [this]() { emit_sample(); };
+    }
+    // TreeMoveMs only acts when this position came with clocks.
+    board.treeMoveMs = treeMoveMs;
 
     // Dirichlet noise is applied when a root is first expanded. Discard an
     // already searched/noised retained root during the opening so every move
@@ -266,6 +315,47 @@ SearchParams::RuntimeConfig UCI::current_search_config() {
         static_cast<float>(openingNoiseEpsilonPermille) / 1000.0f;
     config.rootNoiseSeed = openingNoiseGenerator();
     return config;
+}
+
+void UCI::emit_sample() {
+    try {
+        std::vector<RootEdgeStats> edges = agent->root_edge_stats();
+        if (edges.empty()) {
+            std::cout << "info string sample failed: no root edges" << std::endl;
+            return;
+        }
+        uint64_t visits = 0;
+        for (const RootEdgeStats& edge : edges) {
+            visits += static_cast<uint64_t>(std::max(0, edge.visits));
+        }
+        if (visits == 0) {
+            // A root replaced by a proven mate carries its one action without
+            // visits; give each edge one visit so the target is that action.
+            for (RootEdgeStats& edge : edges) {
+                edge.visits = 1;
+            }
+        }
+        training::TrainingSample sample;
+        sample.gameId = 0;
+        sample.outcome = 0;
+        sample.movesLeft = 0;
+        sample.wdl = 1;
+        sample.macroPly = 0;
+        sample.team = teamSide == Stockfish::WHITE ? 0 : 1;
+        sample.hasTimeAdvantage = teamHasTimeAdvantage ? 1 : 0;
+        sample.nodes = static_cast<uint32_t>(std::min<uint64_t>(
+            visits, std::numeric_limits<uint32_t>::max()));
+        sample.rootQ = agent->root_q();
+        sample.planes = training::encode_planes(board, teamSide, teamHasTimeAdvantage);
+        sample.policyA = training::marginal_policy(board, BOARD_A, edges);
+        sample.policyB = training::marginal_policy(board, BOARD_B, edges);
+        sample.jointPolicy = training::joint_policy(board, edges);
+        std::cout << "info string sample "
+                  << training::base64_encode(training::serialize_sample(sample))
+                  << std::endl;
+    } catch (const std::exception& error) {
+        std::cout << "info string sample failed: " << error.what() << std::endl;
+    }
 }
 
 void UCI::ponderhit() {
@@ -448,6 +538,19 @@ void UCI::setoption(std::istringstream& is) {
                       : g_requiredMoveBoard == REQUIRE_MOVE_BOARD_B ? "B"
                       : "none")
                   << std::endl;
+    } else if (name == "FreePass") {
+        if (value == "true" || value == "false") {
+            g_freePass = value == "true";
+            std::cout << "info string FreePass set to " << value << std::endl;
+        }
+    } else if (name == "MateProbeAnyTime") {
+        if (value == "true" || value == "false") {
+            searchConfig.mateProbeAnyTime = value == "true";
+            std::cout << "info string MateProbeAnyTime set to " << value << std::endl;
+        }
+    } else if (name == "TreeMoveMs") {
+        treeMoveMs = std::clamp(std::stoi(value), 0, 3600000);
+        std::cout << "info string TreeMoveMs set to " << treeMoveMs << std::endl;
     } else if (name == "TimeAdvantage") {
         if (value == "true" || value == "false") {
             teamHasTimeAdvantage = value == "true";
@@ -518,6 +621,9 @@ void UCI::send_uci_response() {
     cout << "option name Team type combo default white var white var black" << endl;
     cout << "option name TimeAdvantage type check default false" << endl;
     cout << "option name RequireMoveOn type combo default none var none var A var B" << endl;
+    cout << "option name FreePass type check default false" << endl;
+    cout << "option name MateProbeAnyTime type check default false" << endl;
+    cout << "option name TreeMoveMs type spin default 0 min 0 max 3600000" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

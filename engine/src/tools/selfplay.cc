@@ -1,4 +1,5 @@
 #include "tools/selfplay.h"
+#include "tools/training_sample.h"
 
 #include <algorithm>
 #include <array>
@@ -29,50 +30,13 @@
 
 namespace {
 
-constexpr std::array<char, 4> CHUNK_MAGIC = {'H', 'V', 'M', '5'};
-constexpr uint32_t CHUNK_VERSION = 5;
-constexpr uint16_t PASS_POLICY_INDEX = static_cast<uint16_t>(NB_POLICY_VALUES());
-
-struct SparsePolicyEntry {
-    uint16_t index;
-    float probability;
-};
-
-struct SparseJointPolicyEntry {
-    uint16_t indexA;
-    uint16_t indexB;
-    float probability;
-};
-
-struct TrainingSample {
-    uint64_t gameId = 0;
-    uint32_t nodes = 0;
-    uint16_t macroPly = 0;
-    uint16_t movesLeft = 0;
-    uint8_t team = 0;
-    uint8_t hasTimeAdvantage = 0;
-    int8_t outcome = 0;
-    uint8_t wdl = 1;
-    float rootQ = 0.0f;
-    std::array<uint8_t, NB_INPUT_VALUES()> planes{};
-    std::vector<SparsePolicyEntry> policyA;
-    std::vector<SparsePolicyEntry> policyB;
-    std::vector<SparseJointPolicyEntry> jointPolicy;
-};
+using namespace training;
 
 struct PgnMove {
     std::string token;
     std::string san;
     float remainingSeconds = 0.0f;
 };
-
-template <typename T>
-void write_scalar(std::ostream& stream, const T& value) {
-    stream.write(reinterpret_cast<const char*>(&value), sizeof(T));
-    if (!stream) {
-        throw std::runtime_error("Failed to write self-play chunk");
-    }
-}
 
 class ChunkWriter {
 public:
@@ -99,31 +63,6 @@ public:
     }
 
 private:
-    void write_policy(std::ostream& stream, const std::vector<SparsePolicyEntry>& policy) {
-        if (policy.size() > std::numeric_limits<uint16_t>::max()) {
-            throw std::runtime_error("Sparse policy is too large for HVM5");
-        }
-        write_scalar(stream, static_cast<uint16_t>(policy.size()));
-        for (const SparsePolicyEntry& entry : policy) {
-            write_scalar(stream, entry.index);
-            write_scalar(stream, entry.probability);
-        }
-    }
-
-    void write_joint_policy(
-        std::ostream& stream,
-        const std::vector<SparseJointPolicyEntry>& policy) {
-        if (policy.size() > std::numeric_limits<uint16_t>::max()) {
-            throw std::runtime_error("Sparse joint policy is too large for HVM5");
-        }
-        write_scalar(stream, static_cast<uint16_t>(policy.size()));
-        for (const SparseJointPolicyEntry& entry : policy) {
-            write_scalar(stream, entry.indexA);
-            write_scalar(stream, entry.indexB);
-            write_scalar(stream, entry.probability);
-        }
-    }
-
     void flush(size_t count) {
         std::ostringstream filename;
         filename << "chunk_" << runId_ << '_' << std::setw(6) << std::setfill('0')
@@ -135,29 +74,10 @@ private:
         if (!stream) {
             throw std::runtime_error("Unable to create " + temporaryPath.string());
         }
-        stream.write(CHUNK_MAGIC.data(), CHUNK_MAGIC.size());
-        write_scalar(stream, CHUNK_VERSION);
-        write_scalar(stream, static_cast<uint16_t>(NB_INPUT_CHANNELS));
-        write_scalar(stream, static_cast<uint16_t>(NB_POLICY_VALUES()));
-        write_scalar(stream, static_cast<uint64_t>(count));
+        write_chunk_header(stream, static_cast<uint64_t>(count));
 
         for (size_t index = 0; index < count; ++index) {
-            const TrainingSample& sample = pending_[index];
-            write_scalar(stream, sample.gameId);
-            write_scalar(stream, sample.nodes);
-            write_scalar(stream, sample.macroPly);
-            write_scalar(stream, sample.movesLeft);
-            write_scalar(stream, sample.team);
-            write_scalar(stream, sample.hasTimeAdvantage);
-            write_scalar(stream, sample.outcome);
-            write_scalar(stream, sample.wdl);
-            write_scalar(stream, sample.rootQ);
-            stream.write(
-                reinterpret_cast<const char*>(sample.planes.data()),
-                static_cast<std::streamsize>(sample.planes.size()));
-            write_policy(stream, sample.policyA);
-            write_policy(stream, sample.policyB);
-            write_joint_policy(stream, sample.jointPolicy);
+            write_sample(stream, pending_[index]);
         }
         stream.close();
         if (!stream) {
@@ -412,81 +332,6 @@ bool action_leads_to_terminal(
         || future.is_draw();
 }
 
-int policy_index(Board& board, int boardNumber, Stockfish::Move move) {
-    const int idx = get_fast_policy_index(move, board.side_to_move(boardNumber));
-    if (idx < 0) {
-        throw std::runtime_error("Move is absent from policy map: " + board.uci_move(boardNumber, move));
-    }
-    return idx;
-}
-
-std::vector<SparsePolicyEntry> marginal_policy(
-    Board& board,
-    int boardNumber,
-    const std::vector<RootEdgeStats>& edges) {
-    std::map<uint16_t, uint64_t> visitsByMove;
-    uint64_t totalVisits = 0;
-    for (const RootEdgeStats& edge : edges) {
-        if (edge.visits <= 0) {
-            continue;
-        }
-        const Stockfish::Move move = boardNumber == BOARD_A
-            ? edge.action.moveA
-            : edge.action.moveB;
-        const int index = policy_index(board, boardNumber, move);
-        visitsByMove[static_cast<uint16_t>(index)] += static_cast<uint64_t>(edge.visits);
-        totalVisits += static_cast<uint64_t>(edge.visits);
-    }
-    if (totalVisits == 0) {
-        throw std::runtime_error("Search returned no visited root edges");
-    }
-
-    std::vector<SparsePolicyEntry> policy;
-    policy.reserve(visitsByMove.size());
-    for (const auto& [index, visits] : visitsByMove) {
-        policy.push_back({index, static_cast<float>(visits) / static_cast<float>(totalVisits)});
-    }
-    return policy;
-}
-
-uint16_t joint_policy_index(Board& board, int boardNumber,
-                            Stockfish::Move move) {
-    if (move == Stockfish::MOVE_NONE) {
-        return PASS_POLICY_INDEX;
-    }
-    return static_cast<uint16_t>(policy_index(board, boardNumber, move));
-}
-
-std::vector<SparseJointPolicyEntry> joint_policy(
-    Board& board, const std::vector<RootEdgeStats>& edges) {
-    std::map<std::pair<uint16_t, uint16_t>, uint64_t> visitsByAction;
-    uint64_t totalVisits = 0;
-    for (const RootEdgeStats& edge : edges) {
-        if (edge.visits <= 0) {
-            continue;
-        }
-        const auto key = std::make_pair(
-            joint_policy_index(board, BOARD_A, edge.action.moveA),
-            joint_policy_index(board, BOARD_B, edge.action.moveB));
-        visitsByAction[key] += static_cast<uint64_t>(edge.visits);
-        totalVisits += static_cast<uint64_t>(edge.visits);
-    }
-    if (totalVisits == 0) {
-        throw std::runtime_error("Search returned no visited root edges");
-    }
-
-    std::vector<SparseJointPolicyEntry> policy;
-    policy.reserve(visitsByAction.size());
-    for (const auto& [indices, visits] : visitsByAction) {
-        policy.push_back({
-            indices.first,
-            indices.second,
-            static_cast<float>(visits) / static_cast<float>(totalVisits),
-        });
-    }
-    return policy;
-}
-
 JointActionCandidate select_action(
     const std::vector<RootEdgeStats>& edges,
     double temperature,
@@ -520,20 +365,6 @@ JointActionCandidate select_action(
     }
     std::discrete_distribution<size_t> distribution(weights.begin(), weights.end());
     return edges[distribution(randomEngine)].action;
-}
-
-std::array<uint8_t, NB_INPUT_VALUES()> encode_planes(
-    Board& board,
-    Stockfish::Color team,
-    bool hasTimeAdvantage) {
-    std::array<float, NB_INPUT_VALUES()> raw{};
-    std::array<uint8_t, NB_INPUT_VALUES()> encoded{};
-    board_to_planes(board, raw.data(), team, hasTimeAdvantage);
-    for (size_t index = 0; index < raw.size(); ++index) {
-        encoded[index] = static_cast<uint8_t>(std::lround(
-            std::clamp(raw[index], 0.0f, 1.0f) * 255.0f));
-    }
-    return encoded;
 }
 
 std::string current_date() {
