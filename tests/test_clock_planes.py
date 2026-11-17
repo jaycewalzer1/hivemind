@@ -190,13 +190,13 @@ def test_widened_network_matches_original_whatever_the_clocks_hold():
     old = _cross_board_model(74)
     old.use_wdl = True
     old_state = old.state_dict()
-    new = tool.load_model(tool.widen_state_dict(old_state))
+    new = tool.load_model(tool.widen_state_dict(old_state, 41))
     assert new.board_channels == 41
 
     rng = np.random.default_rng(0)
     planes74 = rng.uniform(0, 1, size=(6, 74, 8, 8)).astype(np.float32)
     for clocks in (None, rng.uniform(-10, 10, size=(6, 2, 4))):
-        planes82 = tool.widen_planes(planes74, clocks)
+        planes82 = tool.widen_planes(planes74, clocks, target=41)
         np.testing.assert_array_equal(tool.strip_clock_planes(planes82), planes74)
         diffs = tool.max_diffs(tool._torch_outputs(old, planes74), tool._torch_outputs(new, planes82))
         assert max(diffs.values()) < 1e-5, diffs
@@ -204,7 +204,7 @@ def test_widened_network_matches_original_whatever_the_clocks_hold():
     # The check is not vacuous: a non-zero clock weight changes the outputs.
     with torch.no_grad():
         new.body_spatial[0].body[0].weight[:, 37:41] = 0.5
-    planes82 = tool.widen_planes(planes74, np.ones((6, 2, 4)))
+    planes82 = tool.widen_planes(planes74, np.ones((6, 2, 4)), target=41)
     diffs = tool.max_diffs(tool._torch_outputs(old, planes74), tool._torch_outputs(new, planes82))
     assert max(diffs.values()) > 1e-3
 
@@ -220,7 +220,7 @@ def test_widened_optimizer_state_loads_and_steps():
     checkpoint = {"model_state_dict": old.state_dict(),
                   "optimizer_state_dict": optimizer.state_dict(),
                   "training_iteration": 1, "evaluation_step": 0, "batch_steps": 1}
-    widened = tool.widen_checkpoint(checkpoint)
+    widened = tool.widen_checkpoint(checkpoint, 41)
     new = tool.load_model(widened["model_state_dict"]).train()
     new_optimizer = torch.optim.SGD(new.parameters(), lr=0.01, momentum=0.9)
     new_optimizer.load_state_dict(widened["optimizer_state_dict"])

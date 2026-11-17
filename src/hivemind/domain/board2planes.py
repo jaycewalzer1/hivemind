@@ -8,7 +8,7 @@ from hivemind.domain.board import BughouseBoard
 from hivemind.constants import (BOARD_A, BOARD_B, BOARD_HEIGHT, BOARD_WIDTH,
                            MAX_NUM_DROPS, MAX_NUM_NO_PROGRESS,
                            NUM_BUGHOUSE_CHANNELS_PER_BOARD, CLOCK_CHANNEL_OFFSET,
-                           channels_per_board)
+                           ELAPSED_CHANNEL_OFFSET, channels_per_board)
 
 
 _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
@@ -107,20 +107,58 @@ def _fill_clock_planes(planes, offset, team_side, clocks) -> None:
         planes[c + 2][:, :], planes[c + 3][:, :] = clock_plane_values(theirs)
 
 
+def elapsed_plane_values(elapsed_ms: float) -> tuple[float, float]:
+    """The two elapsed-time plane values for one board (spec v2, section A).
+
+    e = seconds since the last move landed on that board (or since the game
+    started): min(e / 10, 1) and 1 - exp(-e / 2). A negative e counts as 0.
+    """
+    e = max(float(elapsed_ms), 0.0) / 1000.0
+    return min(e / 10.0, 1.0), 1.0 - math.exp(-e / 2.0)
+
+
+def _fill_elapsed_planes(planes, offset, elapsed) -> None:
+    """Fill channels 41..42 of both board blocks from (ea, eb) in ms.
+
+    The planes describe the board, not a seat: they say how long whichever side
+    is on turn there (plane 25) has been thinking.
+    """
+    if len(elapsed) != 2:
+        raise ValueError("elapsed must be (ms on board A, ms on board B)")
+    for base, value in ((0, elapsed[0]), (offset, elapsed[1])):
+        c = base + ELAPSED_CHANNEL_OFFSET
+        planes[c][:, :], planes[c + 1][:, :] = elapsed_plane_values(value)
+
+
 def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
-                 clocks=None, clock_planes=None) -> np.ndarray:
+                 clocks=None, clock_planes=None, elapsed=None,
+                 elapsed_planes=None) -> np.ndarray:
     """Encode a bughouse position from team_side's view.
 
     Default: 37 channels per board (74 total), unchanged. With clock_planes=True,
     or when clocks are given, 41 channels per board (82 total): channels 37..40 of
     each board block hold the clock planes (all 0 when clocks is None).
+    With elapsed_planes=True, or when elapsed is given, 43 channels per board
+    (86 total, spec v2): 37..40 clocks as above and 41..42 the elapsed-time
+    planes (all 0 when elapsed is None).
     clocks: remaining ms for (A_white, A_black, B_white, B_black).
+    elapsed: ms since the last move landed on board A and on board B. Read only
+    together with clocks, as the engine does (UCI 'elapsed' extends the 'clocks'
+    suffix, and planes.cc leaves 41..42 at 0 without clocks): elapsed without
+    clocks gives elapsed planes of 0.
     """
+    if elapsed_planes is None:
+        elapsed_planes = elapsed is not None
+    if elapsed is not None and not elapsed_planes:
+        raise ValueError("elapsed needs elapsed_planes=True")
     if clock_planes is None:
-        clock_planes = clocks is not None
+        clock_planes = clocks is not None or elapsed_planes
     if clocks is not None and not clock_planes:
         raise ValueError("clocks need clock_planes=True")
-    offset = channels_per_board(clock_planes)
+    if elapsed_planes and not clock_planes:
+        raise ValueError("elapsed planes come after the clock planes; "
+                         "clock_planes=False is not a supported layout")
+    offset = channels_per_board(clock_planes, elapsed_planes)
     planes = np.zeros(
         (2 * offset, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32
     )
@@ -233,6 +271,10 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
 
     if clocks is not None:
         _fill_clock_planes(planes, offset, team_side, clocks)
+    if elapsed is not None and len(elapsed) != 2:
+        raise ValueError("elapsed must be (ms on board A, ms on board B)")
+    if elapsed is not None and clocks is not None:
+        _fill_elapsed_planes(planes, offset, elapsed)
 
     if flip:
         a_block = planes[:offset].copy()

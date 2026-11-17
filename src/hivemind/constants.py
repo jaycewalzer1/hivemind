@@ -20,14 +20,35 @@ NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD = (
 )
 NUM_CLOCK_BUGHOUSE_CHANNELS = 2 * NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
 CLOCK_CHANNEL_OFFSET = NUM_BUGHOUSE_CHANNELS_PER_BOARD
+
+# Spec v2 (custom engine): two more planes per board after the clock planes,
+# how long the side on turn there has been thinking. 43 channels per board.
+NUM_ELAPSED_CHANNELS_PER_BOARD = 2
+NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD = (
+    NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD + NUM_ELAPSED_CHANNELS_PER_BOARD
+)
+NUM_ELAPSED_BUGHOUSE_CHANNELS = 2 * NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD
+ELAPSED_CHANNEL_OFFSET = NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
+
 SUPPORTED_CHANNELS_PER_BOARD = (
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD,
 )
 
+# Spec v2 auxiliary heads: think_gain (one logit per board) and arrivals
+# (4 pockets x 5 piece types: ours A, theirs A, ours B, theirs B; P N B R Q).
+NUM_THINK_GAIN_OUTPUTS = 2
+NUM_ARRIVAL_POCKETS = 4
+NUM_ARRIVAL_PIECE_TYPES = 5
+NUM_ARRIVAL_OUTPUTS = NUM_ARRIVAL_POCKETS * NUM_ARRIVAL_PIECE_TYPES
 
-def channels_per_board(clock_planes: bool = False) -> int:
-    """Channels in one board block: 37 by default, 41 with clock planes."""
+
+def channels_per_board(clock_planes: bool = False, elapsed_planes: bool = False) -> int:
+    """Channels in one board block: 37 by default, 41 with clock planes,
+    43 with clock and elapsed-time planes (elapsed implies clocks)."""
+    if elapsed_planes:
+        return NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD
     return (
         NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
         if clock_planes
