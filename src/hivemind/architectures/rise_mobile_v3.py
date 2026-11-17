@@ -30,7 +30,7 @@ from hivemind.architectures.builder_util import get_act, _ValueHead, _PolicyHead
     _Stem, process_value_policy_head, _BottlekneckResidualBlock, ClassicalResidualBlock, round_to_next_multiple_of_32
 from hivemind.architectures.next_vit_official_modules import NCB
 from hivemind.architectures.next_vit_official_modules import NTB
-from hivemind.constants import NUM_BUGHOUSE_CHANNELS_PER_BOARD
+from hivemind.constants import board_channels_from_total
 
 
 class _SharedPolicyHeads(Module):
@@ -336,15 +336,18 @@ class CrossBoardRiseV3(RiseV3):
             )
         super().__init__(*args, shared_policy_trunk=False, **kwargs)
 
-        if self.nb_input_channels != 2 * NUM_BUGHOUSE_CHANNELS_PER_BOARD:
+        try:
+            board_channels = board_channels_from_total(self.nb_input_channels)
+        except ValueError:
             raise ValueError(
-                "CrossBoardRiseV3 requires two 37-plane bughouse boards"
-            )
+                "CrossBoardRiseV3 requires two 37-plane (or 41-plane with "
+                "clocks) bughouse boards"
+            ) from None
+        self.board_channels = board_channels
         if attention_layers not in (1, 2):
             raise ValueError("CrossBoardRiseV3 supports one or two attention layers")
 
         channels = self.channels
-        board_channels = NUM_BUGHOUSE_CHANNELS_PER_BOARD
         self.board_token_projections = nn.ModuleList([
             Sequential(
                 Conv2d(channels + board_channels, attention_dim, kernel_size=1,
@@ -409,7 +412,7 @@ class CrossBoardRiseV3(RiseV3):
         nn.init.trunc_normal_(self.context_role_embedding, std=0.02)
 
     def _context_tokens(self, x):
-        offset = NUM_BUGHOUSE_CHANNELS_PER_BOARD
+        offset = self.board_channels
         pocket_values = (
             x[:, 12:17].mean(dim=(2, 3)),
             x[:, 17:22].mean(dim=(2, 3)),
@@ -428,7 +431,7 @@ class CrossBoardRiseV3(RiseV3):
 
     def forward(self, x):
         shared_spatial = self.body_spatial(x)
-        board_inputs = x.split(NUM_BUGHOUSE_CHANNELS_PER_BOARD, dim=1)
+        board_inputs = x.split(self.board_channels, dim=1)
         board_maps = [
             projection(torch.cat((shared_spatial, board_input), dim=1))
             for projection, board_input in zip(
@@ -623,10 +626,14 @@ class DualStreamMemoryRiseV3(Module):
         joint_policy_rank=0,
     ):
         super().__init__()
-        if nb_input_channels != 2 * NUM_BUGHOUSE_CHANNELS_PER_BOARD:
+        try:
+            board_channels = board_channels_from_total(nb_input_channels)
+        except ValueError:
             raise ValueError(
-                "DualStreamMemoryRiseV3 requires two 37-plane bughouse boards"
-            )
+                "DualStreamMemoryRiseV3 requires two 37-plane (or 41-plane "
+                "with clocks) bughouse boards"
+            ) from None
+        self.board_channels = board_channels
         if board_height * board_width != 64:
             raise ValueError("DualStreamMemoryRiseV3 requires 8x8 boards")
         if sum(stage_sizes) != len(kernels) or len(stage_sizes) != 3:
@@ -677,7 +684,7 @@ class DualStreamMemoryRiseV3(Module):
         self.shared_stem = _Stem(
             channels=channels,
             act_type=act_types[0],
-            nb_input_channels=NUM_BUGHOUSE_CHANNELS_PER_BOARD,
+            nb_input_channels=board_channels,
         )
         stage_boundaries = (
             0,
@@ -778,7 +785,7 @@ class DualStreamMemoryRiseV3(Module):
         nn.init.trunc_normal_(self.context_role_embedding, std=0.02)
 
     def _context_tokens(self, x):
-        offset = NUM_BUGHOUSE_CHANNELS_PER_BOARD
+        offset = self.board_channels
         pocket_values = (
             x[:, 12:17].mean(dim=(2, 3)),
             x[:, 17:22].mean(dim=(2, 3)),
@@ -828,7 +835,7 @@ class DualStreamMemoryRiseV3(Module):
     def forward(self, x):
         batch_size = x.shape[0]
         board_a_input, board_b_input = x.split(
-            NUM_BUGHOUSE_CHANNELS_PER_BOARD, dim=1
+            self.board_channels, dim=1
         )
         paired_maps = self.shared_stem(
             torch.cat((board_a_input, board_b_input), dim=0)

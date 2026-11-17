@@ -2,7 +2,11 @@
 
 from dataclasses import dataclass
 
-from hivemind.constants import NUM_BUGHOUSE_CHANNELS
+from hivemind.constants import (
+    NUM_BUGHOUSE_CHANNELS,
+    board_channels_from_total,
+    channels_per_board,
+)
 from hivemind.architectures.rise_mobile_v3 import (
     get_cross_board_rise_v33_model,
     get_dual_stream_memory_rise_v33_model,
@@ -38,8 +42,19 @@ class ModelArgs:
     memory_tokens: int = 8
 
 
-def get_model_args(train_config=None, architecture="risev33") -> ModelArgs:
+def input_shape_for(clock_planes: bool = False) -> tuple[int, int, int]:
+    """Network input shape: (74, 8, 8) by default, (82, 8, 8) with clock planes."""
+    return (2 * channels_per_board(clock_planes), 8, 8)
+
+
+def has_clock_planes(args) -> bool:
+    return board_channels_from_total(args.input_shape[0]) != channels_per_board(False)
+
+
+def get_model_args(train_config=None, architecture="risev33",
+                   clock_planes: bool = False) -> ModelArgs:
     args = ModelArgs(model_type=architecture)
+    args.input_shape = input_shape_for(clock_planes)
     if train_config is not None:
         args.use_wdl = bool(train_config.use_wdl)
         args.use_plys_to_end = bool(train_config.use_plys_to_end)
@@ -63,6 +78,13 @@ def model_args_from_state_dict(state_dict) -> ModelArgs:
     Attention head count is not encoded in tensor shapes; released models use six.
     """
     args = ModelArgs()
+    stem_weight = state_dict.get("body_spatial.0.body.0.weight")
+    if stem_weight is not None:
+        args.input_shape = (int(stem_weight.shape[1]), 8, 8)
+    shared_stem_weight = state_dict.get("shared_stem.body.0.weight")
+    if shared_stem_weight is not None:
+        args.input_shape = (2 * int(shared_stem_weight.shape[1]), 8, 8)
+    board_channels_from_total(args.input_shape[0])
     if any(key.startswith("memory_exchanges.") for key in state_dict):
         args.model_type = "dualstream-memory-risev33"
         args.memory_tokens = state_dict["initial_memory"].shape[1]
