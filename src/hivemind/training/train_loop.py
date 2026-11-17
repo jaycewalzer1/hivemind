@@ -133,6 +133,8 @@ def configure_batch_size(train_config, architecture, batch_size=None):
         factor = selected_batch_size / original_batch_size
         train_config.max_lr *= factor
         train_config.min_lr *= factor
+        if hasattr(train_config, "trunk_max_lr"):
+            train_config.trunk_max_lr *= factor
         print(
             f"Learning rate scaled by {factor:g} with the batch size: max_lr "
             f"{train_config.max_lr:g}, min_lr {train_config.min_lr:g}"

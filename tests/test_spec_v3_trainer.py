@@ -74,7 +74,7 @@ def test_param_groups_partition_the_network(widened):
     assert all(n.startswith(("think_gain_head.", "arrivals_head.")) for n in groups["new"]["param_names"])
     assert set(groups["widened"]["param_names"]) == set(new_input_columns(new, 37))
     assert tc.max_lr * groups["trunk"]["lr_scale"] == pytest.approx(1e-4)
-    assert groups["new"]["lr_scale"] == groups["widened"]["lr_scale"] == 1.0
+    assert groups["new"]["lr_scale"] == 1.0 and groups["widened"]["lr_scale"] == 10.0
     assert groups["widened"]["weight_decay"] == 0.0
 
 
@@ -122,7 +122,7 @@ def test_batch_lr_consistency():
     tc = rl_clock_train_config()
     lr = tc.max_lr
     configure_batch_size(tc, "crossboard-risev33")
-    assert tc.batch_size == 256 and tc.max_lr == pytest.approx(lr / 2)
+    assert tc.batch_size == 256 and tc.max_lr == pytest.approx(lr / 2) and tc.trunk_max_lr == pytest.approx(5e-5)
     stock = rl_train_config()
     configure_batch_size(stock, "crossboard-risev33")
     assert stock.max_lr == lr  # stock recipe unchanged
@@ -132,7 +132,7 @@ def test_clock_recipe_defaults():
     tc = rl_clock_train_config()
     assert tc.plys_to_end_loss_factor == 0.0 and tc.q_value_ratio == 0.2
     assert tc.arrivals_piece_weights == (1.0, 2.0, 2.0, 2.0, 4.0) and tc.arrivals_loss == "log1p"
-    assert tc.sample_weight_targets == "policy" and tc.finetune_param_groups
+    assert tc.sample_weight_targets == "policy" and tc.finetune_param_groups and tc.freeze_batchnorm_stats
     stock = rl_train_config()
     assert not stock.finetune_param_groups and stock.sample_weight_targets == "none"
     assert stock.arrivals_loss == "mse"
@@ -180,3 +180,19 @@ def test_drift_is_zero_for_the_widened_start(widened):
     d = drift_metrics(ref, cur)
     assert d["policy_kl"] < 1e-6 and d["value_mse"] < 1e-10 and d["positions"] == 6
     assert new_columns_max_abs(new) == 0.0
+
+
+def test_frozen_batchnorm_stats_do_not_move(widened):
+    from hivemind.training.trainer_agent import set_train_mode
+    _, new = widened
+    tc = rl_clock_train_config()
+    bn = next(m for m in new.modules() if isinstance(m, torch.nn.BatchNorm2d))
+    before = bn.running_mean.clone()
+    set_train_mode(new, tc)
+    assert new.training and not bn.training
+    with torch.no_grad():
+        new(torch.rand(4, 86, 8, 8))
+    assert torch.equal(bn.running_mean, before)
+    set_train_mode(new, rl_train_config())
+    assert bn.training
+    new.eval()

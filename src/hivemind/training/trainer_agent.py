@@ -163,7 +163,7 @@ class TrainerAgentPytorch:
         """
 
         self._setup_variables(cur_it)
-        self._model.train()  # set training mode
+        set_train_mode(self._model, self.tc)  # set training mode
 
         while self.continue_training:
             # reshuffle the ordering of the training game batches (shuffle works in place)
@@ -458,7 +458,7 @@ class TrainerAgentPytorch:
                 )
                 additional_metric_values[dataset_name] = metric_values
 
-        self._model.train()  # return back to training mode
+        set_train_mode(self._model, self.tc)  # return back to training mode
         return train_metric_values, val_metric_values, additional_metric_values
 
     def train_update(self, batch):
@@ -535,6 +535,11 @@ class TrainerAgentPytorch:
         Training update for RL mode with separate policy_a and policy_b targets.
         Batch format: (data, value_label, policy_a, policy_b, wdl, moves_left)
         """
+        if getattr(self.tc, "freeze_batchnorm_stats", False):
+            # Re-applied every step: tensorboard's add_graph (after the first
+            # step) restores training mode with model.train(), which would put
+            # every BatchNorm layer back into training mode.
+            set_train_mode(self._model, self.tc)
         self.optimizer.zero_grad()
 
         data, value_label, policy_a, policy_b, wdl_label, moves_left_label = batch[:6]
@@ -638,7 +643,7 @@ class TrainerAgentPytorch:
         print("starting val eval (RL)")
         val_metric_values = self._evaluate_metrics_rl(self._val_loader, nb_batches=None)
 
-        self._model.train()
+        set_train_mode(self._model, self.tc)
         return train_metric_values, val_metric_values, {}
 
     def _evaluate_metrics_rl(self, data_loader, nb_batches=None):
@@ -966,7 +971,8 @@ def finetune_param_groups(model: nn.Module, train_config: TrainConfig) -> list:
 
     trunk: every parameter the source network had, lr_scale = trunk_max_lr /
     max_lr (at most 1). new: the aux heads, lr_scale = new_params_lr_factor.
-    widened: the input tensors with new columns, at the new rate; a gradient
+    widened: the input tensors with new columns, lr_scale =
+    new_columns_lr_factor for the new columns; a gradient
     hook scales their old columns to the trunk rate and applies weight decay
     per column (the group's own weight_decay is 0), so for SGD/NAG every
     column moves exactly as if it sat in its own group. Each group carries
@@ -975,12 +981,13 @@ def finetune_param_groups(model: nn.Module, train_config: TrainConfig) -> list:
     max_lr = float(train_config.max_lr)
     trunk_scale = min(1.0, float(train_config.trunk_max_lr) / max_lr) if max_lr > 0 else 1.0
     new_scale = float(train_config.new_params_lr_factor)
+    column_scale_lr = float(getattr(train_config, "new_columns_lr_factor", new_scale))
     wd = float(train_config.wd)
     masks = new_input_columns(model, int(train_config.source_board_channels))
     groups = {
         "trunk": {"params": [], "param_names": [], "lr_scale": trunk_scale, "weight_decay": wd},
         "new": {"params": [], "param_names": [], "lr_scale": new_scale, "weight_decay": wd},
-        "widened": {"params": [], "param_names": [], "lr_scale": new_scale, "weight_decay": 0.0},
+        "widened": {"params": [], "param_names": [], "lr_scale": column_scale_lr, "weight_decay": 0.0},
     }
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -992,7 +999,8 @@ def finetune_param_groups(model: nn.Module, train_config: TrainConfig) -> list:
             shape = [1] * param.dim()
             shape[1] = -1
             column_scale = torch.where(
-                masks[name], torch.tensor(1.0), torch.tensor(trunk_scale / new_scale if new_scale else 0.0)
+                masks[name], torch.tensor(1.0),
+                torch.tensor(trunk_scale / column_scale_lr if column_scale_lr else 0.0),
             ).view(shape).to(param.device, param.dtype)
 
             def hook(grad, p=param, scale=column_scale):
@@ -1009,6 +1017,17 @@ def finetune_param_groups(model: nn.Module, train_config: TrainConfig) -> list:
             group["name"] = key
             out.append(group)
     return out
+
+
+def set_train_mode(model: nn.Module, train_config: TrainConfig) -> None:
+    """model.train(), except that with freeze_batchnorm_stats every BatchNorm
+    layer stays in eval mode: it normalises with the source network's running
+    statistics and does not update them (their affine weights still train)."""
+    model.train()
+    if getattr(train_config, "freeze_batchnorm_stats", False):
+        for module in model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
 
 
 def uses_sample_weights(train_config: TrainConfig) -> bool:
