@@ -19,6 +19,7 @@
 // Only the stub player exists so far.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,7 +42,7 @@ inline char board_name(int board) { return board == 0 ? 'A' : 'B'; }
 
 struct GameResult {
     std::string result;  // "T1" | "T2" | "draw"
-    std::string reason;  // "checkmate" | "flag" | "max_plies" | "aborted"
+    std::string reason;  // "checkmate" | "flag" | "double_flag" | "repetition" | "max_plies" | "aborted"
     int board = -1;      // -1 = none
     int loserSeat = -1;  // -1 = none
 };
@@ -66,7 +67,8 @@ class BughouseState {
     const std::optional<GameResult>& result() const { return result_; }
 
     /// Charge elapsed time to the side to move on each board. Returns the flag
-    /// result the first time a clock reaches 0.
+    /// result the first time a clock reaches 0; two clocks out at the same ms
+    /// is a draw ("double_flag"), as in state.py.
     std::optional<GameResult> advance_clocks(int64_t nowMs);
     /// Throws std::invalid_argument on an illegal move or a flag before landing.
     MoveResult apply_move(int seat, const std::string& uci, int64_t nowMs);
@@ -81,6 +83,8 @@ class BughouseState {
     Stockfish::StateListPtr states_[2];
     std::optional<GameResult> result_;
     int halfmove_[2] = {0, 0};  ///< python-chess halfmove clock per board
+    /// state.py repetition: board-only position -> occurrences since the last drop on that board.
+    std::map<std::string, int> seen_[2];
 };
 
 /// Fairy-Stockfish has no notion of "a drop could block": the arena's geometric rule.
@@ -152,6 +156,8 @@ struct GameConfig {
     int64_t thinkMs[NUM_SEATS] = {100, 100, 100, 100};
     int64_t waitMs[NUM_SEATS] = {200, 200, 200, 200};
     int waitPct = 0;
+    int64_t minMoveMs = 0;  ///< sim.py min_move_ms: floor on every landing's cost
+    int64_t lagMaxMs = 0;   ///< sim.py lag_max_ms: + SplitMix64(seed ^ "lag_") % (lagMaxMs + 1) per move
 };
 
 /// arena/sim.py Simulator restricted to message-free, lend-free players.
@@ -206,6 +212,7 @@ class Simulator {
     Status status_[NUM_SEATS] = {IDLE, IDLE, IDLE, IDLE};
     int64_t gen_[NUM_SEATS] = {0, 0, 0, 0};
     bool sitting_[NUM_SEATS] = {false, false, false, false};
+    SplitMix64 lagRng_{0};
 };
 
 uint64_t fnv1a64(const std::string& s);

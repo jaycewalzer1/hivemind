@@ -7,6 +7,7 @@
 // One game per input line, tab separated:
 //   game_id  fenA  fenB  base_ms  inc_ms  max_plies  seed
 //   think_AW,think_AB,think_BW,think_BB  wait_AW,wait_AB,wait_BW,wait_BB  wait_pct
+//   [min_move_ms  lag_max_ms]   (optional; 0 = off, as sim.py's defaults)
 // One output line per game: {"game_id":..,"events":[..],"trace":[..]}.
 //
 // TODO(custom-engine): 'async_selfplay engine ...' driving Hivemind searches
@@ -59,6 +60,19 @@ const char* other_team(const char* team) { return std::string(team) == "T1" ? "T
 
 int seat_of(int board, Stockfish::Color c) { return board * 2 + (c == Stockfish::WHITE ? 0 : 1); }
 
+// state.py repetition_key: FEN placement without the pocket, side to move, castling, en passant.
+std::string repetition_key(const std::string& fen) {
+    std::istringstream in(fen);
+    std::vector<std::string> parts;
+    for (std::string w; in >> w;) parts.push_back(w);
+    if (parts.empty()) return fen;
+    std::string key = parts[0].substr(0, parts[0].find('['));
+    for (size_t i = 1; i < 4 && i < parts.size(); ++i) key += " " + parts[i];
+    return key;
+}
+
+constexpr uint64_t LAG_STREAM = 0x6C61675FULL;  // sim.py _LAG_STREAM ("lag_")
+
 }  // namespace
 
 const char* seat_name(int seat) { return SEAT_NAMES[seat]; }
@@ -88,6 +102,7 @@ BughouseState::BughouseState(int64_t base, int64_t inc, const std::string& fenA,
         halfmove_[b] = pos_[b]->rule50_count();
     }
     for (int s = 0; s < NUM_SEATS; ++s) clocks[s] = base;
+    for (int b = 0; b < 2; ++b) seen_[b][repetition_key(fen(b))] = 1;
 }
 
 std::string BughouseState::fen(int board) const {
@@ -127,24 +142,30 @@ std::optional<GameResult> BughouseState::advance_clocks(int64_t nowMs) {
     if (result_) return std::nullopt;
     const int64_t elapsed = std::max<int64_t>(0, nowMs - lastMs);
     lastMs = std::max(lastMs, nowMs);
-    // (remaining before charge, seat name) - min() over these picks the loser, as in state.py
-    bool any = false;
+    // The clock with less time left before the charge ran out first and loses;
+    // an exact tie is a double flag, a draw (state.py, spec v3 D4).
+    int flagged = 0;
     int64_t bestBefore = 0;
     int loser = -1;
+    bool tie = false;
     for (int b = 0; b < 2; ++b) {
         const int seat = to_move(b);
         const int64_t before = clocks[seat];
         clocks[seat] = std::max<int64_t>(0, before - elapsed);
         if (clocks[seat] == 0) {
-            if (!any || before < bestBefore
-                || (before == bestBefore && std::string(SEAT_NAMES[seat]) < SEAT_NAMES[loser])) {
+            if (flagged && before == bestBefore) tie = true;
+            if (!flagged || before < bestBefore) {
                 bestBefore = before;
                 loser = seat;
             }
-            any = true;
+            ++flagged;
         }
     }
-    if (!any) return std::nullopt;
+    if (!flagged) return std::nullopt;
+    if (tie) {
+        result_ = GameResult{"draw", "double_flag", -1, -1};
+        return result_;
+    }
     result_ = GameResult{other_team(TEAMS[loser]), "flag", board_of(loser), loser};
     return result_;
 }
@@ -184,8 +205,9 @@ MoveResult BughouseState::apply_move(int seat, const std::string& uci, int64_t n
     if (Stockfish::type_of(move) == Stockfish::DROP && mr.san.rfind("P@", 0) == 0) {
         mr.san.erase(0, 1);  // python-chess writes pawn drops as "@e5"
     }
+    const bool isDrop = Stockfish::type_of(move) == Stockfish::DROP;
     // python-chess halfmove rule: a drop always counts up; otherwise a capture or pawn move resets.
-    if (Stockfish::type_of(move) == Stockfish::DROP) {
+    if (isDrop) {
         ++halfmove_[b];
     } else if (pos.capture(move) || Stockfish::type_of(pos.moved_piece(move)) == Stockfish::PAWN) {
         halfmove_[b] = 0;
@@ -207,6 +229,10 @@ MoveResult BughouseState::apply_move(int seat, const std::string& uci, int64_t n
     if (is_bughouse_mate(pos)) {
         const int loser = seat_of(b, pos.side_to_move());
         result_ = GameResult{TEAMS[seat], "checkmate", b, loser};
+    } else {
+        // state.py FICS repetition: board-only, any drop resets the count, threefold is a draw.
+        if (isDrop) seen_[b].clear();
+        if (++seen_[b][repetition_key(mr.fen)] >= 3) result_ = GameResult{"draw", "repetition", b, -1};
     }
     return mr;
 }
@@ -233,7 +259,7 @@ Decision StubPlayer::decide(const Observation& obs) {
 // ------------------------------------------------------------------ simulator
 
 Simulator::Simulator(BughouseState& state, std::vector<Player*> players, const GameConfig& cfg)
-    : st_(state), players_(std::move(players)), cfg_(cfg) {}
+    : st_(state), players_(std::move(players)), cfg_(cfg), lagRng_(cfg.seed ^ LAG_STREAM) {}
 
 void Simulator::push(int64_t t, Kind kind, int seat, int64_t gen, Decision dec, int64_t started) {
     heap_.push_back(Item{t, counter_++, kind, seat, gen, std::move(dec), started});
@@ -262,8 +288,7 @@ bool Simulator::advance() {
         for (int b = 0; b < 2; ++b) {
             const int seat = st_.to_move(b);
             if (st_.clocks[seat] <= 0) {
-                res = GameResult{TEAMS[opponent_of(seat)], "flag", b, seat};
-                break;
+                res = res ? GameResult{"draw", "double_flag", -1, -1} : GameResult{TEAMS[opponent_of(seat)], "flag", b, seat};
             }
         }
     }
@@ -384,7 +409,8 @@ void Simulator::on_decide(int seat, int64_t gen) {
     }
     const int64_t g = ++gen_[seat];
     if (dec.isMove) {
-        const int64_t cost = std::max<int64_t>(0, dec.thinkMs);
+        int64_t cost = std::max<int64_t>(cfg_.minMoveMs, std::max<int64_t>(0, dec.thinkMs));
+        if (cfg_.lagMaxMs > 0) cost += static_cast<int64_t>(lagRng_.next() % static_cast<uint64_t>(cfg_.lagMaxMs + 1));
         status_[seat] = THINKING;
         std::ostringstream ss;
         ss << "\"seat\":" << jstr(SEAT_NAMES[seat]) << ",\"phase\":\"start\",\"think_ms\":" << cost
@@ -492,8 +518,8 @@ std::vector<std::string> split(const std::string& s, char sep) {
 
 bool parse_line(const std::string& line, async_selfplay::GameConfig& cfg, std::string& err) {
     const auto f = split(line, '\t');
-    if (f.size() != 10) {
-        err = "expected 10 tab-separated fields, got " + std::to_string(f.size());
+    if (f.size() != 10 && f.size() != 12) {
+        err = "expected 10 or 12 tab-separated fields, got " + std::to_string(f.size());
         return false;
     }
     try {
@@ -514,6 +540,10 @@ bool parse_line(const std::string& line, async_selfplay::GameConfig& cfg, std::s
             cfg.waitMs[s] = std::stoll(wait[s]);
         }
         cfg.waitPct = std::stoi(f[9]);
+        if (f.size() == 12) {
+            cfg.minMoveMs = std::stoll(f[10]);
+            cfg.lagMaxMs = std::stoll(f[11]);
+        }
     } catch (const std::exception& e) {
         err = e.what();
         return false;
