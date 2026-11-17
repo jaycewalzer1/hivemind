@@ -60,6 +60,7 @@ from hivemind.constants import (
     NUM_BUGHOUSE_CHANNELS,
     NUM_CLOCK_BUGHOUSE_CHANNELS,
     NUM_ELAPSED_BUGHOUSE_CHANNELS,
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS,
     NUM_MOVE_CHANNELS,
 )
 
@@ -67,10 +68,12 @@ from hivemind.constants import (
 NB_INPUT_CHANNELS = NUM_BUGHOUSE_CHANNELS
 BOARD_SIZE = 8
 NB_INPUT_VALUES = NB_INPUT_CHANNELS * BOARD_SIZE * BOARD_SIZE
-# Plane widths a chunk header may declare: 74 (stock), 82 (clock planes) or
-# 86 (clock and elapsed-time planes, spec v2).
+# Plane widths a chunk header may declare: 74 (stock), 82 (clock planes),
+# 86 (clock and elapsed-time planes, spec v2) or 88 (plus the spec v3 diagonal
+# clock plane).
 SUPPORTED_INPUT_CHANNELS = (
     NB_INPUT_CHANNELS, NUM_CLOCK_BUGHOUSE_CHANNELS, NUM_ELAPSED_BUGHOUSE_CHANNELS,
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS,
 )
 NB_POLICY_VALUES = NUM_MOVE_CHANNELS * BOARD_SIZE * BOARD_SIZE
 HEADER = struct.Struct('<4sIHHQ')
@@ -295,7 +298,7 @@ def read_aux_labels(f) -> dict:
 
 
 def read_shard_channels(filepath: str | Path) -> int:
-    """Input channels declared in a chunk header (74 stock, 82 clocks, 86 v2)."""
+    """Input channels declared in a chunk header (74 stock, 82 clocks, 86 v2, 88 v3)."""
     with open(filepath, 'rb') as f:
         _, _, channels, _, _ = HEADER.unpack(read_exact(f, HEADER.size))
     return int(channels)
@@ -312,7 +315,7 @@ def read_binary_shard(
 ) -> list[dict]:
     """Read one HVM3, HVM4, HVM5 or HVM6 chunk and return its samples.
 
-    The plane width comes from the chunk header and may be 74, 82 or 86 channels.
+    The plane width comes from the chunk header and may be 74, 82, 86 or 88 channels.
     input_channels, when given, makes any other width an error.
     q_value_ratio / weight_nodes_ref: None picks the default for the chunk's
     width (resolve_q_value_ratio, resolve_weight_nodes_ref).

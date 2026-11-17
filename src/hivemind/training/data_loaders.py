@@ -7,10 +7,13 @@ import polars as pl
 import torch
 from hivemind.constants import (
     CLOCK_CHANNEL_OFFSET,
+    DIAGONAL_CHANNEL_OFFSET,
+    DIAGONAL_SCALE_S,
     ELAPSED_CHANNEL_OFFSET,
     NUM_BUGHOUSE_CHANNELS,
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD,
     board_channels_from_total,
 )
@@ -58,11 +61,24 @@ def elapsed_plane_tensors(elapsed_ms: torch.Tensor):
     return (e / 10.0).clamp_max(1.0).float(), (1.0 - torch.exp(-e / 2.0)).float()
 
 
+def diagonal_plane_tensor(ours_a_ms: torch.Tensor, theirs_b_ms: torch.Tensor,
+                          scale_s: float = DIAGONAL_SCALE_S) -> torch.Tensor:
+    """tanh((t_ourA - t_oppB) / s), t = max(ms, 0) / 1000, as planes.cc and
+    board2planes.diagonal_plane_value (spec v3 diagonal plane, signed)."""
+    ours = ours_a_ms.double().clamp_min(0.0)
+    theirs = theirs_b_ms.double().clamp_min(0.0)
+    return torch.tanh((ours - theirs) / (1000.0 * float(scale_s))).float()
+
+
 def rebuild_clock_planes(x: torch.Tensor, clocks_ms: torch.Tensor,
                          elapsed_ms: torch.Tensor, mask: torch.Tensor,
-                         team: torch.Tensor) -> torch.Tensor:
+                         team: torch.Tensor,
+                         diagonal_scale_s: float = DIAGONAL_SCALE_S) -> torch.Tensor:
     """Overwrite the clock (37-40) and elapsed (41-42) planes of both board
     blocks of normalized planes x (N, C, 8, 8) from exact scalars, in place.
+    With 44 channels per board (spec v3) the diagonal plane (43) of both
+    blocks is rebuilt from the clocks too: the uint8 sample planes clip its
+    negative half to 0.
 
     clocks_ms (N, 4): A_white A_black B_white B_black; elapsed_ms (N, 2): A, B;
     mask (N,): CLOCKS_MASK_BIT / ELAPSED_MASK_BIT; team (N,): 0 = the sample's
@@ -87,6 +103,12 @@ def rebuild_clock_planes(x: torch.Tensor, clocks_ms: torch.Tensor,
             values = (*clock_plane_tensors(ours), *clock_plane_tensors(theirs))
             for k, value in enumerate(values):
                 x[rows, c + k] = value[rows].view(-1, 1, 1).expand(-1, 8, 8).to(x.dtype)
+        if per_board >= NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD:
+            # The partner's opponent on B plays our colour there: theirs_b.
+            value = diagonal_plane_tensor(ours_a, theirs_b, diagonal_scale_s)
+            for base in (0, per_board):
+                x[rows, base + DIAGONAL_CHANNEL_OFFSET] = (
+                    value[rows].view(-1, 1, 1).expand(-1, 8, 8).to(x.dtype))
     rows = (mask & ELAPSED_MASK_BIT) != 0
     if per_board >= NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD and bool(rows.any()):
         for base, column in ((0, 0), (per_board, 1)):
