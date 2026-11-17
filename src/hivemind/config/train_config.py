@@ -208,6 +208,34 @@ class TrainConfig:
     info_wd: str = "wd defines the weight decay value for regularization as a measure to prevent overfitting."
     wd: float = 1e-4
 
+    # ---- spec v3 (WP-D): fine-tuning recipe for the clock build; every default here keeps the stock behaviour.
+    info_sample_weight_targets: str = "sample_weight_targets: which losses use the converter's per-sample weight" \
+                                      " min(1, nodes / N_ref): 'none' (stock), 'policy' (policy losses only, the" \
+                                      " clock-build default: the visit target of a small search is mostly the" \
+                                      " prior) or 'all'."
+    sample_weight_targets: str = "none"
+    info_finetune_param_groups: str = "finetune_param_groups: two learning rates. The trunk (every parameter it04" \
+                                      " had) at most trunk_max_lr; the new stem/board-token input columns (clock," \
+                                      " elapsed planes) and the aux heads at max_lr * new_params_lr_factor. SGD/NAG" \
+                                      " only (per-column rates use gradient scaling)."
+    finetune_param_groups: bool = False
+    info_trunk_max_lr: str = "trunk_max_lr caps the trunk's peak learning rate under finetune_param_groups."
+    trunk_max_lr: float = 1e-4
+    info_new_params_lr_factor: str = "new_params_lr_factor multiplies max_lr for the new columns and aux heads."
+    new_params_lr_factor: float = 1.0
+    info_source_board_channels: str = "source_board_channels: input channels per board of the network the trunk" \
+                                      " came from (37 = it04); later channels are the new columns."
+    source_board_channels: int = 37
+    info_scale_lr_with_batch: str = "scale_lr_with_batch: when the batch size is changed from the config's," \
+                                    " scale max_lr and min_lr by the same factor (linear rule for SGD)."
+    scale_lr_with_batch: bool = False
+    info_arrivals_loss: str = "arrivals_loss: 'mse' on raw counts (spec v2), 'log1p' (MSE between the output and" \
+                              " log1p(count)) or 'poisson' (Poisson NLL, the output is the log rate)."
+    arrivals_loss: str = "mse"
+    info_arrivals_piece_weights: str = "arrivals_piece_weights: per piece type P N B R Q weights of the arrivals" \
+                                       " loss, the same for each of the four pockets."
+    arrivals_piece_weights: tuple = (1.0, 1.0, 1.0, 1.0, 1.0)
+
 
 def rl_train_config():
     tc = TrainConfig()
@@ -238,6 +266,32 @@ def rl_train_config():
     tc.q_value_ratio = 0.0
     tc.sparse_policy_label = False
 
+    return tc
+
+
+CLOCK_Q_VALUE_RATIO = 0.2
+
+
+def rl_clock_train_config():
+    """rl_train_config() with the spec v3 fine-tuning recipe for the clock build
+    (widened it04 with new input columns and aux heads):
+      - trunk at most 1e-4, new columns and aux heads at max_lr (two rates);
+      - max_lr / min_lr scaled with the batch size actually used;
+      - policy losses weighted by min(1, nodes / N_ref) from the converter;
+      - arrivals: log1p target, piece weights P1 N2 B2 R2 Q4;
+      - moves-left loss weight 0 (D6: its label differs from stock selfplay's);
+      - q_value_ratio 0.2 (the converter applies it; recorded here for logs).
+    """
+    tc = rl_train_config()
+    tc.finetune_param_groups = True
+    tc.trunk_max_lr = 1e-4
+    tc.new_params_lr_factor = 1.0
+    tc.scale_lr_with_batch = True
+    tc.sample_weight_targets = "policy"
+    tc.arrivals_loss = "log1p"
+    tc.arrivals_piece_weights = (1.0, 2.0, 2.0, 2.0, 4.0)
+    tc.plys_to_end_loss_factor = 0.0
+    tc.q_value_ratio = CLOCK_Q_VALUE_RATIO
     return tc
 
 

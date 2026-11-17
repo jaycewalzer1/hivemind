@@ -6,7 +6,9 @@ from hivemind.paths import PROJECT_ROOT as project_root, TRAINING_OUTPUT_DIR
 import polars as pl
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from hivemind.config.train_config import TrainConfig, TrainObjects, rl_train_config
+import json
+
+from hivemind.config.train_config import TrainConfig, TrainObjects, rl_train_config, rl_clock_train_config
 from hivemind.config.main_config import main_config
 from hivemind.training.data_loaders import (
     load_parquet_shard,
@@ -29,9 +31,12 @@ from hivemind.architectures.model_config import (
     MODEL_FACTORIES,
     create_model,
     get_model_args,
+    model_args_from_state_dict,
 )
 from hivemind.training.trainer_agent import TrainerAgentPytorch, save_torch_state,\
-    restore_torch_state, export_to_onnx, get_context
+    restore_torch_state, export_to_onnx, get_context, uses_sample_weights, \
+    DRIFT_POLICY_KL_MAX, DRIFT_VALUE_MSE_MAX, drift_metrics, drift_outputs, \
+    load_drift_inputs, new_columns_max_abs
 from hivemind.training.train_util import get_metrics
 from hivemind.constants import (
     NUM_BUGHOUSE_CHANNELS,
@@ -122,6 +127,16 @@ def configure_batch_size(train_config, architecture, batch_size=None):
         f"Training batch size: {train_config.batch_size} "
         f"(evaluate every {train_config.batch_steps} batches)"
     )
+    # Spec v3: the configured rates belong to the configured batch size; with
+    # scale_lr_with_batch the peak and floor follow the batch actually used.
+    if getattr(train_config, "scale_lr_with_batch", False) and selected_batch_size != original_batch_size:
+        factor = selected_batch_size / original_batch_size
+        train_config.max_lr *= factor
+        train_config.min_lr *= factor
+        print(
+            f"Learning rate scaled by {factor:g} with the batch size: max_lr "
+            f"{train_config.max_lr:g}, min_lr {train_config.min_lr:g}"
+        )
 
 
 def configure_precision(train_config, architecture, precision=None, is_rl=False):
@@ -322,13 +337,71 @@ def checkpoint_has_aux_heads(state_dict) -> bool:
     return any(key.startswith(AUX_HEAD_KEY_PREFIXES) for key in state_dict)
 
 
+def _drift_setup(model, drift_shard, reference_path, drift_samples, tc):
+    """Reference outputs and the start-of-iteration drift (spec v3 WP-D)."""
+    if not reference_path:
+        raise ValueError("drift_shard needs drift_reference or a checkpoint")
+    ctx = get_context(tc.context, tc.device_id)
+    state = torch.load(reference_path, map_location="cpu")
+    state = state.get("model_state_dict", state)
+    reference = create_model(model_args_from_state_dict(state))
+    reference.load_state_dict(state)
+    reference = reference.to(ctx)
+    x = load_drift_inputs(
+        drift_shard, model.board_channels, drift_samples, tc.source_board_channels
+    )
+    ref_out = drift_outputs(reference, x, ctx)
+    del reference
+    model.to(ctx)
+    start = drift_metrics(ref_out, drift_outputs(model, x, ctx))
+    print(
+        f"Drift at start vs {reference_path}: policy KL {start['policy_kl']:.5f}, "
+        f"value MSE {start['value_mse']:.5f} ({start['positions']} positions)"
+    )
+    return {
+        "x": x, "reference_outputs": ref_out, "start": start,
+        "shard": str(drift_shard), "reference": str(reference_path),
+        "new_columns_max_abs_start": new_columns_max_abs(model, tc.source_board_channels),
+    }
+
+
+def _drift_finish(drift, model, tc, drift_out, steps=None):
+    ctx = get_context(tc.context, tc.device_id)
+    end = drift_metrics(drift["reference_outputs"], drift_outputs(model, drift["x"], ctx))
+    report = {
+        "shard": drift["shard"],
+        "reference": drift["reference"],
+        "start": drift["start"],
+        "end": end,
+        "policy_kl_max": DRIFT_POLICY_KL_MAX,
+        "value_mse_max": DRIFT_VALUE_MSE_MAX,
+        "within_threshold": end["policy_kl"] <= DRIFT_POLICY_KL_MAX and end["value_mse"] <= DRIFT_VALUE_MSE_MAX,
+        "new_columns_max_abs_start": drift["new_columns_max_abs_start"],
+        "new_columns_max_abs_end": new_columns_max_abs(model, tc.source_board_channels),
+        "steps": steps,
+    }
+    path = Path(drift_out) if drift_out else Path(tc.export_dir) / "drift.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"Drift at end: policy KL {end['policy_kl']:.5f}, value MSE {end['value_mse']:.5f} "
+        f"({'within' if report['within_threshold'] else 'ABOVE'} threshold {DRIFT_POLICY_KL_MAX} / "
+        f"{DRIFT_VALUE_MSE_MAX}); new input columns max |w| {report['new_columns_max_abs_end']:.4g}; "
+        f"written to {path}"
+    )
+    return report
+
+
 def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
              augment_flip: bool = True, architecture: str = "risev33",
              batch_size: int = None, precision: str = None,
              iteration_label: str = None, shuffle_buffer_size: int = 10000,
              resume_training: bool = False, aux_heads: bool | None = None,
              joint_policy_rank: int | None = None,
-             joint_policy_loss_factor: float | None = None):
+             joint_policy_loss_factor: float | None = None,
+             recipe: str = "auto", drift_shard: str | None = None,
+             drift_reference: str | None = None, drift_samples: int = 1024,
+             drift_out: str | None = None, max_steps: int | None = None):
     """
     Run RL training on self-play data.
     
@@ -346,11 +419,27 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         joint_policy_rank / joint_policy_loss_factor: override the RL config
             (both default off, see docs in rl_train_config). The joint loss
             needs a model with joint_factors heads AND a factor above 0.
+        recipe: "clock" = rl_clock_train_config (spec v3: two learning rates,
+            batch-scaled rates, weighted policy loss, arrivals fixes, moves-left
+            weight 0), "stock" = rl_train_config, "auto" = clock for data with
+            more than 74 input channels.
+        drift_shard: a Parquet shard of planes (the frozen supervised
+            validation shard); policy KL and value MSE of the network against
+            drift_reference (default: checkpoint_path) on its first
+            drift_samples positions, clock planes 0, before and after training,
+            written to drift_out (default <export_dir>/drift.json).
+        max_steps: stop after this many optimizer steps (smoke runs).
     """
     if shuffle_buffer_size <= 0:
         raise ValueError("shuffle_buffer_size must be positive")
+    if recipe not in ("auto", "clock", "stock"):
+        raise ValueError(f"recipe must be auto, clock or stock, got {recipe!r}")
+    first_parquet = sorted(glob.glob(str(Path(rl_data_dir) / "*.parquet")))
+    data_channels = rl_parquet_input_channels(first_parquet[0]) if first_parquet else NUM_BUGHOUSE_CHANNELS
+    clock_recipe = recipe == "clock" or (recipe == "auto" and data_channels > NUM_BUGHOUSE_CHANNELS)
 
-    tc = rl_train_config()
+    tc = rl_clock_train_config() if clock_recipe else rl_train_config()
+    print(f"Training recipe: {'clock (spec v3)' if clock_recipe else 'stock'}")
     if joint_policy_rank is not None:
         tc.joint_policy_rank = int(joint_policy_rank)
     if joint_policy_loss_factor is not None:
@@ -445,6 +534,7 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         shuffle_samples=False,
         include_joint_policy=tc.joint_policy_rank > 0,
         include_aux_labels=tc.aux_head_labels,
+        include_sample_weights=uses_sample_weights(tc),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -481,11 +571,16 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         augment_flip=augment_flip,
         include_joint_policy=tc.joint_policy_rank > 0,
         include_aux_labels=tc.aux_head_labels,
+        include_sample_weights=uses_sample_weights(tc),
     )
     train_loader = DataLoader(train_dataset, batch_size=tc.batch_size, num_workers=0)
     
     nb_it_per_epoch = max(1, (n_train + tc.batch_size - 1) // tc.batch_size)
     tc.total_it = int(nb_it_per_epoch * tc.nb_training_epochs)
+    if max_steps is not None:  # exactly this many steps, over as many epochs as needed
+        tc.total_it = max(1, int(max_steps))
+        tc.nb_training_epochs = max(1, -(-tc.total_it // nb_it_per_epoch))
+        tc.batch_steps = min(tc.batch_steps, tc.total_it)
     tc.nb_parts = len(parquet_files)
     
     print(f"Iterations per epoch: {nb_it_per_epoch}, Total iterations: {tc.total_it}")
@@ -559,9 +654,21 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
             checkpoint = None
         print("Checkpoint loaded successfully")
     
+    drift = None
+    if drift_shard:
+        drift = _drift_setup(
+            model, drift_shard, drift_reference or checkpoint_path, drift_samples, tc,
+        )
+
     # Train with streaming RL data loader
     trainer = TrainerAgentPytorch(model, val_loader, tc, to, use_rtpt=True, 
                                   is_rl=True, rl_train_loader=train_loader)
+    if tc.finetune_param_groups:
+        for group in trainer.optimizer.param_groups:
+            print(
+                f"Parameter group {group['name']}: {len(group['params'])} tensors, "
+                f"peak lr {tc.max_lr * group['lr_scale']:g}"
+            )
     if resume_training:
         restore_torch_state(trainer._model, trainer.optimizer, checkpoint)
         del checkpoint
@@ -570,6 +677,8 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
             f"and evaluation step {tc.k_steps_initial}"
         )
     trainer.train(cur_it=resume_iteration)
+    if drift is not None:
+        _drift_finish(drift, model, tc, drift_out, steps=trainer.cur_it)
 
     # Determine model prefix using Option 1 naming convention: hivemind-rl-it{N}-{arch}-loss{val_loss}-p{policy_acc}
     val_loss = trainer.val_loss_best if trainer.val_loss_best is not None else 0.0
@@ -647,8 +756,9 @@ def main():
     parser.add_argument('--selfplay-dir', type=str,
                         default=str(project_root / 'engine/selfplay_games'),
                         help='Self-play output directory, or its training_data directory, containing HVM chunks')
-    parser.add_argument('--replay-dir', type=str, default=None,
-                        help='Archived self-play directory used as CrazyAra-style replay memory')
+    parser.add_argument('--replay-dir', type=str, nargs='+', default=None,
+                        help='Archived self-play directories used as CrazyAra-style replay memory '
+                             '(spec v3: the last 3 iterations)')
     parser.add_argument('--replay-files', type=int, default=DEFAULT_REPLAY_FILES,
                         help=f'Number of archived HVM chunks to include (default: {DEFAULT_REPLAY_FILES} chunks / 409,600 samples)')
     parser.add_argument('--all-replay', action='store_true',
@@ -704,11 +814,34 @@ def main():
     parser.add_argument(
         '--q-value-ratio',
         type=float,
-        default=DEFAULT_Q_VALUE_RATIO,
-        help=f'Ratio of root Q-value to mix with game outcome (default: {DEFAULT_Q_VALUE_RATIO})',
+        default=None,
+        help=f'Ratio of root Q-value to mix with game outcome (default: 0.2 for clock-build data, '
+             f'{DEFAULT_Q_VALUE_RATIO} for stock)',
     )
+    parser.add_argument('--weight-nodes-ref', type=float, default=None,
+                        help='Sample weight = min(1, nodes / N); default 400 for clock-build data, off for stock')
+    parser.add_argument('--split-by', choices=('auto', 'game', 'opening'), default='auto',
+                        help='Validation split unit (default auto: opening pair for clock-build data)')
+    parser.add_argument('--recipe', choices=('auto', 'clock', 'stock'), default='auto',
+                        help='RL recipe: clock = spec v3 fine-tuning (two learning rates, weighted policy loss, '
+                             'arrivals fixes); auto = clock for data with more than 74 channels')
+    parser.add_argument('--drift-shard', type=str, default=None,
+                        help='Parquet shard of planes (the frozen supervised validation shard) for the drift '
+                             'metric: policy KL and value MSE against --drift-reference before and after training')
+    parser.add_argument('--drift-reference', type=str, default=None,
+                        help='Checkpoint the drift is measured against (default: --checkpoint; use it04)')
+    parser.add_argument('--drift-samples', type=int, default=1024,
+                        help='Positions of --drift-shard used (default 1024)')
+    parser.add_argument('--drift-out', type=str, default=None,
+                        help='Drift JSON path (default <workspace>/artifacts/training/drift.json)')
+    parser.add_argument('--max-steps', type=int, default=None,
+                        help='RL: stop after this many optimizer steps (smoke runs)')
     
     args = parser.parse_args()
+    rl_extra = dict(
+        recipe=args.recipe, drift_shard=args.drift_shard, drift_reference=args.drift_reference,
+        drift_samples=args.drift_samples, drift_out=args.drift_out, max_steps=args.max_steps,
+    )
 
     if args.mode == 'sl':
         train_supervised(
@@ -737,6 +870,7 @@ def main():
                 aux_heads=args.aux_heads,
                 joint_policy_rank=args.joint_policy_rank,
                 joint_policy_loss_factor=args.joint_policy_loss_factor,
+                **rl_extra,
             )
         else:
             selfplay_path = Path(args.selfplay_dir).expanduser().resolve()
@@ -754,12 +888,14 @@ def main():
             )
             replay_path = None
             if args.replay_dir:
-                replay_root = Path(args.replay_dir).expanduser().resolve()
-                replay_path = (
-                    replay_root / "training_data"
-                    if (replay_root / "training_data").is_dir()
-                    else replay_root
-                )
+                replay_path = []
+                for replay_dir in args.replay_dir:
+                    replay_root = Path(replay_dir).expanduser().resolve()
+                    replay_path.append(
+                        replay_root / "training_data"
+                        if (replay_root / "training_data").is_dir()
+                        else replay_root
+                    )
             replay_files = None if args.all_replay else args.replay_files
             train_path, val_path, _, _ = convert_to_split_parquet(
                 hvm_path,
@@ -771,6 +907,8 @@ def main():
                 replay_selection_fraction=args.replay_selection_fraction,
                 q_value_ratio=args.q_value_ratio,
                 samples_per_shard=args.samples_per_shard,
+                split_by=args.split_by,
+                weight_nodes_ref=args.weight_nodes_ref,
             )
             # Auto-detect iteration label from selfplay_path if not explicitly provided
             iter_label = args.iteration
@@ -794,6 +932,7 @@ def main():
                 aux_heads=args.aux_heads,
                 joint_policy_rank=args.joint_policy_rank,
                 joint_policy_loss_factor=args.joint_policy_loss_factor,
+                **rl_extra,
             )
 
 

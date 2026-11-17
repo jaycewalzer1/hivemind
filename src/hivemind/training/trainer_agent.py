@@ -538,8 +538,8 @@ class TrainerAgentPytorch:
         self.optimizer.zero_grad()
 
         data, value_label, policy_a, policy_b, wdl_label, moves_left_label = batch[:6]
-        joint_targets, aux_labels = split_rl_batch_extras(
-            batch, self.tc.aux_head_labels
+        joint_targets, aux_labels, batch_weights = split_rl_batch_extras(
+            batch, self.tc.aux_head_labels, uses_sample_weights(self.tc), with_weights=True
         )
         data = data.to(self._ctx)
         value_label = value_label.to(self._ctx)
@@ -552,6 +552,11 @@ class TrainerAgentPytorch:
         if aux_labels:
             aux_labels = tuple(label.to(self._ctx) for label in aux_labels)
         sample_weights = torch.ones(len(value_label), device=self._ctx)
+        policy_weights = sample_weights
+        if batch_weights is not None:
+            policy_weights = batch_weights.to(self._ctx).float()
+            if self.tc.sample_weight_targets == "all":
+                sample_weights = policy_weights
 
         self.old_label = value_label
 
@@ -566,10 +571,10 @@ class TrainerAgentPytorch:
 
         # For RL, we use soft cross-entropy with full policy distributions
         policy_loss_1 = self.policy_loss(
-            policy_out_1.float(), policy_a, sample_weights
+            policy_out_1.float(), policy_a, policy_weights
         )
         policy_loss_2 = self.policy_loss(
-            policy_out_2.float(), policy_b, sample_weights
+            policy_out_2.float(), policy_b, policy_weights
         )
 
         policy_loss = 0.5 * (policy_loss_1 + policy_loss_2)
@@ -597,7 +602,9 @@ class TrainerAgentPytorch:
             + self.tc.joint_policy_loss_factor * joint_loss
         )
         if aux_out is not None and aux_labels:
-            think_loss, _, arrivals_loss, _ = aux_head_losses(*aux_out, *aux_labels)
+            think_loss, _, arrivals_loss, _ = aux_head_losses(
+                *aux_out, *aux_labels, **arrivals_loss_options(self.tc)
+            )
             combined_loss = (
                 combined_loss
                 + self.tc.think_gain_loss_factor * think_loss
@@ -605,7 +612,7 @@ class TrainerAgentPytorch:
             )
         combined_loss.backward()
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.to.lr_schedule(self.cur_it)
+            param_group['lr'] = self.to.lr_schedule(self.cur_it) * param_group.get('lr_scale', 1.0)
             if 'momentum' in param_group:
                 param_group['momentum'] = self.to.momentum_schedule(self.cur_it)
         self.optimizer.step()
@@ -650,7 +657,7 @@ class TrainerAgentPytorch:
             for i, batch in enumerate(data_loader):
                 data, value_label, policy_a, policy_b, wdl_label, moves_left_label = batch[:6]
                 joint_targets, aux_labels = split_rl_batch_extras(
-                    batch, self.tc.aux_head_labels
+                    batch, self.tc.aux_head_labels, uses_sample_weights(self.tc)
                 )
                 data = data.to(self._ctx)
                 value_label = value_label.to(self._ctx)
@@ -674,7 +681,8 @@ class TrainerAgentPytorch:
                 joint_factors, aux_out = split_model_extras(self._model, model_out)
                 if aux_out is not None and aux_labels:
                     think_loss, think_count, arrivals_loss, arrivals_count = aux_head_losses(
-                        *aux_out, *(label.to(self._ctx) for label in aux_labels)
+                        *aux_out, *(label.to(self._ctx) for label in aux_labels),
+                        **arrivals_loss_options(self.tc)
                     )
                     aux_sums[0] += float(think_loss) * float(think_count)
                     aux_sums[1] += float(arrivals_loss) * float(arrivals_count)
@@ -892,6 +900,15 @@ class TrainerAgentPytorch:
 
 
 def create_optimizer(model: nn.Module, train_config: TrainConfig):
+    if getattr(train_config, "finetune_param_groups", False):
+        if train_config.optimizer_name not in ("nag", "sgd"):
+            raise ValueError(
+                "finetune_param_groups scales gradients per input column, which matches a per-column "
+                f"learning rate only for SGD/NAG, not {train_config.optimizer_name}"
+            )
+        groups = finetune_param_groups(model, train_config)
+        return torch.optim.SGD(groups, lr=train_config.max_lr, momentum=train_config.max_momentum,
+                               weight_decay=train_config.wd)
     if train_config.optimizer_name == "nag":  # torch.optim.SGD uses Nestorov momentum already
         return torch.optim.SGD(model.parameters(), lr=train_config.max_lr, momentum=train_config.max_momentum,
                                weight_decay=train_config.wd)
@@ -900,6 +917,109 @@ def create_optimizer(model: nn.Module, train_config: TrainConfig):
     elif train_config.optimizer_name == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=train_config.max_lr, weight_decay=train_config.wd)
     raise Exception(f"Selected optimizer {train_config.optimizer_name} is not supported.")
+
+
+AUX_HEAD_PREFIXES = ("think_gain_head.", "arrivals_head.")
+STEM_KEYS = ("body_spatial.0.body.0.weight", "shared_stem.body.0.weight")
+
+
+def _is_board_token_projection(name: str) -> bool:
+    return name.startswith("board_token_projections.") and name.endswith(".0.weight")
+
+
+def new_input_columns(model: nn.Module, source_board_channels: int) -> dict:
+    """{parameter name: bool mask over dim 1} for every tensor that reads the
+    raw planes, True on the columns added by widening (board channels
+    source_board_channels.. of each board block; tools/make_clock_net.py).
+    Empty for a network that was not widened."""
+    total = None
+    for name, param in model.named_parameters():
+        if name == "body_spatial.0.body.0.weight":
+            total = int(param.shape[1]) // 2
+        elif name == "shared_stem.body.0.weight":
+            total = int(param.shape[1])
+    board = getattr(model, "board_channels", None) or total
+    if board is None or board <= source_board_channels:
+        return {}
+    masks = {}
+    for name, param in model.named_parameters():
+        width = int(param.shape[1]) if param.dim() > 1 else 0
+        mask = None
+        if name == "body_spatial.0.body.0.weight":
+            mask = torch.zeros(width, dtype=torch.bool)
+            mask[source_board_channels:board] = True
+            mask[board + source_board_channels:2 * board] = True
+        elif name == "shared_stem.body.0.weight":
+            mask = torch.zeros(width, dtype=torch.bool)
+            mask[source_board_channels:board] = True
+        elif _is_board_token_projection(name):
+            trunk = width - board
+            mask = torch.zeros(width, dtype=torch.bool)
+            mask[trunk + source_board_channels:trunk + board] = True
+        if mask is not None:
+            masks[name] = mask
+    return masks
+
+
+def finetune_param_groups(model: nn.Module, train_config: TrainConfig) -> list:
+    """SGD parameter groups for the spec v3 fine-tuning recipe.
+
+    trunk: every parameter the source network had, lr_scale = trunk_max_lr /
+    max_lr (at most 1). new: the aux heads, lr_scale = new_params_lr_factor.
+    widened: the input tensors with new columns, at the new rate; a gradient
+    hook scales their old columns to the trunk rate and applies weight decay
+    per column (the group's own weight_decay is 0), so for SGD/NAG every
+    column moves exactly as if it sat in its own group. Each group carries
+    'name' and 'param_names'; the trainer sets lr = schedule * lr_scale.
+    """
+    max_lr = float(train_config.max_lr)
+    trunk_scale = min(1.0, float(train_config.trunk_max_lr) / max_lr) if max_lr > 0 else 1.0
+    new_scale = float(train_config.new_params_lr_factor)
+    wd = float(train_config.wd)
+    masks = new_input_columns(model, int(train_config.source_board_channels))
+    groups = {
+        "trunk": {"params": [], "param_names": [], "lr_scale": trunk_scale, "weight_decay": wd},
+        "new": {"params": [], "param_names": [], "lr_scale": new_scale, "weight_decay": wd},
+        "widened": {"params": [], "param_names": [], "lr_scale": new_scale, "weight_decay": 0.0},
+    }
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(AUX_HEAD_PREFIXES):
+            key = "new"
+        elif name in masks:
+            key = "widened"
+            shape = [1] * param.dim()
+            shape[1] = -1
+            column_scale = torch.where(
+                masks[name], torch.tensor(1.0), torch.tensor(trunk_scale / new_scale if new_scale else 0.0)
+            ).view(shape).to(param.device, param.dtype)
+
+            def hook(grad, p=param, scale=column_scale):
+                return (grad + wd * p.detach()) * scale
+
+            param.register_hook(hook)
+        else:
+            key = "trunk"
+        groups[key]["params"].append(param)
+        groups[key]["param_names"].append(name)
+    out = []
+    for key, group in groups.items():
+        if group["params"]:
+            group["name"] = key
+            out.append(group)
+    return out
+
+
+def uses_sample_weights(train_config: TrainConfig) -> bool:
+    return getattr(train_config, "sample_weight_targets", "none") in ("policy", "all")
+
+
+def arrivals_loss_options(train_config: TrainConfig) -> dict:
+    return {
+        "arrivals_loss": getattr(train_config, "arrivals_loss", "mse"),
+        "piece_weights": getattr(train_config, "arrivals_piece_weights", None),
+    }
 
 
 class SoftCrossEntropyLoss(_Loss):
@@ -924,21 +1044,32 @@ class SoftCrossEntropyLoss(_Loss):
 AUX_LABEL_FIELDS = 4  # think_gain [2], think_gain_mask [2], arrivals [20], arrivals_mask []
 
 
-def split_rl_batch_extras(batch, aux_head_labels: bool):
+def split_rl_batch_extras(batch, aux_head_labels: bool, sample_weights: bool = False,
+                          with_weights: bool = False):
     """Split an RL batch after its six base fields.
 
     Layout: (data, value, policy_a, policy_b, wdl, moves_left), then the four
     joint-policy targets when the loader includes them, then, when
     aux_head_labels is set, (think_gain, think_gain_mask, arrivals,
-    arrivals_mask). Returns (joint_targets or None, aux_labels or None).
+    arrivals_mask), then, when sample_weights is set, the per-sample weight.
+    Returns (joint_targets or None, aux_labels or None), plus the weights (or
+    None) with with_weights.
     """
     extras = tuple(batch[6:])
+    weights = None
+    if sample_weights:
+        if not extras:
+            raise ValueError("RL batch has no sample-weight field")
+        weights = extras[-1]
+        extras = extras[:-1]
     aux_labels = None
     if aux_head_labels:
         if len(extras) < AUX_LABEL_FIELDS:
             raise ValueError("RL batch has no aux-head label fields")
         aux_labels = extras[-AUX_LABEL_FIELDS:]
         extras = extras[:-AUX_LABEL_FIELDS]
+    if with_weights:
+        return (extras or None), aux_labels, weights
     return (extras or None), aux_labels
 
 
@@ -962,12 +1093,18 @@ def split_model_extras(model, model_out):
 
 def aux_head_losses(think_logits: Tensor, arrivals_pred: Tensor,
                     think_label: Tensor, think_mask: Tensor,
-                    arrivals_label: Tensor, arrivals_mask: Tensor):
+                    arrivals_label: Tensor, arrivals_mask: Tensor,
+                    arrivals_loss: str = "mse", piece_weights=None):
     """Masked losses of the spec v2 aux heads.
 
     think_gain: binary cross-entropy on the logits, averaged over the boards
-    that carry a label (think_mask 1). arrivals: squared error averaged over
-    the 20 values, then over the samples that carry a label (arrivals_mask 1).
+    that carry a label (think_mask 1). arrivals: a per-value loss averaged
+    over the 20 values (weighted by piece_weights, one per piece type P N B R
+    Q, repeated for the four pockets, normalised to mean 1), then over the
+    samples that carry a label (arrivals_mask 1). arrivals_loss: "mse" on the
+    raw counts (spec v2), "log1p" (squared error to log1p(count); the output is
+    log1p of the expected count) or "poisson" (Poisson NLL with the output as
+    the log rate, without the constant log(k!) term).
     With no labels a loss is exactly 0 and passes no gradient.
     Returns (think_loss, labelled boards, arrivals_loss, labelled samples).
     """
@@ -979,9 +1116,21 @@ def aux_head_losses(think_logits: Tensor, arrivals_pred: Tensor,
     think_loss = think_terms.sum() / think_count.clamp_min(1.0)
 
     arrivals_mask = arrivals_mask.float().reshape(-1)
-    arrivals_terms = (
-        (arrivals_pred.float() - arrivals_label.float()) ** 2
-    ).mean(dim=1) * arrivals_mask
+    pred = arrivals_pred.float()
+    label = arrivals_label.float()
+    if arrivals_loss == "mse":
+        per_value = (pred - label) ** 2
+    elif arrivals_loss == "log1p":
+        per_value = (pred - torch.log1p(label.clamp_min(0.0))) ** 2
+    elif arrivals_loss == "poisson":
+        per_value = torch.exp(pred) - label * pred
+    else:
+        raise ValueError(f"Unknown arrivals_loss {arrivals_loss!r}")
+    if piece_weights is not None:
+        weights = torch.as_tensor(piece_weights, dtype=per_value.dtype, device=per_value.device)
+        weights = weights.repeat(per_value.shape[1] // weights.numel())
+        per_value = per_value * (weights / weights.mean())
+    arrivals_terms = per_value.mean(dim=1) * arrivals_mask
     arrivals_count = arrivals_mask.sum()
     arrivals_loss = arrivals_terms.sum() / arrivals_count.clamp_min(1.0)
     return think_loss, think_count, arrivals_loss, arrivals_count
@@ -1437,3 +1586,96 @@ def get_data_loader(pgn_dataset_arrays_dict: dict, tc: TrainConfig, shuffle=True
     dataset = TensorDataset(torch.Tensor(d['x']), torch.Tensor(d['y_value']), torch.Tensor(d['y_policy']))
     train_loader = DataLoader(dataset, shuffle=shuffle, batch_size=tc.batch_size, num_workers=tc.cpu_count)
     return train_loader
+
+
+# ------------------------------------------------------------------ drift (spec v3 WP-D)
+# How far training moved the network from it04 on positions it04 knows: the
+# frozen supervised validation shard (or any shard of planes), with every plane
+# past the source's 37 per board set to 0 (no clocks, as the engine sees a
+# position without clocks), so the widened start network equals it04 exactly.
+DRIFT_POLICY_KL_MAX = 0.05
+DRIFT_VALUE_MSE_MAX = 0.01
+
+
+def narrow_board_planes(x: Tensor, board_channels: int) -> Tensor:
+    """Keep the first board_channels channels of each of the two board blocks."""
+    per_board = x.shape[1] // 2
+    if per_board == board_channels:
+        return x
+    return torch.cat((x[:, :board_channels], x[:, per_board:per_board + board_channels]), dim=1)
+
+
+def widen_board_planes(x: Tensor, board_channels: int) -> Tensor:
+    """Pad each board block with zero planes up to board_channels."""
+    per_board = x.shape[1] // 2
+    if per_board == board_channels:
+        return x
+    out = x.new_zeros((x.shape[0], 2 * board_channels, *x.shape[2:]))
+    out[:, :per_board] = x[:, :per_board]
+    out[:, board_channels:board_channels + per_board] = x[:, per_board:]
+    return out
+
+
+def load_drift_inputs(path, board_channels: int, max_samples: int = 1024,
+                      source_board_channels: int = 37) -> Tensor:
+    """Normalised planes (N, 2 * board_channels, 8, 8) from the 'x' column of a
+    supervised or RL Parquet shard, first max_samples rows, every channel from
+    source_board_channels on (per board) set to 0."""
+    import numpy as np
+    import polars as pl
+    from hivemind.training.data_loaders import infer_input_channels
+
+    frame = pl.read_parquet(path, columns=["x"], n_rows=max_samples)
+    values = frame["x"].to_list()
+    channels = infer_input_channels(values)
+    x = torch.from_numpy(
+        np.frombuffer(b"".join(values), dtype=np.uint8).reshape(len(values), channels, 8, 8).copy()
+    ).float() / 255.0
+    x = narrow_board_planes(x, min(source_board_channels, channels // 2))
+    return widen_board_planes(x, board_channels)
+
+
+def drift_outputs(model: nn.Module, x: Tensor, ctx, batch_size: int = 256):
+    """(value (N,), log-softmax policy A (N, 4672), policy B) of model on x."""
+    board = getattr(model, "board_channels", None) or x.shape[1] // 2
+    was_training = model.training
+    model.eval()
+    values, logp_a, logp_b = [], [], []
+    with torch.no_grad():
+        for start in range(0, len(x), batch_size):
+            batch = x[start:start + batch_size]
+            batch = narrow_board_planes(batch, board) if batch.shape[1] // 2 > board else \
+                widen_board_planes(batch, board)
+            out = model(batch.to(ctx))
+            values.append(torch.flatten(out[0]).float().cpu())
+            logp_a.append(torch.log_softmax(out[1][0].float(), dim=1).cpu())
+            logp_b.append(torch.log_softmax(out[1][1].float(), dim=1).cpu())
+    if was_training:
+        model.train()
+    return torch.cat(values), torch.cat(logp_a), torch.cat(logp_b)
+
+
+def drift_metrics(reference, current) -> dict:
+    """policy_kl: KL(reference || current) per board, averaged over boards and
+    positions; value_mse: mean squared value difference."""
+    ref_v, ref_a, ref_b = reference
+    cur_v, cur_a, cur_b = current
+    kl = 0.0
+    for ref, cur in ((ref_a, cur_a), (ref_b, cur_b)):
+        kl += float((ref.exp() * (ref - cur)).sum(dim=1).mean())
+    return {
+        "policy_kl": kl / 2.0,
+        "value_mse": float(((cur_v - ref_v) ** 2).mean()),
+        "positions": int(len(ref_v)),
+    }
+
+
+def new_columns_max_abs(model: nn.Module, source_board_channels: int = 37) -> float:
+    """Largest |weight| over the widened input columns (0 when there are none)."""
+    masks = new_input_columns(model, source_board_channels)
+    params = dict(model.named_parameters())
+    best = 0.0
+    for name, mask in masks.items():
+        if bool(mask.any()):
+            best = max(best, float(params[name].detach()[:, mask].abs().max()))
+    return best
