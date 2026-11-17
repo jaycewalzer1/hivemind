@@ -30,10 +30,22 @@ NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD = (
 NUM_ELAPSED_BUGHOUSE_CHANNELS = 2 * NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD
 ELAPSED_CHANNEL_OFFSET = NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD
 
+# Spec v3 (custom engine): one diagonal clock plane per board after the elapsed
+# planes, tanh((t_ourA - t_oppB) / s), identical in both blocks. 44 channels per
+# board. s = DIAGONAL_SCALE_S seconds by default; {10, 20} are ablation arms.
+NUM_DIAGONAL_CHANNELS_PER_BOARD = 1
+NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD = (
+    NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD + NUM_DIAGONAL_CHANNELS_PER_BOARD
+)
+NUM_DIAGONAL_BUGHOUSE_CHANNELS = 2 * NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD
+DIAGONAL_CHANNEL_OFFSET = NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD
+DIAGONAL_SCALE_S = 15.0
+
 SUPPORTED_CHANNELS_PER_BOARD = (
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD,
 )
 
 # Spec v2 auxiliary heads: think_gain (one logit per board) and arrivals
@@ -44,9 +56,13 @@ NUM_ARRIVAL_PIECE_TYPES = 5
 NUM_ARRIVAL_OUTPUTS = NUM_ARRIVAL_POCKETS * NUM_ARRIVAL_PIECE_TYPES
 
 
-def channels_per_board(clock_planes: bool = False, elapsed_planes: bool = False) -> int:
+def channels_per_board(clock_planes: bool = False, elapsed_planes: bool = False,
+                       diagonal_plane: bool = False) -> int:
     """Channels in one board block: 37 by default, 41 with clock planes,
-    43 with clock and elapsed-time planes (elapsed implies clocks)."""
+    43 with clock and elapsed-time planes (elapsed implies clocks), 44 with the
+    spec v3 diagonal plane as well (implies both)."""
+    if diagonal_plane:
+        return NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD
     if elapsed_planes:
         return NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD
     return (

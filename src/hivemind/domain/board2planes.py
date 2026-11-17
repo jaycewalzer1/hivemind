@@ -8,7 +8,8 @@ from hivemind.domain.board import BughouseBoard
 from hivemind.constants import (BOARD_A, BOARD_B, BOARD_HEIGHT, BOARD_WIDTH,
                            MAX_NUM_DROPS, MAX_NUM_NO_PROGRESS,
                            NUM_BUGHOUSE_CHANNELS_PER_BOARD, CLOCK_CHANNEL_OFFSET,
-                           ELAPSED_CHANNEL_OFFSET, channels_per_board)
+                           ELAPSED_CHANNEL_OFFSET, DIAGONAL_CHANNEL_OFFSET,
+                           DIAGONAL_SCALE_S, channels_per_board)
 
 
 _PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
@@ -130,9 +131,33 @@ def _fill_elapsed_planes(planes, offset, elapsed) -> None:
         planes[c][:, :], planes[c + 1][:, :] = elapsed_plane_values(value)
 
 
+def diagonal_plane_value(team_side: chess.Color, clocks,
+                         scale_s: float = DIAGONAL_SCALE_S) -> float:
+    """The spec v3 diagonal plane: tanh((t_ourA - t_oppB) / s), t in seconds.
+
+    clocks = (A_white, A_black, B_white, B_black) in ms. t_ourA is team_side's
+    clock on board A; t_oppB is our partner's opponent on board B, who plays
+    team_side's colour there. Negative clocks count as 0, as in planes.cc.
+    """
+    if len(clocks) != 4:
+        raise ValueError("clocks must be (A_white, A_black, B_white, B_black) in ms")
+    a_white, a_black, b_white, b_black = (max(float(c), 0.0) for c in clocks)
+    ours = a_white if team_side == chess.WHITE else a_black
+    diagonal = b_white if team_side == chess.WHITE else b_black
+    return math.tanh((ours - diagonal) / (1000.0 * float(scale_s)))
+
+
+def _fill_diagonal_plane(planes, offset, team_side, clocks, scale_s) -> None:
+    """Fill channel 43 of both board blocks (the same value in each)."""
+    value = diagonal_plane_value(team_side, clocks, scale_s)
+    for base in (0, offset):
+        planes[base + DIAGONAL_CHANNEL_OFFSET][:, :] = value
+
+
 def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
                  clocks=None, clock_planes=None, elapsed=None,
-                 elapsed_planes=None) -> np.ndarray:
+                 elapsed_planes=None, diagonal_plane=False,
+                 diagonal_scale_s: float = DIAGONAL_SCALE_S) -> np.ndarray:
     """Encode a bughouse position from team_side's view.
 
     Default: 37 channels per board (74 total), unchanged. With clock_planes=True,
@@ -141,12 +166,20 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
     With elapsed_planes=True, or when elapsed is given, 43 channels per board
     (86 total, spec v2): 37..40 clocks as above and 41..42 the elapsed-time
     planes (all 0 when elapsed is None).
+    With diagonal_plane=True, 44 channels per board (88 total, spec v3): the
+    43 above plus channel 43, tanh((t_ourA - t_oppB) / diagonal_scale_s) with
+    clocks in seconds, the same in both blocks (0 when clocks is None).
     clocks: remaining ms for (A_white, A_black, B_white, B_black).
     elapsed: ms since the last move landed on board A and on board B. Read only
     together with clocks, as the engine does (UCI 'elapsed' extends the 'clocks'
     suffix, and planes.cc leaves 41..42 at 0 without clocks): elapsed without
     clocks gives elapsed planes of 0.
     """
+    if diagonal_plane:
+        if elapsed_planes is False or clock_planes is False:
+            raise ValueError("the diagonal plane comes after the clock and elapsed "
+                             "planes; it needs both")
+        elapsed_planes = clock_planes = True
     if elapsed_planes is None:
         elapsed_planes = elapsed is not None
     if elapsed is not None and not elapsed_planes:
@@ -158,7 +191,7 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
     if elapsed_planes and not clock_planes:
         raise ValueError("elapsed planes come after the clock planes; "
                          "clock_planes=False is not a supported layout")
-    offset = channels_per_board(clock_planes, elapsed_planes)
+    offset = channels_per_board(clock_planes, elapsed_planes, diagonal_plane)
     planes = np.zeros(
         (2 * offset, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32
     )
@@ -275,6 +308,8 @@ def board2planes(board: BughouseBoard, team_side: chess.Color, flip=False,
         raise ValueError("elapsed must be (ms on board A, ms on board B)")
     if elapsed is not None and clocks is not None:
         _fill_elapsed_planes(planes, offset, elapsed)
+    if diagonal_plane and clocks is not None:
+        _fill_diagonal_plane(planes, offset, team_side, clocks, diagonal_scale_s)
 
     if flip:
         a_block = planes[:offset].copy()

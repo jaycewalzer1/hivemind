@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Widen a 37-plane-per-board Hivemind network for the custom engine.
 
-Spec v2 (default, `--planes 43`): every board block grows from 37 to 43
+Spec v3 (default, `--planes 44`): the v2 layout below plus channel 43 of each
+board block, the diagonal clock plane tanh((t_ourA - t_oppB) / s) (s = 15 s by
+default; its weights start at 0 like every new plane, so s does not change the
+network, only the planes it is checked on). Same v2 heads. Output
+`hivemind-clock-v3*`.
+
+Spec v2 (`--planes 43`): every board block grows from 37 to 43
 channels: 37..40 the clock planes (our / opponent seat, min(t/300, 1) and
 exp(-t/10)) and 41..42 the elapsed-time planes (min(e/10, 1), 1 - exp(-e/2)).
 It also adds the two v2 auxiliary heads, exported as extra ONNX outputs:
@@ -29,13 +35,14 @@ with S = source and T = target channels per board:
      channels; the new columns are zeros)
 For dualstream-memory-risev33 the shared per-board stem
 (shared_stem.body.0.weight [C, S, 3, 3]) gets T - S zero columns.
-The source may be a 37-plane (it04) or a 41-plane (v1) network.
+The source may be a 37-plane (it04), a 41-plane (v1) or a 43-plane (v2) network.
 
 The optimizer state (SGD momentum buffers) is widened the same way; the new
 head parameters are appended to the last parameter group without state, so
 `train_loop.py --mode rl --checkpoint <out> --resume-training` stays possible.
 
-    python tools/make_clock_net.py                # it04 -> engine/models/hivemind-clock-v2*
+    python tools/make_clock_net.py                # it04 -> engine/models/hivemind-clock-v3* (44 planes)
+    python tools/make_clock_net.py --planes 43    # it04 -> engine/models/hivemind-clock-v2*
     python tools/make_clock_net.py --planes 41    # it04 -> engine/models/hivemind-clock* (v1)
     python tools/make_clock_net.py --check        # also run the parity check
 """
@@ -63,7 +70,9 @@ from hivemind.architectures.model_config import (  # noqa: E402
 from hivemind.constants import (  # noqa: E402
     NUM_ARRIVAL_OUTPUTS,
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
+    DIAGONAL_SCALE_S,
     NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_THINK_GAIN_OUTPUTS,
     board_channels_from_total,
@@ -74,13 +83,15 @@ DEFAULT_SOURCE = MODELS / "hivemind-it04-crossboard-risev33-loss1.556-p82.0.tar"
 DEFAULT_PREFIXES = {
     NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD: "hivemind-clock",
     NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD: "hivemind-clock-v2",
+    NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD: "hivemind-clock-v3",
 }
 FP16_CONVERTER = REPO / "engine" / "scripts" / "convert_onnx_fp16.py"
 
 OLD = NUM_BUGHOUSE_CHANNELS_PER_BOARD  # 37
 V1 = NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD  # 41
 V2 = NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD  # 43
-NEW = V2  # default target
+V3 = NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD  # 44
+NEW = V3  # default target
 
 OUTPUT_NAMES = ("value", "pi_a", "pi_b", "wdl_out", "moves_left")
 AUX_OUTPUT_NAMES = ("think_gain", "arrivals")
@@ -147,9 +158,9 @@ def source_board_channels(state_dict) -> int:
 
 
 def widen_state_dict(state_dict, target: int = NEW) -> dict:
-    """Copy of a 37- (or 41-) channel-per-board state dict widened to target."""
+    """Copy of a 37- (41- or 43-) channel-per-board state dict widened to target."""
     source = source_board_channels(state_dict)
-    if source not in (OLD, V1) or target not in (V1, V2) or target <= source:
+    if source not in (OLD, V1, V2) or target not in (V1, V2, V3) or target <= source:
         raise ValueError(
             f"Cannot widen a {source}-plane-per-board network to {target} planes"
         )
@@ -220,11 +231,12 @@ def widen_checkpoint(checkpoint: dict, target: int = NEW,
                      aux_heads: bool | None = None) -> dict:
     """Widen model weights and, when present, the optimizer state.
 
-    aux_heads (default: on for the v2 target) also adds the think_gain and
-    arrivals heads with zero output layers.
+    aux_heads (default: on for the v2 and v3 targets) also adds the think_gain
+    and arrivals heads with zero output layers (kept as they are when the
+    source already has them).
     """
     if aux_heads is None:
-        aux_heads = target == V2
+        aux_heads = target in (V2, V3)
     state_dict = checkpoint["model_state_dict"]
     source = source_board_channels(state_dict)
     old_model = create_model(model_args_from_state_dict(state_dict))
@@ -243,7 +255,8 @@ def widen_checkpoint(checkpoint: dict, target: int = NEW,
             source, target, new_parameter_count=added,
         )
     widened["clock_planes"] = True
-    widened["elapsed_planes"] = target == V2
+    widened["elapsed_planes"] = target in (V2, V3)
+    widened["diagonal_plane"] = target == V3
     widened["aux_heads"] = bool(aux_heads)
     return widened
 
@@ -356,12 +369,16 @@ def logged_positions(paths, limit: int):
     return positions
 
 
-def planes_for(positions, target: int = NEW):
+def planes_for(positions, target: int = NEW, diagonal_scale_s: float = DIAGONAL_SCALE_S):
     """(74-channel planes, target-width planes from board2planes) for positions."""
     from hivemind.domain.board2planes import board2planes
 
     p74 = np.stack([board2planes(p[0], p[1]) for p in positions])
-    if target == V2:
+    if target == V3:
+        wide = np.stack([board2planes(b, team, clocks=clocks, elapsed=elapsed,
+                                      diagonal_plane=True, diagonal_scale_s=diagonal_scale_s)
+                         for b, team, clocks, elapsed in positions])
+    elif target == V2:
         wide = np.stack([board2planes(b, team, clocks=clocks, elapsed=elapsed)
                          for b, team, clocks, elapsed in positions])
     else:
@@ -471,14 +488,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--out-dir", type=Path, default=MODELS)
-    parser.add_argument("--planes", type=int, choices=(V1, V2), default=V2,
-                        help="channels per board: 43 (spec v2, default) or 41 (v1)")
+    parser.add_argument("--planes", type=int, choices=(V1, V2, V3), default=V3,
+                        help="channels per board: 44 (spec v3, default), 43 (v2) or 41 (v1)")
     parser.add_argument("--prefix", default=None,
-                        help="output name prefix (default hivemind-clock-v2, or "
-                             "hivemind-clock with --planes 41)")
+                        help="output name prefix (default hivemind-clock-v3; hivemind-clock-v2 "
+                             "with --planes 43, hivemind-clock with --planes 41)")
+    parser.add_argument("--diagonal-scale", type=float, default=DIAGONAL_SCALE_S,
+                        help="--check with --planes 44: s of the diagonal plane in the "
+                             "parity positions (default 15; the network does not depend on it)")
     aux = parser.add_mutually_exclusive_group()
     aux.add_argument("--aux-heads", dest="aux_heads", action="store_true", default=None,
-                     help="add think_gain/arrivals heads (default with --planes 43)")
+                     help="add think_gain/arrivals heads (default with --planes 43 and 44)")
     aux.add_argument("--no-aux-heads", dest="aux_heads", action="store_false")
     parser.add_argument("--no-fp16", action="store_true", help="skip the FP16 ONNX")
     parser.add_argument("--check", action="store_true",
@@ -489,7 +509,7 @@ def main() -> None:
                         help="arena event logs (jsonl) to take real positions from")
     args = parser.parse_args()
     target = args.planes
-    aux_heads = (target == V2) if args.aux_heads is None else args.aux_heads
+    aux_heads = (target in (V2, V3)) if args.aux_heads is None else args.aux_heads
     prefix = args.prefix or DEFAULT_PREFIXES[target]
 
     torch.set_num_threads(4)
@@ -524,7 +544,7 @@ def main() -> None:
         ref_path = export_onnx(old_model, Path(tmp) / "it04-fp32.onnx", 2 * OLD)
         sets = []
         rnd = random_positions(args.random_positions, seed=1)
-        sets.append(("random", *planes_for(rnd, target)))
+        sets.append(("random", *planes_for(rnd, target, args.diagonal_scale)))
         logs = args.game_logs
         if logs is None:
             runs = REPO.parents[1] / "runs"
@@ -532,7 +552,7 @@ def main() -> None:
         if logs and args.logged_positions:
             real = logged_positions(logs, args.logged_positions)
             if real:
-                sets.append(("logged games", *planes_for(real, target)))
+                sets.append(("logged games", *planes_for(real, target, args.diagonal_scale)))
         for label, p74, _ in sets:
             print(f"positions: {label} {len(p74)}")
         worst = run_parity(old_model, new_model, sets, onnx_pair=(ref_path, fp32_path))
