@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <filesystem>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -123,10 +124,10 @@ void UCI::position(istringstream& is) {
         ++at;
     }
     else if (tokens[at] == "fen") {
-        // Build the FEN string until we hit "moves", "clocks" or the end
+        // Build the FEN string until we hit "moves", "clocks", "elapsed" or the end
         std::string fen;
         for (++at; at < tokens.size() && tokens[at] != "moves"
-                    && tokens[at] != "clocks"; ++at) {
+                    && tokens[at] != "clocks" && tokens[at] != "elapsed"; ++at) {
             fen += tokens[at] + " ";
         }
         board.set(fen);
@@ -136,13 +137,34 @@ void UCI::position(istringstream& is) {
     }
     // Without a 'clocks' suffix there are no clocks (stock behaviour).
     board.clear_clocks();
+    // 'elapsed <ea> <eb>' (spec v2) is applied once the clocks are known.
+    bool elapsedGiven = false;
+    int64_t elapsedValues[2] = {0, 0};
+    // Reads up to `count` ms values starting at tokens[at]; returns how many parsed.
+    auto parse_ms = [&](int64_t* values, int count) {
+        int parsed = 0;
+        for (; parsed < count && at < tokens.size(); ++parsed, ++at) {
+            try {
+                size_t used = 0;
+                const double value = std::stod(tokens[at], &used);
+                if (used != tokens[at].size() || !std::isfinite(value)) {
+                    break;
+                }
+                values[parsed] = static_cast<int64_t>(std::llround(value));
+            } catch (const std::exception&) {
+                break;
+            }
+        }
+        return parsed;
+    };
 
     while (at < tokens.size()) {
         const std::string& section = tokens[at++];
         if (section == "moves") {
             // Parse move list (if any)
             int moveCount = 0;
-            for (; at < tokens.size() && tokens[at] != "clocks"; ++at) {
+            for (; at < tokens.size() && tokens[at] != "clocks"
+                    && tokens[at] != "elapsed"; ++at) {
                 const std::string& token = tokens[at];
                 if (token.empty() || token[0] < '1' || token[0] > '2') {
                     std::cerr << "Error: Invalid board indicator in move '" << token
@@ -168,25 +190,14 @@ void UCI::position(istringstream& is) {
                 moveCount++;
             }
             // After an invalid move the rest of the list is skipped, as before.
-            while (at < tokens.size() && tokens[at] != "clocks") {
+            while (at < tokens.size() && tokens[at] != "clocks"
+                   && tokens[at] != "elapsed") {
                 ++at;
             }
         } else if (section == "clocks") {
             // Remaining ms for A_white, A_black, B_white, B_black.
             int64_t values[4];
-            int parsed = 0;
-            for (; parsed < 4 && at < tokens.size(); ++parsed, ++at) {
-                try {
-                    size_t used = 0;
-                    const double value = std::stod(tokens[at], &used);
-                    if (used != tokens[at].size() || !std::isfinite(value)) {
-                        break;
-                    }
-                    values[parsed] = static_cast<int64_t>(std::llround(value));
-                } catch (const std::exception&) {
-                    break;
-                }
-            }
+            const int parsed = parse_ms(values, 4);
             if (parsed == 4) {
                 board.set_clocks(values[0], values[1], values[2], values[3]);
             } else {
@@ -194,8 +205,25 @@ void UCI::position(istringstream& is) {
                 std::cout << "info string clocks needs four ms values"
                           << " (A_white A_black B_white B_black); ignored" << std::endl;
             }
+        } else if (section == "elapsed") {
+            // ms since the last move landed on board A and on board B.
+            if (parse_ms(elapsedValues, 2) == 2) {
+                elapsedGiven = true;
+            } else {
+                elapsedGiven = false;
+                std::cout << "info string elapsed needs two ms values"
+                          << " (board A, board B); ignored" << std::endl;
+            }
         }
         // Anything else after the position is ignored, as before.
+    }
+    if (elapsedGiven) {
+        if (board.has_clocks()) {
+            board.set_elapsed(elapsedValues[0], elapsedValues[1]);
+        } else {
+            std::cout << "info string elapsed needs a clocks suffix; ignored"
+                      << std::endl;
+        }
     }
 }
 
@@ -250,8 +278,16 @@ void UCI::go(std::istringstream& is) {
     }
     opts.enablePonder = ponderEnabled;
     opts.search = current_search_config();
-    if (emitSample) {
-        opts.beforeBestmove = [this]() { emit_sample(); };
+    const bool emitThinkGain = !engines.empty() && engines.front()->hasThinkGain();
+    if (emitSample || emitThinkGain) {
+        opts.beforeBestmove = [this, emitSample, emitThinkGain]() {
+            if (emitThinkGain) {
+                emit_think_gain();
+            }
+            if (emitSample) {
+                emit_sample();
+            }
+        };
     }
     // TreeMoveMs only acts when this position came with clocks.
     board.treeMoveMs = treeMoveMs;
@@ -315,6 +351,27 @@ SearchParams::RuntimeConfig UCI::current_search_config() {
         static_cast<float>(openingNoiseEpsilonPermille) / 1000.0f;
     config.rootNoiseSeed = openingNoiseGenerator();
     return config;
+}
+
+void UCI::emit_think_gain() {
+    try {
+        std::vector<float> planes(NB_INPUT_VALUES());
+        board_to_planes(board, planes.data(), teamSide, teamHasTimeAdvantage);
+        float logits[2] = {0.0f, 0.0f};
+        if (!engines.front()->evaluateThinkGain(planes.data(), logits)) {
+            std::cout << "info string think_gain failed" << std::endl;
+            return;
+        }
+        auto probability = [](float logit) {
+            return 1.0 / (1.0 + std::exp(-static_cast<double>(logit)));
+        };
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(4) << "info string think_gain "
+             << probability(logits[0]) << " " << probability(logits[1]);
+        std::cout << line.str() << std::endl;
+    } catch (const std::exception& error) {
+        std::cout << "info string think_gain failed: " << error.what() << std::endl;
+    }
 }
 
 void UCI::emit_sample() {

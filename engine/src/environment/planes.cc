@@ -236,6 +236,23 @@ inline void set_plane_clocks_board(PlaneData<T>& p, int boardIdx) {
     }
 }
 
+// Elapsed-time planes (spec v2, 43-channel clock build): channels 41..42 of a
+// board block. e = seconds since the last move landed on this board, for
+// whichever side is on turn there (plane 25 says which).
+//   41: min(e / 10, 1)    42: 1 - exp(-e / 2)
+// Both stay 0 when no elapsed times were given.
+template <typename T>
+inline void set_plane_elapsed_board(PlaneData<T>& p, int boardIdx) {
+    if (!p.board.has_clocks() || !p.board.has_elapsed()) {
+        p.increment_channel();
+        p.increment_channel();
+        return;
+    }
+    const double seconds = std::max<int64_t>(0, p.board.elapsed_ms(boardIdx)) / 1000.0;
+    p.set_plane_to_value(static_cast<float>(std::min(seconds / 10.0, 1.0)));
+    p.set_plane_to_value(static_cast<float>(1.0 - std::exp(-seconds / 2.0)));
+}
+
 template <typename T>
 void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSide, bool hasTimeAdvantage) {
     // Initialize all to 0 using SIMD when available
@@ -272,6 +289,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     if constexpr (HAS_CLOCK_PLANES) {
         set_plane_clocks_board(planeData, 0);
     }
+    if constexpr (HAS_ELAPSED_PLANES) {
+        set_plane_elapsed_board(planeData, 0);
+    }
     
     // Process Board 1
     set_plane_pieces_board(planeData, 1);           
@@ -285,6 +305,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     set_plane_history_board(planeData, 1);
     if constexpr (HAS_CLOCK_PLANES) {
         set_plane_clocks_board(planeData, 1);
+    }
+    if constexpr (HAS_ELAPSED_PLANES) {
+        set_plane_elapsed_board(planeData, 1);
     }
 }
 

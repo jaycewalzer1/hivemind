@@ -50,6 +50,12 @@ private:
     // ('go ... sample'): one HVM5 TrainingSample record, as selfplay writes it.
     void emit_sample();
 
+    // Prints 'info string think_gain <pa> <pb>' (spec v2 B) for the root
+    // position when the network has a think_gain output: the sigmoid of each
+    // board's logit, from one extra evaluation after the search (never read
+    // by the search). Prints nothing otherwise.
+    void emit_think_gain();
+
     // Rebuilds the engines (and the agent) with the current settings. The batch
     // size is baked into the TensorRT engine, so changing it means reloading.
     bool reload_engines();

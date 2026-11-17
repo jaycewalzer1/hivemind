@@ -21,7 +21,7 @@ option(HIVEMIND_NATIVE_ARCH "Optimize for the build machine's CPU" ON)
 option(HIVEMIND_USE_PEXT "Use BMI2 PEXT for sliding attacks (benchmark first; slower on most CPUs tested)" OFF)
 option(HIVEMIND_ORT_FP16 "Use native FP16 tensors with the ONNX Runtime backend" OFF)
 option(HIVEMIND_PORTABLE_BUNDLE "Use relocatable runtime search paths for release packaging" OFF)
-option(HIVEMIND_CLOCK_PLANES "Build hivemind-clock: 41 input channels per board (37 + 4 clock planes)" OFF)
+option(HIVEMIND_CLOCK_PLANES "Build hivemind-clock: 43 input channels per board (37 + 4 clock + 2 elapsed planes)" OFF)
 
 # Set C++ version and optimization level. Keep compiler flags portable: GNU
 # switches passed unconditionally here used to make the ONNX Runtime backend

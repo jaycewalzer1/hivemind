@@ -10,15 +10,21 @@ const int BOARD_B = 1;
 constexpr int NB_POLICY_CHANNELS = 73;
 // Channels the stock network reads per board.
 constexpr int NB_LEGACY_INPUT_CHANNELS_PER_BOARD = 37;
+// Channels per board of a v1 clock network (37 + 4 clock planes).
+constexpr int NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 4;
 #ifdef HIVEMIND_CLOCK_PLANES
-// hivemind-clock build (-DHIVEMIND_CLOCK_PLANES=ON): four clock planes follow
-// the 37 stock channels of each board (channels 37..40 of every board block).
-constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 4;
+// hivemind-clock build (-DHIVEMIND_CLOCK_PLANES=ON), spec v2: four clock planes
+// (channels 37..40) and two elapsed-time planes (41..42) follow the 37 stock
+// channels of each board, 43 per board block. A v1 network (41 per board) is
+// still accepted by the ONNX Runtime backend, which drops channels 41..42.
+constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD + 6;
 #else
 constexpr int NB_INPUT_CHANNELS_PER_BOARD = NB_LEGACY_INPUT_CHANNELS_PER_BOARD;
 #endif
 constexpr bool HAS_CLOCK_PLANES =
     NB_INPUT_CHANNELS_PER_BOARD > NB_LEGACY_INPUT_CHANNELS_PER_BOARD;
+constexpr bool HAS_ELAPSED_PLANES =
+    NB_INPUT_CHANNELS_PER_BOARD > NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD;
 constexpr int NB_INPUT_CHANNELS = 2 * NB_INPUT_CHANNELS_PER_BOARD;
 constexpr int BOARD_HEIGHT = 8; 
 constexpr int BOARD_WIDTH = 8; 
