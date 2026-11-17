@@ -590,7 +590,8 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
     # LR schedule: Cosine Annealing with 25% warm-up (as per CrazyAra RL paper)
     # The warm-up helps with context drift in the training data
     cosine_schedule = CosineAnnealingSchedule(min_lr=tc.min_lr, max_lr=tc.max_lr, cycle_length=tc.total_it)
-    to.lr_schedule = LinearWarmUp(cosine_schedule, start_lr=tc.min_lr, length=int(tc.total_it * 0.25))
+    # max(1, ...): a run of 1-3 steps (tiny smoke data) would otherwise divide by a zero warm-up length.
+    to.lr_schedule = LinearWarmUp(cosine_schedule, start_lr=tc.min_lr, length=max(1, int(tc.total_it * 0.25)))
     to.momentum_schedule = MomentumSchedule(to.lr_schedule, tc.min_lr, tc.max_lr, tc.min_momentum, tc.max_momentum)
     
     # Load model.
