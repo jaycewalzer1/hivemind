@@ -6,8 +6,12 @@ import numpy as np
 import polars as pl
 import torch
 from hivemind.constants import (
+    CLOCK_CHANNEL_OFFSET,
+    ELAPSED_CHANNEL_OFFSET,
     NUM_BUGHOUSE_CHANNELS,
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD,
+    NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD,
     board_channels_from_total,
 )
 
@@ -31,6 +35,87 @@ AUX_LABEL_COLUMNS = (
     'arrivals',
     'arrivals_mask',
 )
+
+
+# Spec v3 (WP-D): exact clock scalars written by the converter from the
+# recorder's sidecar; the loader rebuilds planes 37-42 of each board block from
+# them instead of the uint8 planes (clocks on a 1.18 s grid, exp planes 0 above
+# 62 s). Bits of clock_scalars_mask: 1 = clocks present, 2 = elapsed present.
+CLOCK_SCALAR_COLUMNS = ('clocks_ms', 'elapsed_ms', 'clock_scalars_mask', 'team')
+CLOCKS_MASK_BIT = 1
+ELAPSED_MASK_BIT = 2
+
+
+def clock_plane_tensors(remaining_ms: torch.Tensor):
+    """(min(t/300, 1), exp(-t/10)), t = max(ms, 0) / 1000, as planes.cc."""
+    t = remaining_ms.double().clamp_min(0.0) / 1000.0
+    return (t / 300.0).clamp_max(1.0).float(), torch.exp(-t / 10.0).float()
+
+
+def elapsed_plane_tensors(elapsed_ms: torch.Tensor):
+    """(min(e/10, 1), 1 - exp(-e/2)), e = max(ms, 0) / 1000, as planes.cc."""
+    e = elapsed_ms.double().clamp_min(0.0) / 1000.0
+    return (e / 10.0).clamp_max(1.0).float(), (1.0 - torch.exp(-e / 2.0)).float()
+
+
+def rebuild_clock_planes(x: torch.Tensor, clocks_ms: torch.Tensor,
+                         elapsed_ms: torch.Tensor, mask: torch.Tensor,
+                         team: torch.Tensor) -> torch.Tensor:
+    """Overwrite the clock (37-40) and elapsed (41-42) planes of both board
+    blocks of normalized planes x (N, C, 8, 8) from exact scalars, in place.
+
+    clocks_ms (N, 4): A_white A_black B_white B_black; elapsed_ms (N, 2): A, B;
+    mask (N,): CLOCKS_MASK_BIT / ELAPSED_MASK_BIT; team (N,): 0 = the sample's
+    team plays white on board A (T1), 1 = black. Our seat on A is the team's
+    colour there, on B the other colour (the partner). Rows without the bit
+    keep their planes. Other widths (37 per board) are returned unchanged.
+    """
+    per_board = x.shape[1] // 2
+    if per_board < NUM_CLOCK_BUGHOUSE_CHANNELS_PER_BOARD or len(x) == 0:
+        return x
+    mask = mask.long()
+    white = team.long() == 0
+    clocks = clocks_ms.double()
+    ours_a = torch.where(white, clocks[:, 0], clocks[:, 1])
+    theirs_a = torch.where(white, clocks[:, 1], clocks[:, 0])
+    ours_b = torch.where(white, clocks[:, 3], clocks[:, 2])
+    theirs_b = torch.where(white, clocks[:, 2], clocks[:, 3])
+    rows = (mask & CLOCKS_MASK_BIT) != 0
+    if bool(rows.any()):
+        for base, ours, theirs in ((0, ours_a, theirs_a), (per_board, ours_b, theirs_b)):
+            c = base + CLOCK_CHANNEL_OFFSET
+            values = (*clock_plane_tensors(ours), *clock_plane_tensors(theirs))
+            for k, value in enumerate(values):
+                x[rows, c + k] = value[rows].view(-1, 1, 1).expand(-1, 8, 8).to(x.dtype)
+    rows = (mask & ELAPSED_MASK_BIT) != 0
+    if per_board >= NUM_ELAPSED_BUGHOUSE_CHANNELS_PER_BOARD and bool(rows.any()):
+        for base, column in ((0, 0), (per_board, 1)):
+            c = base + ELAPSED_CHANNEL_OFFSET
+            for k, value in enumerate(elapsed_plane_tensors(elapsed_ms[:, column])):
+                x[rows, c + k] = value[rows].view(-1, 1, 1).expand(-1, 8, 8).to(x.dtype)
+    return x
+
+
+def _apply_exact_clocks(df, x_tensor: torch.Tensor) -> torch.Tensor:
+    """rebuild_clock_planes from a shard's clock-scalar columns, when present."""
+    if not all(column in df.columns for column in CLOCK_SCALAR_COLUMNS) or not len(df):
+        return x_tensor
+    mask = torch.tensor(df['clock_scalars_mask'].to_numpy(), dtype=torch.long)
+    if not bool(mask.any()):
+        return x_tensor
+    clocks = torch.from_numpy(_decode_fixed_width_binary_column(
+        df['clocks_ms'].to_list(), dtype=np.float32, width=4).copy())
+    elapsed = torch.from_numpy(_decode_fixed_width_binary_column(
+        df['elapsed_ms'].to_list(), dtype=np.float32, width=2).copy())
+    team = torch.tensor(df['team'].to_numpy(), dtype=torch.long)
+    return rebuild_clock_planes(x_tensor, clocks, elapsed, mask, team)
+
+
+def _sample_weight_tensor(df, sample_count: int) -> torch.Tensor:
+    """The converter's sample_weight column (spec v3), or ones."""
+    if 'sample_weight' not in df.columns:
+        return torch.ones(sample_count)
+    return torch.tensor(df['sample_weight'].to_numpy(), dtype=torch.float32)
 
 
 def infer_input_channels(encoded_planes_column) -> int:
@@ -181,7 +266,8 @@ def load_parquet_shard(file_path, include_auxiliary=False):
 
 
 def load_rl_parquet_shard(file_path, include_joint_policy=False,
-                          include_aux_labels=False):
+                          include_aux_labels=False, include_sample_weights=False,
+                          exact_clocks=True):
     """
     Loads a single RL/self-play parquet shard and converts it to PyTorch tensors.
     
@@ -197,6 +283,10 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False,
     think_gain (N, 2), think_gain_mask (N, 2), arrivals (N, 20) and
     arrivals_mask (N,), all float32. A shard without those columns (converted
     from HVM3-HVM5 chunks before spec v2) gives zero labels and zero masks.
+    With include_sample_weights, one more tensor ends the tuple: the per-sample
+    weight (N,) float32 (spec v3; ones when the shard has no column).
+    exact_clocks: rebuild planes 37-42 from the shard's exact clock scalars
+    when it has them (rebuild_clock_planes); stock shards are unaffected.
 
     Returns:
         x_tensor: (N, C, 8, 8) float32 input planes, C = 74, 82 or 86
@@ -218,6 +308,10 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False,
     has_aux_labels = all(column in available_columns for column in AUX_LABEL_COLUMNS)
     if include_aux_labels and has_aux_labels:
         columns.extend(AUX_LABEL_COLUMNS)
+    if exact_clocks and all(column in available_columns for column in CLOCK_SCALAR_COLUMNS):
+        columns.extend(c for c in CLOCK_SCALAR_COLUMNS if c not in columns)
+    if include_sample_weights and 'sample_weight' in available_columns:
+        columns.append('sample_weight')
     df = pl.read_parquet(file_path, columns=columns)
 
     x_values = df['x'].to_list()
@@ -231,6 +325,8 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False,
         -1, input_channels, BOARD_SIZE, BOARD_SIZE
     )
     x_tensor = _normalize_input_planes(x_tensor)
+    if exact_clocks:
+        x_tensor = _apply_exact_clocks(df, x_tensor)
     
     # Process Y_Value
     y_val_tensor = torch.tensor(df['y_value'].to_list(), dtype=torch.float32)
@@ -264,6 +360,8 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False,
     aux = ()
     if include_aux_labels:
         aux = _aux_label_tensors(df, sample_count, has_aux_labels)
+    if include_sample_weights:
+        aux = aux + (_sample_weight_tensor(df, sample_count),)
     if not include_joint_policy:
         return base + aux
 
@@ -400,6 +498,7 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         shuffle_samples: bool = True,
         include_joint_policy: bool = False,
         include_aux_labels: bool = False,
+        include_sample_weights: bool = False,
     ):
         """
         Args:
@@ -420,6 +519,7 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         self.shuffle_samples = shuffle_samples
         self.include_joint_policy = include_joint_policy
         self.include_aux_labels = include_aux_labels
+        self.include_sample_weights = include_sample_weights
         
     def __iter__(self):
         files = self.parquet_files.copy()
@@ -430,7 +530,14 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
         def iter_shard(pf):
             """Keep decoded shard tensors scoped to one exhausted generator."""
             buffer = []
-            if self.include_aux_labels:
+            if self.include_sample_weights:
+                shard = load_rl_parquet_shard(
+                    pf,
+                    include_joint_policy=self.include_joint_policy,
+                    include_aux_labels=self.include_aux_labels,
+                    include_sample_weights=True,
+                )
+            elif self.include_aux_labels:
                 shard = load_rl_parquet_shard(
                     pf,
                     include_joint_policy=self.include_joint_policy,
@@ -442,6 +549,10 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
                 shard = load_rl_parquet_shard(pf)
             x, y_val, pol_a, pol_b, wdl, moves_left = shard[:6]
             extras = shard[6:]
+            weights = ()
+            if self.include_sample_weights:
+                weights = extras[-1:]
+                extras = extras[:-1]
             aux = ()
             if self.include_aux_labels:
                 aux = extras[-4:]
@@ -454,7 +565,7 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
                     x[i], y_val[i], pol_a[i], pol_b[i], wdl[i], moves_left[i]
                 ) + tuple(values[i] for values in joint) + tuple(
                     values[i] for values in aux
-                )
+                ) + tuple(values[i] for values in weights)
                 if self.shuffle_samples:
                     buffer.append(sample)
                 else:
@@ -484,6 +595,8 @@ class StreamingRLDataset(torch.utils.data.IterableDataset):
                         flipped_sample += flip_aux_labels(
                             *(values[i] for values in aux)
                         )
+                    if weights:
+                        flipped_sample += (weights[0][i],)
                     if self.shuffle_samples:
                         buffer.append(flipped_sample)
                     else:

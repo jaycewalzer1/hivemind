@@ -22,10 +22,29 @@ Parquet row with the columns think_gain_a, think_gain_b, think_gain_mask_a,
 think_gain_mask_b, arrivals (20 float32 as bytes) and arrivals_mask; samples
 from older chunks carry zero labels and zero masks. An arrivals block that
 holds a NaN is treated as absent (arrivals_mask 0).
+
+Spec v3 (WP-D) columns, written for every sample (defaults when a chunk has no
+`<chunk>.hvm.pos.jsonl` sidecar, see docs/events.md):
+    clocks_ms, elapsed_ms        4 and 2 float32 as bytes: the exact clocks
+                                 (A_white A_black B_white B_black) and elapsed
+                                 times (A, B) the engine was sent
+    clock_scalars_mask           bit 0: clocks present, bit 1: elapsed present;
+                                 the loader then rebuilds planes 37-42 from them
+    sample_weight                min(1, nodes / weight_nodes_ref), 1 when off
+    end_reason, opening          the game's end reason and opening-pair key
+    plane_hash                   64-bit hash of the uint8 planes (signed int)
+The clock build (more than 74 channels) also gets, by default: value target
+(1 - r) * outcome + r * root_q with r = 0.2, sample weights with
+weight_nodes_ref 400, the validation split by opening pair, validation samples
+whose planes also occur in training dropped, the arrivals label masked when its
+window passes the game end, games ending aborted / max_plies left out, and a
+report (<output>/report.json: samples by end reason, mean |root_q - outcome|
+by reason, duplicate rates). Stock (74-channel) data keeps the old behaviour.
 """
 
 import argparse
 import hashlib
+import json
 import random
 import re
 import shutil
@@ -78,6 +97,92 @@ DEFAULT_REPLAY_FILES = 25
 DEFAULT_REPLAY_SELECTION_FRACTION = 0.05
 DEFAULT_Q_VALUE_RATIO = 0.0
 DEFAULT_RL_SAMPLES_PER_SHARD = 4096
+# Spec v3 defaults for clock-build data (more than NB_INPUT_CHANNELS channels).
+DEFAULT_CLOCK_Q_VALUE_RATIO = 0.2
+DEFAULT_CLOCK_WEIGHT_NODES_REF = 400
+NON_TRAINING_REASONS = ("aborted", "max_plies")
+CLOCK_SEAT_ORDER = ("A_white", "A_black", "B_white", "B_black")
+CLOCKS_MASK_BIT = 1
+ELAPSED_MASK_BIT = 2
+
+
+def is_clock_data(input_channels: int) -> bool:
+    return int(input_channels) > NB_INPUT_CHANNELS
+
+
+def resolve_q_value_ratio(q_value_ratio, input_channels: int) -> float:
+    """None -> 0.2 for clock-build data, 0.0 for stock data."""
+    if q_value_ratio is not None:
+        return float(q_value_ratio)
+    return DEFAULT_CLOCK_Q_VALUE_RATIO if is_clock_data(input_channels) else DEFAULT_Q_VALUE_RATIO
+
+
+def resolve_weight_nodes_ref(weight_nodes_ref, input_channels: int) -> float:
+    """None -> 400 for clock-build data, 0 (off: every weight 1) for stock data."""
+    if weight_nodes_ref is not None:
+        return float(weight_nodes_ref)
+    return float(DEFAULT_CLOCK_WEIGHT_NODES_REF) if is_clock_data(input_channels) else 0.0
+
+
+def sample_weight(nodes: float, weight_nodes_ref: float) -> float:
+    """min(1, nodes / N_ref); 1 when N_ref <= 0."""
+    if weight_nodes_ref <= 0:
+        return 1.0
+    return float(min(1.0, max(0.0, float(nodes)) / float(weight_nodes_ref)))
+
+
+def plane_hash(planes: bytes) -> int:
+    """Signed 64-bit hash of a sample's uint8 planes (fits a Parquet Int64)."""
+    return int.from_bytes(hashlib.blake2b(planes, digest_size=8).digest(), "little", signed=True)
+
+
+def sidecar_path(chunk_path) -> Path:
+    return Path(str(chunk_path) + ".pos.jsonl")
+
+
+def read_sidecar(chunk_path) -> list[dict] | None:
+    """The arena recorder's per-sample JSON lines next to a chunk, or None."""
+    path = sidecar_path(chunk_path)
+    if not path.is_file():
+        return None
+    with path.open() as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def exact_clock_scalars(meta: dict | None) -> tuple[np.ndarray, np.ndarray, int]:
+    """(clocks_ms[4], elapsed_ms[2], mask) from one sidecar line.
+
+    Prefers the exact float fields (clocks_ms, elapsed_ms, spec v3); falls back
+    to the v2 dicts, rounded as the arena sent them (max(0, int(ms))). Elapsed
+    counts only together with clocks, as in the engine.
+    """
+    clocks = np.zeros(4, dtype=np.float32)
+    elapsed = np.zeros(2, dtype=np.float32)
+    mask = 0
+    if not meta:
+        return clocks, elapsed, mask
+    if meta.get("clocks_ms") is not None:
+        clocks[:] = [max(0.0, float(v)) for v in meta["clocks_ms"]]
+        mask |= CLOCKS_MASK_BIT
+    elif isinstance(meta.get("clocks"), dict):
+        clocks[:] = [max(0, int(meta["clocks"][seat])) for seat in CLOCK_SEAT_ORDER]
+        mask |= CLOCKS_MASK_BIT
+    if mask & CLOCKS_MASK_BIT:
+        if meta.get("elapsed_ms") is not None:
+            elapsed[:] = [max(0.0, float(v)) for v in meta["elapsed_ms"]]
+            mask |= ELAPSED_MASK_BIT
+        elif isinstance(meta.get("elapsed"), dict):
+            elapsed[:] = [max(0, int(meta["elapsed"][b])) for b in ("A", "B")]
+            mask |= ELAPSED_MASK_BIT
+    return clocks, elapsed, mask
+
+
+def arrivals_past_end(meta: dict | None) -> bool:
+    """True when the sample's arrivals window runs past the game end."""
+    if not meta or meta.get("gameEndMs") is None or meta.get("t") is None:
+        return False
+    window = meta.get("arrivalWindowMs") or 5000
+    return float(meta["t"]) + float(window) > float(meta["gameEndMs"])
 
 
 def read_exact(stream, size: int) -> bytes:
@@ -198,15 +303,26 @@ def read_shard_channels(filepath: str | Path) -> int:
 
 def read_binary_shard(
     filepath: str | Path,
-    q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    q_value_ratio: float | None = None,
     input_channels: int | None = None,
+    sidecar="auto",
+    weight_nodes_ref: float | None = None,
+    drop_non_training: bool = False,
+    mask_arrivals_past_end: bool = False,
 ) -> list[dict]:
     """Read one HVM3, HVM4, HVM5 or HVM6 chunk and return its samples.
 
     The plane width comes from the chunk header and may be 74, 82 or 86 channels.
     input_channels, when given, makes any other width an error.
+    q_value_ratio / weight_nodes_ref: None picks the default for the chunk's
+    width (resolve_q_value_ratio, resolve_weight_nodes_ref).
+    sidecar: "auto" reads <chunk>.pos.jsonl when present; a list of dicts (one
+    per sample) or None. drop_non_training / mask_arrivals_past_end use the
+    sidecar's reason / gameEndMs (convert_to_split_parquet turns both on for
+    clock-build data; the reader alone returns every sample as written).
     """
     samples = []
+    metas = read_sidecar(filepath) if isinstance(sidecar, str) and sidecar == "auto" else sidecar
     
     with open(filepath, 'rb') as f:
         magic, version, channels, policy_values, num_samples = HEADER.unpack(
@@ -233,9 +349,15 @@ def read_binary_shard(
                 f"Expected {NB_POLICY_VALUES} policy values, found {policy_values}"
             )
         
+        q_value_ratio = resolve_q_value_ratio(q_value_ratio, channels)
+        weight_nodes_ref = resolve_weight_nodes_ref(weight_nodes_ref, channels)
+        if metas is not None and len(metas) != num_samples:
+            raise ValueError(
+                f"Sidecar of {filepath} has {len(metas)} lines for {num_samples} samples"
+            )
         sample_struct = SAMPLE_METADATA_V4 if version >= 4 else SAMPLE_METADATA_V3
         # Read samples
-        for _ in range(num_samples):
+        for sample_index in range(num_samples):
             if version >= 4:
                 (
                     game_id,
@@ -275,6 +397,16 @@ def read_binary_shard(
                 else empty_aux_labels()
             )
 
+            meta = metas[sample_index] if metas is not None else None
+            reason = str(meta.get("reason") or "unknown") if meta else "unknown"
+            if drop_non_training and reason in NON_TRAINING_REASONS:
+                continue
+            if mask_arrivals_past_end and aux_labels['arrivals_mask'] and arrivals_past_end(meta):
+                aux_labels['arrivals'] = np.zeros(NB_ARRIVAL_VALUES, dtype=np.float32).tobytes()
+                aux_labels['arrivals_mask'] = 0
+            clocks_ms, elapsed_ms, clock_mask = exact_clock_scalars(meta)
+            nodes_searched = int(meta.get("nodes_searched") or nodes) if meta else int(nodes)
+
             blended_value = (1.0 - q_value_ratio) * float(outcome) + q_value_ratio * float(root_q)
 
             samples.append({
@@ -296,6 +428,13 @@ def read_binary_shard(
                 'has_time_advantage': bool(has_time_advantage),
                 'search_nodes': int(nodes),
                 **aux_labels,
+                'clocks_ms': clocks_ms.tobytes(),
+                'elapsed_ms': elapsed_ms.tobytes(),
+                'clock_scalars_mask': int(clock_mask),
+                'sample_weight': sample_weight(nodes_searched, weight_nodes_ref),
+                'end_reason': reason,
+                'opening': str(meta.get("opening") or "") if meta else "",
+                'plane_hash': plane_hash(planes),
             })
         if f.read(1):
             raise ValueError(f"Trailing bytes in chunk {filepath}")
@@ -355,51 +494,157 @@ def select_replay_files(
     return sorted(random.Random(seed).sample(candidates, replay_files))
 
 
+def is_validation_key(key: str, validation_fraction: float, split_seed: int) -> bool:
+    """Assign a whole opening pair (or any string key) to a deterministic split."""
+    digest = hashlib.blake2b(
+        f"{split_seed}:opening:{key}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "little") / 2**64 < validation_fraction
+
+
+def _replay_dirs(replay_input_dir) -> list[Path]:
+    if replay_input_dir is None:
+        return []
+    if isinstance(replay_input_dir, (str, Path)):
+        replay_input_dir = [replay_input_dir]
+    return [Path(d) for d in replay_input_dir if d]
+
+
+def _sidecar_openings(binary_files) -> set[str] | None:
+    """Opening keys from the input chunks' sidecars; None when any chunk lacks them."""
+    openings = set()
+    for path in binary_files:
+        metas = read_sidecar(path)
+        if metas is None or any(not m.get("opening") for m in metas):
+            return None
+        openings.update(str(m["opening"]) for m in metas)
+    return openings
+
+
+class _ConversionStats:
+    """Per-iteration data report (spec v3 WP-D): samples and games by end
+    reason, mean |root_q - outcome| by reason, weights, duplicate rates."""
+
+    def __init__(self):
+        self.by_reason = {}
+        self.weight_sum = 0.0
+        self.samples = 0
+        self.first_game_of_hash = {}
+        self.cross_game_duplicates = 0
+        self.train_samples = 0
+
+    def add(self, sample: dict, game_key, split: str, fresh: bool) -> None:
+        if fresh:
+            entry = self.by_reason.setdefault(
+                sample["end_reason"], {"samples": 0, "games": set(), "abs_q_err_sum": 0.0}
+            )
+            entry["samples"] += 1
+            entry["games"].add(game_key)
+            entry["abs_q_err_sum"] += abs(float(sample["root_q"]) - float(sample["outcome"]))
+            self.weight_sum += float(sample["sample_weight"])
+            self.samples += 1
+        if split == "train":
+            self.train_samples += 1
+            first = self.first_game_of_hash.setdefault(sample["plane_hash"], game_key)
+            if first != game_key:
+                self.cross_game_duplicates += 1
+
+    def report(self) -> dict:
+        reasons = {}
+        for reason, entry in sorted(self.by_reason.items()):
+            reasons[reason] = {
+                "samples": entry["samples"],
+                "games": len(entry["games"]),
+                "mean_abs_root_q_minus_outcome": entry["abs_q_err_sum"] / max(1, entry["samples"]),
+            }
+        return {
+            "samples_by_reason": reasons,
+            "mean_sample_weight": self.weight_sum / max(1, self.samples),
+            "train_cross_game_duplicate_rate": self.cross_game_duplicates / max(1, self.train_samples),
+        }
+
+
 def convert_to_split_parquet(
     input_dir: str | Path,
     output_dir: str | Path,
     validation_fraction: float = DEFAULT_RL_VALIDATION_FRACTION,
     split_seed: int = 42,
     samples_per_shard: int = DEFAULT_RL_SAMPLES_PER_SHARD,
-    replay_input_dir: str | Path | None = None,
+    replay_input_dir=None,
     replay_files: int = DEFAULT_REPLAY_FILES,
     replay_selection_fraction: float = DEFAULT_REPLAY_SELECTION_FRACTION,
-    q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    q_value_ratio: float | None = None,
     input_channels: int | None = None,
+    split_by: str = "auto",
+    dedupe_validation: bool | None = None,
+    weight_nodes_ref: float | None = None,
 ) -> tuple[Path, Path, int, int]:
     """Convert HVM chunks directly into game-disjoint train/validation shards.
 
     All chunks (replay included) must share one plane width; by default it is
     taken from the first chunk, so 74- and 82-channel data are never mixed.
+    replay_input_dir: one directory or a list (spec v3: the last 3
+    iterations); replay_files chunks are drawn from each, into training only.
+    split_by: "game", "opening" (whole opening pairs, from the sidecars) or
+    "auto" (opening for clock-build data whose chunks all have sidecar
+    openings, else game; when the opening split would leave one side empty it
+    falls back to games). dedupe_validation (None: on for clock-build data):
+    drop validation samples whose planes also occur in training. Writes
+    <output_dir>/report.json (_ConversionStats) and prints a summary.
     """
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction must be between 0 and 1")
     if samples_per_shard <= 0:
         raise ValueError("samples_per_shard must be positive")
+    if split_by not in ("auto", "game", "opening"):
+        raise ValueError(f"split_by must be auto, game or opening, got {split_by!r}")
 
     input_path = Path(input_dir)
     binary_files = sorted(input_path.glob("*.hvm"))
     if not binary_files:
         raise FileNotFoundError(f"No HVM chunks found in {input_path}")
-    selected_replay_files = (
-        select_replay_files(
-            replay_input_dir,
+    replay_dirs = _replay_dirs(replay_input_dir)
+    selected_replay_files = [
+        path
+        for directory in replay_dirs
+        for path in select_replay_files(
+            directory,
             replay_files,
             replay_selection_fraction,
             split_seed,
         )
-        if replay_input_dir is not None
-        else []
-    )
+    ]
 
     if input_channels is None:
         input_channels = read_shard_channels(binary_files[0])
+    clock_data = is_clock_data(input_channels)
+    q_value_ratio = resolve_q_value_ratio(q_value_ratio, input_channels)
+    weight_nodes_ref = resolve_weight_nodes_ref(weight_nodes_ref, input_channels)
+    if dedupe_validation is None:
+        dedupe_validation = clock_data
+
+    openings = _sidecar_openings(binary_files) if split_by != "game" else None
+    if split_by == "opening" and openings is None:
+        raise ValueError("split_by='opening' needs sidecars with an opening for every sample")
+    effective_split = "game"
+    if openings is not None and (split_by == "opening" or clock_data):
+        val_openings = {
+            o for o in openings
+            if is_validation_key(o, validation_fraction, split_seed)
+        }
+        if val_openings and val_openings != openings:
+            effective_split = "opening"
+        else:
+            print(
+                f"Opening split puts {len(val_openings)} of {len(openings)} opening "
+                "pairs in validation; splitting by game instead"
+            )
 
     output_path = Path(output_dir)
     if selected_replay_files:
         print(
             f"Selected {len(selected_replay_files)} replay chunks from "
-            f"{replay_input_dir}"
+            + ", ".join(map(str, replay_dirs))
         )
     resolved_input = input_path.resolve()
     resolved_output = output_path.resolve()
@@ -414,6 +659,9 @@ def convert_to_split_parquet(
     buffers = {"train": [], "val": []}
     counts = {"train": 0, "val": 0}
     shard_indices = {"train": 0, "val": 0}
+    stats = _ConversionStats()
+    train_hashes = set()
+    val_hashes = set()
 
     def flush(split: str) -> None:
         if not buffers[split]:
@@ -426,47 +674,93 @@ def convert_to_split_parquet(
         shard_indices[split] += 1
         buffers[split].clear()
 
+    def add(split: str, sample: dict, game_key, fresh: bool) -> None:
+        (train_hashes if split == "train" else val_hashes).add(sample["plane_hash"])
+        stats.add(sample, game_key, split, fresh)
+        buffers[split].append(sample)
+        counts[split] += 1
+        if len(buffers[split]) >= samples_per_shard:
+            flush(split)
+
+    read_kw = dict(
+        q_value_ratio=q_value_ratio,
+        input_channels=input_channels,
+        weight_nodes_ref=weight_nodes_ref,
+        drop_non_training=clock_data,
+        mask_arrivals_past_end=clock_data,
+    )
     for binary_file in tqdm(binary_files, desc="Converting HVM chunks"):
         run_id = _selfplay_run_id(binary_file)
-        for sample in read_binary_shard(
-            binary_file,
-            q_value_ratio=q_value_ratio,
-            input_channels=input_channels,
-        ):
-            split = "val" if is_validation_game(
-                run_id,
-                sample["game_id"],
-                validation_fraction,
-                split_seed,
-            ) else "train"
-            buffers[split].append(sample)
-            counts[split] += 1
-            if len(buffers[split]) >= samples_per_shard:
-                flush(split)
+        for sample in read_binary_shard(binary_file, **read_kw):
+            if effective_split == "opening" and sample["opening"]:
+                is_val = is_validation_key(sample["opening"], validation_fraction, split_seed)
+            else:
+                is_val = is_validation_game(
+                    run_id,
+                    sample["game_id"],
+                    validation_fraction,
+                    split_seed,
+                )
+            add("val" if is_val else "train", sample, (run_id, sample["game_id"]), True)
 
     for binary_file in tqdm(selected_replay_files, desc="Adding replay chunks"):
-        for sample in read_binary_shard(
-            binary_file,
-            q_value_ratio=q_value_ratio,
-            input_channels=input_channels,
-        ):
-            buffers["train"].append(sample)
-            counts["train"] += 1
-            if len(buffers["train"]) >= samples_per_shard:
-                flush("train")
+        run_id = _selfplay_run_id(binary_file)
+        for sample in read_binary_shard(binary_file, **read_kw):
+            add("train", sample, (run_id, sample["game_id"]), False)
 
     flush("train")
     flush("val")
+
+    shared = val_hashes & train_hashes
+    dropped = 0
+    if dedupe_validation and shared:
+        shared_list = list(shared)
+        for shard in sorted(validation_path.glob("*.parquet")):
+            frame = pl.read_parquet(shard)
+            kept = frame.filter(~pl.col("plane_hash").is_in(shared_list))
+            dropped += frame.height - kept.height
+            if kept.height:
+                temporary = shard.with_suffix(".parquet.tmp")
+                kept.write_parquet(temporary, compression="zstd")
+                temporary.replace(shard)
+            else:
+                shard.unlink()
+        counts["val"] -= dropped
+
     if counts["train"] == 0 or counts["val"] == 0:
         raise ValueError(
             "The game-level split produced an empty train or validation set; "
             "adjust validation_fraction or generate more games"
         )
 
+    report = {
+        "train_samples": counts["train"],
+        "val_samples": counts["val"],
+        "split_by": effective_split,
+        "q_value_ratio": q_value_ratio,
+        "weight_nodes_ref": weight_nodes_ref,
+        "replay_dirs": [str(d) for d in replay_dirs],
+        "replay_chunks": len(selected_replay_files),
+        "val_planes_also_in_train": len(shared),
+        "val_samples_dropped_as_duplicates": dropped,
+        **stats.report(),
+    }
+    (output_path / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(
         f"Prepared RL data: {counts['train']} train samples, "
         f"{counts['val']} validation samples"
     )
+    print(
+        f"  split by {effective_split}; q_value_ratio {q_value_ratio}; "
+        f"mean sample weight {report['mean_sample_weight']:.3f}; train cross-game "
+        f"duplicate rate {report['train_cross_game_duplicate_rate']:.4f}; "
+        f"{dropped} validation samples dropped as train duplicates"
+    )
+    for reason, entry in report["samples_by_reason"].items():
+        print(
+            f"  {reason}: {entry['samples']} samples, {entry['games']} games, "
+            f"mean |root_q - outcome| {entry['mean_abs_root_q_minus_outcome']:.3f}"
+        )
     return train_path, validation_path, counts["train"], counts["val"]
 
 
@@ -474,7 +768,7 @@ def convert_to_parquet(
     input_dir: str,
     output_dir: str,
     samples_per_shard: int = 65536,
-    q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    q_value_ratio: float | None = None,
     input_channels: int | None = None,
 ):
     """Convert all binary shards in input_dir to parquet in output_dir.
@@ -565,8 +859,9 @@ def main():
     parser.add_argument(
         '--q-value-ratio',
         type=float,
-        default=DEFAULT_Q_VALUE_RATIO,
-        help=f'Ratio of root Q-value to mix with game outcome (default: {DEFAULT_Q_VALUE_RATIO})'
+        default=None,
+        help=(f'Ratio of root Q-value to mix with game outcome (default: '
+              f'{DEFAULT_CLOCK_Q_VALUE_RATIO} for clock-build data, {DEFAULT_Q_VALUE_RATIO} for stock)')
     )
     parser.add_argument(
         '--input-channels',
