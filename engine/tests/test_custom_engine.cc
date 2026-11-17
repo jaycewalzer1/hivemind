@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <filesystem>
+#include <iomanip>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -26,6 +28,16 @@ public:
     static int tree_move_ms(UCI& uci) { return uci.treeMoveMs; }
     static SearchParams::RuntimeConfig config(UCI& uci) {
         return uci.current_search_config();
+    }
+    static std::string emit_think_gain(UCI& uci) {
+        std::ostringstream output;
+        std::streambuf* previous = std::cout.rdbuf(output.rdbuf());
+        uci.emit_think_gain();
+        std::cout.rdbuf(previous);
+        return output.str();
+    }
+    static Engine* engine(UCI& uci) {
+        return uci.engines.empty() ? nullptr : uci.engines.front().get();
     }
 };
 
@@ -584,5 +596,394 @@ TEST_F(CustomEngineTest, SamplePoliciesFollowRootVisits) {
         EXPECT_EQ(entry.indexB, training::PASS_POLICY_INDEX);
     }
 }
+
+// ================================================================ spec v2
+
+// ------------------------------------------- A: elapsed planes and UCI
+
+TEST_F(CustomEngineTest, ClockBuildHas43ChannelsPerBoard) {
+    if constexpr (HAS_CLOCK_PLANES) {
+        EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 43);
+        EXPECT_EQ(NB_INPUT_CHANNELS, 86);
+        EXPECT_TRUE(HAS_ELAPSED_PLANES);
+    } else {
+        EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 37);
+        EXPECT_FALSE(HAS_ELAPSED_PLANES);
+    }
+}
+
+TEST_F(CustomEngineTest, PositionParsesElapsedAfterClocks) {
+    UCI uci;
+    Board& board = UCIClockTestPeer::board(uci);
+    uci_command(uci, "position startpos clocks 1000 2000 3000 4000 elapsed 1500 250.4");
+    ASSERT_TRUE(board.has_clocks());
+    ASSERT_TRUE(board.has_elapsed());
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 1500);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 250);
+    EXPECT_EQ(board.clock_ms(BOARD_B, Stockfish::BLACK), 4000);
+
+    // After a move list, and from a FEN.
+    const std::string fen =
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 | "
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    uci_command(uci, "position fen " + fen + " moves 1e2e4 2d2d4 clocks 1 2 3 4 elapsed 7 8");
+    EXPECT_EQ(board.side_to_move(BOARD_A), Stockfish::BLACK);
+    EXPECT_EQ(board.side_to_move(BOARD_B), Stockfish::BLACK);
+    ASSERT_TRUE(board.has_elapsed());
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 7);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 8);
+
+    // Clocks without elapsed: no elapsed.
+    uci_command(uci, "position startpos clocks 1 2 3 4");
+    EXPECT_TRUE(board.has_clocks());
+    EXPECT_FALSE(board.has_elapsed());
+    // Elapsed without clocks is ignored.
+    uci_command(uci, "position startpos elapsed 10 20");
+    EXPECT_FALSE(board.has_clocks());
+    EXPECT_FALSE(board.has_elapsed());
+    // Malformed elapsed is ignored; the clocks stay.
+    uci_command(uci, "position startpos clocks 1 2 3 4 elapsed 10 x");
+    EXPECT_TRUE(board.has_clocks());
+    EXPECT_FALSE(board.has_elapsed());
+    // Negative elapsed is clamped to 0.
+    uci_command(uci, "position startpos clocks 1 2 3 4 elapsed -5 6");
+    ASSERT_TRUE(board.has_elapsed());
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 0);
+    // A later position without the suffix drops it.
+    uci_command(uci, "position startpos");
+    EXPECT_FALSE(board.has_elapsed());
+}
+
+TEST_F(CustomEngineTest, ElapsedPlanesFollowSpec) {
+    Board board;
+    board.push_move(BOARD_B, Stockfish::make_move(Stockfish::SQ_E2, Stockfish::SQ_E4));
+    board.set_clocks(150000, 600000, 5000, 1000);
+    std::vector<float> withoutElapsed(NB_INPUT_VALUES());
+    board_to_planes(board, withoutElapsed.data(), Stockfish::WHITE, false);
+    board.set_elapsed(4000, 25000);
+    std::vector<float> planes(NB_INPUT_VALUES());
+    board_to_planes(board, planes.data(), Stockfish::WHITE, false);
+    if constexpr (!HAS_ELAPSED_PLANES) {
+        // Stock width: elapsed times never reach the planes.
+        EXPECT_EQ(planes, withoutElapsed);
+        GTEST_SKIP() << "elapsed planes exist only in the hivemind-clock build";
+    }
+    // Every other channel is as without elapsed times.
+    for (int boardBlock = 0; boardBlock < 2; ++boardBlock) {
+        for (int channel = 0; channel < 41; ++channel) {
+            const int at = boardBlock * NB_INPUT_CHANNELS_PER_BOARD + channel;
+            ASSERT_EQ(plane_at(planes, at, 9), plane_at(withoutElapsed, at, 9)) << at;
+        }
+    }
+    const auto expect_elapsed = [&](const std::vector<float>& p, int boardBlock, double seconds) {
+        const int base = boardBlock * NB_INPUT_CHANNELS_PER_BOARD;
+        for (int square = 0; square < 64; ++square) {
+            ASSERT_FLOAT_EQ(plane_at(p, base + 41, square),
+                            static_cast<float>(std::min(seconds / 10.0, 1.0)));
+            ASSERT_FLOAT_EQ(plane_at(p, base + 42, square),
+                            static_cast<float>(1.0 - std::exp(-seconds / 2.0)));
+        }
+    };
+    expect_elapsed(planes, 0, 4.0);
+    expect_elapsed(planes, 1, 25.0);
+    // The same for either team: it is the on-turn side's thinking time.
+    board_to_planes(board, planes.data(), Stockfish::BLACK, true);
+    expect_elapsed(planes, 0, 4.0);
+    expect_elapsed(planes, 1, 25.0);
+    // No timing given: both planes 0.
+    for (int boardBlock = 0; boardBlock < 2; ++boardBlock) {
+        EXPECT_EQ(plane_at(withoutElapsed, boardBlock * NB_INPUT_CHANNELS_PER_BOARD + 41), 0.0f);
+        EXPECT_EQ(plane_at(withoutElapsed, boardBlock * NB_INPUT_CHANNELS_PER_BOARD + 42), 0.0f);
+    }
+}
+
+TEST_F(CustomEngineTest, TreeElapsedResetsOnMoveGrowsOnPassAndRefunds) {
+    Board board;
+    board.set_clocks(60000, 60000, 60000, 60000);
+    board.set_elapsed(1000, 2000);
+    board.treeMoveMs = 250;
+    const uint64_t rootHash = board.hash_key();
+
+    const Stockfish::Move e4 = Stockfish::make_move(Stockfish::SQ_E2, Stockfish::SQ_E4);
+    board.make_moves(e4, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 0);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 2250);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 250);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 2500);
+    Board copy(board);
+    EXPECT_EQ(copy.elapsed_ms(BOARD_B), 2500);
+    EXPECT_EQ(copy.tree_pass_streak(), 1);
+
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 0);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 2250);
+    board.unmake_moves(e4, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 1000);
+    EXPECT_EQ(board.elapsed_ms(BOARD_B), 2000);
+    EXPECT_EQ(board.tree_pass_streak(), 0);
+    EXPECT_EQ(board.hash_key(), rootHash);
+
+    // Frozen tree clocks: elapsed is frozen too.
+    board.treeMoveMs = 0;
+    board.make_moves(e4, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.elapsed_ms(BOARD_A), 1000);
+    board.unmake_moves(e4, Stockfish::MOVE_NONE);
+
+    // Elapsed is part of the node key only where it reaches the planes.
+    Board other(board);
+    other.set_elapsed(1000, 2001);
+    if constexpr (HAS_ELAPSED_PLANES) {
+        EXPECT_NE(other.hash_key(), board.hash_key());
+    } else {
+        EXPECT_EQ(other.hash_key(), board.hash_key());
+    }
+}
+
+TEST_F(CustomEngineTest, ElapsedNeverChangesTheStockBuildKeyOrPlanes) {
+    if constexpr (HAS_CLOCK_PLANES) {
+        GTEST_SKIP() << "stock-width build only";
+    }
+    Board plain;
+    Board timed(plain);
+    timed.set_clocks(1000, 1000, 1000, 1000);
+    timed.set_elapsed(5000, 9000);
+    Board clocked(plain);
+    clocked.set_clocks(1000, 1000, 1000, 1000);
+    EXPECT_EQ(timed.hash_key(), clocked.hash_key());
+    std::vector<float> a(NB_INPUT_VALUES()), b(NB_INPUT_VALUES());
+    board_to_planes(timed, a.data(), Stockfish::WHITE, false);
+    board_to_planes(plain, b.data(), Stockfish::WHITE, false);
+    EXPECT_EQ(a, b);
+}
+
+// ------------------------------------------------------- D1: sit-offs
+
+TEST_F(CustomEngineTest, SitOffIsTerminalAndDecidedByClocks) {
+    // Start position: on A white (white team) is on turn, on B white (black
+    // team). A full round of passes: the white team passes on A (B forced),
+    // then the black team passes on B (A forced).
+    Board board;
+    board.set_clocks(5000, 60000, 3000, 60000);
+    board.treeMoveMs = 200;
+    const std::array<int, 2> noMoves{0, 0};
+
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.sit_off_losers(), 0);
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::BLACK, Stockfish::WHITE, false, noMoves),
+              TerminalOutcome::NONE);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    if constexpr (!HAS_CLOCK_PLANES) {
+        EXPECT_EQ(board.sit_off_losers(), 0);
+        EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false, noMoves),
+                  TerminalOutcome::NONE);
+        GTEST_SKIP() << "sit-offs resolve only in the hivemind-clock build";
+    }
+    // B white (black team, 2600 ms) would flag before A white (4600 ms).
+    EXPECT_EQ(board.sit_off_losers(), 1 << Stockfish::BLACK);
+    int endInPly = -1;
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false, noMoves,
+                                         &endInPly),
+              TerminalOutcome::WIN);
+    EXPECT_EQ(endInPly, 1);
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::BLACK, Stockfish::WHITE, false, noMoves),
+              TerminalOutcome::LOSS);
+    // The pass streak is part of the node key and is restored on unmake.
+    const uint64_t sitOffKey = board.hash_key();
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.tree_pass_streak(), 1);
+    EXPECT_EQ(board.sit_off_losers(), 0);
+    EXPECT_NE(board.hash_key(), sitOffKey);
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.tree_pass_streak(), 0);
+
+    // A move in between resets the round.
+    const Stockfish::Move e4 = Stockfish::make_move(Stockfish::SQ_E2, Stockfish::SQ_E4);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    board.make_moves(Stockfish::MOVE_NONE, e4);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.sit_off_losers(), 0);
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    board.unmake_moves(Stockfish::MOVE_NONE, e4);
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+
+    // Equal clocks on seats of different teams: a draw.
+    Board even;
+    even.set_clocks(4000, 60000, 4000, 60000);
+    even.treeMoveMs = 200;
+    even.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    even.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(classify_terminal_position(even, Stockfish::WHITE, Stockfish::WHITE, false, noMoves),
+              TerminalOutcome::DRAW);
+
+    // Without TreeMoveMs nothing is a sit-off.
+    Board frozen;
+    frozen.set_clocks(4000, 60000, 3000, 60000);
+    frozen.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    frozen.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(frozen.sit_off_losers(), 0);
+}
+
+TEST_F(CustomEngineTest, SitOffWithBothSeatsInCheckOfOneTeam) {
+    if constexpr (!HAS_CLOCK_PLANES) {
+        GTEST_SKIP() << "sit-offs resolve only in the hivemind-clock build";
+    }
+    // The v1 games: a team sat in check on its boards until it flagged. On A
+    // Black (black team) is in a blockable back-rank check, on B White (also
+    // the black team) is on turn. Under FreePass neither is mate; after a
+    // full round of passes the black team loses on time, whatever the
+    // comparison of its two clocks.
+    g_freePass = true;
+    Board board;
+    board.set_fen(BOARD_A, "R5k1/5ppp/8/8/8/8/8/6K1[] b - - 0 1");
+    board.set_fen(BOARD_B, kStart);
+    board.set_clocks(60000, 900, 900, 60000);
+    board.treeMoveMs = 100;
+    const std::array<int, 2> noMoves{0, 0};
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::BLACK, Stockfish::BLACK, false, noMoves),
+              TerminalOutcome::NONE);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.flagged_teams(), 0);
+    EXPECT_EQ(board.sit_off_losers(), 1 << Stockfish::BLACK);
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::BLACK, Stockfish::BLACK, false, noMoves),
+              TerminalOutcome::LOSS);
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::BLACK, false, noMoves),
+              TerminalOutcome::WIN);
+}
+
+// ------------------------------------- D4: waiting-board mate under FreePass
+
+TEST_F(CustomEngineTest, WaitingBoardMateCountsThePassUnderFreePass) {
+    // White team to play. On A white is on turn with no legal move (stuck,
+    // not in check: never a loss under FreePass). On B the black team (White
+    // on B) mates our Black king next move with Qh7-b7 (or a7), contact and
+    // protected by the king.
+    // The only reply left on A is the pass, and the mate survives it.
+    Board board;
+    board.set_fen(BOARD_A, "7k/8/8/8/8/8/5q2/7K[] w - - 0 1");
+    board.set_fen(BOARD_B, "k7/7Q/1K6/8/8/8/8/8[] w - - 0 1");
+    const std::array<int, 2> searched{1, 0};
+
+    g_freePass = true;
+    EXPECT_FALSE(board.is_checkmate(Stockfish::WHITE, false));
+    int endInPly = -1;
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false, searched,
+                                         &endInPly),
+              TerminalOutcome::LOSS);
+    EXPECT_EQ(endInPly, 3);
+    // Before the fix the pass was a reply only with TimeAdvantage, so this
+    // position (no legal move on A, no TimeAdvantage) found no reply and
+    // missed the mate. With TimeAdvantage it was, and still is, found.
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, true, searched),
+              TerminalOutcome::LOSS);
+}
+
+// --------------------------------------- B, C: think_gain and arrivals heads
+
+#if !defined(HIVEMIND_BACKEND_TENSORRT)
+std::string fixture(const std::string& name) {
+    return (std::filesystem::path(HIVEMIND_TEST_DATA_DIR) / name).string();
+}
+
+// The fixtures' logits are channel means (in the stock build channel 40 is a
+// piece plane, not a constant one).
+float channel_mean(const std::vector<float>& planes, int channel) {
+    double total = 0.0;
+    for (int square = 0; square < 64; ++square) {
+        total += plane_at(planes, channel, square);
+    }
+    return static_cast<float>(total / 64.0);
+}
+
+TEST_F(CustomEngineTest, NetworkWithoutThinkGainHasNone) {
+    Engine engine(0, 4);
+    ASSERT_TRUE(engine.loadNetwork(fixture("plain_" + std::to_string(NB_INPUT_CHANNELS) + ".onnx"), ""));
+    EXPECT_FALSE(engine.hasThinkGain());
+    std::vector<float> planes(NB_INPUT_VALUES(), 0.0f);
+    float logits[2] = {9.0f, 9.0f};
+    EXPECT_FALSE(engine.evaluateThinkGain(planes.data(), logits));
+
+    UCI uci;
+    ASSERT_TRUE(uci.initializeEngines({0}, fixture("plain_" + std::to_string(NB_INPUT_CHANNELS) + ".onnx"), 4));
+    EXPECT_FALSE(UCIClockTestPeer::engine(uci)->hasThinkGain());
+}
+
+TEST_F(CustomEngineTest, ThinkGainIsReadAndArrivalsIgnored) {
+    Engine engine(0, 4);
+    ASSERT_TRUE(engine.loadNetwork(fixture("think_gain_" + std::to_string(NB_INPUT_CHANNELS) + ".onnx"), ""));
+    ASSERT_TRUE(engine.hasThinkGain());
+
+    Board board;
+    board.set_clocks(150000, 600000, 5000, 1000);
+    board.set_elapsed(4000, 25000);
+    std::vector<float> planes(NB_INPUT_VALUES());
+    board_to_planes(board, planes.data(), Stockfish::WHITE, false);
+    const float expectedA = channel_mean(planes, 40);
+    const float expectedB = channel_mean(planes, NB_INPUT_CHANNELS - 1);
+    float logits[2] = {0.0f, 0.0f};
+    ASSERT_TRUE(engine.evaluateThinkGain(planes.data(), logits));
+    EXPECT_NEAR(logits[0], expectedA, 1e-6);
+    EXPECT_NEAR(logits[1], expectedB, 1e-6);
+
+    // The batch path carries it too; the search heads are unaffected.
+    std::vector<__half> batch(4 * NB_INPUT_VALUES());
+    for (int row = 0; row < 4; ++row) {
+        std::transform(planes.begin(), planes.end(), batch.begin() + row * NB_INPUT_VALUES(),
+                       __float2half_rn);
+    }
+    Engine::HalfInferenceOutputs outputs;
+    ASSERT_TRUE(engine.runInferenceHalf(batch.data(), outputs));
+    ASSERT_NE(outputs.thinkGain, nullptr);
+    ASSERT_NE(outputs.value, nullptr);
+    ASSERT_NE(outputs.wdl, nullptr);
+    ASSERT_NE(outputs.movesLeft, nullptr);
+    EXPECT_NEAR(__half2float(outputs.thinkGain[3 * 2 + 1]), expectedB, 1e-3);
+    EXPECT_EQ(__half2float(outputs.value[0]), 0.0f);
+
+    // UCI prints the sigmoid of each logit.
+    UCI uci;
+    ASSERT_TRUE(uci.initializeEngines({0}, fixture("think_gain_" + std::to_string(NB_INPUT_CHANNELS) + ".onnx"), 4));
+    uci_command(uci, "position startpos clocks 150000 600000 5000 1000 elapsed 4000 25000");
+    const std::string line = UCIClockTestPeer::emit_think_gain(uci);
+    std::ostringstream expected;
+    expected << std::fixed << std::setprecision(4) << "info string think_gain "
+             << 1.0 / (1.0 + std::exp(-static_cast<double>(expectedA))) << " "
+             << 1.0 / (1.0 + std::exp(-static_cast<double>(expectedB))) << "\n";
+    EXPECT_EQ(line, expected.str());
+}
+
+TEST_F(CustomEngineTest, V1ClockNetworkStillLoadsInTheClockBuild) {
+    Engine engine(0, 4);
+    const bool loaded = engine.loadNetwork(fixture("think_gain_82.onnx"), "");
+    if constexpr (!HAS_ELAPSED_PLANES) {
+        EXPECT_FALSE(loaded);
+        GTEST_SKIP() << "the stock build only loads 74-channel networks";
+    }
+    ASSERT_TRUE(loaded);
+    Board board;
+    board.set_clocks(150000, 600000, 5000, 1000);
+    board.set_elapsed(4000, 25000);
+    std::vector<float> planes(NB_INPUT_VALUES());
+    board_to_planes(board, planes.data(), Stockfish::WHITE, false);
+    // The v1 network's last channel is board B's channel 40 (a clock plane).
+    const float expectedB = plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 40);
+    ASSERT_NE(expectedB, plane_at(planes, NB_INPUT_CHANNELS - 1));
+    float logits[2] = {0.0f, 0.0f};
+    ASSERT_TRUE(engine.evaluateThinkGain(planes.data(), logits));
+    EXPECT_NEAR(logits[0], channel_mean(planes, 40), 1e-6);
+    EXPECT_NEAR(logits[1], expectedB, 1e-6);
+
+    std::vector<__half> batch(4 * NB_INPUT_VALUES());
+    for (int row = 0; row < 4; ++row) {
+        std::transform(planes.begin(), planes.end(), batch.begin() + row * NB_INPUT_VALUES(),
+                       __float2half_rn);
+    }
+    Engine::HalfInferenceOutputs outputs;
+    ASSERT_TRUE(engine.runInferenceHalf(batch.data(), outputs));
+    ASSERT_NE(outputs.thinkGain, nullptr);
+    EXPECT_NEAR(__half2float(outputs.thinkGain[2 * 2 + 1]), expectedB, 1e-3);
+}
+#endif
 
 }  // namespace

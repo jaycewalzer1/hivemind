@@ -26,6 +26,9 @@ add_executable(
   test_custom_engine.cc
 )
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
+# Tiny ONNX fixtures (tests/data/make_think_gain_fixtures.py).
+target_compile_definitions(hivemind_tests PRIVATE
+  HIVEMIND_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 include(GoogleTest)
 gtest_discover_tests(hivemind_tests)
