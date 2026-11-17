@@ -30,7 +30,62 @@ from hivemind.architectures.builder_util import get_act, _ValueHead, _PolicyHead
     _Stem, process_value_policy_head, _BottlekneckResidualBlock, ClassicalResidualBlock, round_to_next_multiple_of_32
 from hivemind.architectures.next_vit_official_modules import NCB
 from hivemind.architectures.next_vit_official_modules import NTB
-from hivemind.constants import board_channels_from_total
+from hivemind.constants import (
+    NUM_ARRIVAL_OUTPUTS,
+    NUM_THINK_GAIN_OUTPUTS,
+    board_channels_from_total,
+)
+
+DEFAULT_AUX_HEAD_HIDDEN = 64
+
+
+class _PooledAuxHead(Module):
+    """Small auxiliary head (custom engine spec v2, sections B and C).
+
+    Global average pool of each given feature map, concatenated, one hidden
+    layer, then a linear output. The output layer starts at exactly 0 (weight
+    and bias), so adding the head changes nothing else and outputs 0 at first.
+    """
+
+    def __init__(self, in_features, outputs, hidden=DEFAULT_AUX_HEAD_HIDDEN):
+        super().__init__()
+        self.body = Sequential(
+            nn.Linear(in_features, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, outputs),
+        )
+        nn.init.zeros_(self.body[2].weight)
+        nn.init.zeros_(self.body[2].bias)
+
+    def forward(self, feature_maps):
+        pooled = torch.cat(
+            [feature_map.mean(dim=(2, 3)) for feature_map in feature_maps], dim=1
+        )
+        return self.body(pooled)
+
+
+def _build_aux_heads(module, in_features, enabled, hidden):
+    """Attach think_gain (2 logits) and arrivals (20 counts) heads, or None."""
+    module.aux_heads = bool(enabled)
+    if enabled:
+        module.think_gain_head = _PooledAuxHead(
+            in_features, NUM_THINK_GAIN_OUTPUTS, hidden
+        )
+        module.arrivals_head = _PooledAuxHead(
+            in_features, NUM_ARRIVAL_OUTPUTS, hidden
+        )
+    else:
+        module.think_gain_head = None
+        module.arrivals_head = None
+
+
+def _aux_outputs(module, feature_maps):
+    if not getattr(module, "aux_heads", False):
+        return ()
+    return (
+        module.think_gain_head(feature_maps),
+        module.arrivals_head(feature_maps),
+    )
 
 
 class _SharedPolicyHeads(Module):
@@ -137,6 +192,8 @@ class RiseV3(Module):
                  kernel_5_channel_ratio=None, round_channels_to_next_32=False,
                  shared_policy_trunk=False,
                  joint_policy_rank=0,
+                 aux_heads=False,
+                 aux_head_hidden=DEFAULT_AUX_HEAD_HIDDEN,
                  ):
         """
         RISEv3 architecture
@@ -237,6 +294,8 @@ class RiseV3(Module):
             if joint_policy_rank > 0
             else None
         )
+        # Registered last so existing parameters keep their positions.
+        _build_aux_heads(self, channels, aux_heads, aux_head_hidden)
 
     def forward(self, x):
         """
@@ -267,13 +326,13 @@ class RiseV3(Module):
                     self.joint_policy_heads[0](out),
                     self.joint_policy_heads[1](out),
                 )
-            return outputs
+            return outputs + _aux_outputs(self, (out,))
 
         return process_value_policy_head(
             out, self.value_head, self.policy_heads,
             self.use_plys_to_end, self.use_wdl,
             joint_policy_heads=self.joint_policy_heads,
-        )
+        ) + _aux_outputs(self, (out,))
 
     def merge_bn(self):
         """
@@ -330,6 +389,8 @@ class CrossBoardRiseV3(RiseV3):
     def __init__(self, *args, attention_dim=192, attention_heads=6,
                  attention_layers=2, **kwargs):
         joint_policy_rank = kwargs.pop("joint_policy_rank", 0)
+        aux_heads = kwargs.pop("aux_heads", False)
+        aux_head_hidden = kwargs.pop("aux_head_hidden", DEFAULT_AUX_HEAD_HIDDEN)
         if kwargs.get("shared_policy_trunk", False):
             raise ValueError(
                 "CrossBoardRiseV3 uses separate post-attention policy heads"
@@ -340,8 +401,8 @@ class CrossBoardRiseV3(RiseV3):
             board_channels = board_channels_from_total(self.nb_input_channels)
         except ValueError:
             raise ValueError(
-                "CrossBoardRiseV3 requires two 37-plane (or 41-plane with "
-                "clocks) bughouse boards"
+                "CrossBoardRiseV3 requires two 37-plane (41 with clocks, 43 "
+                "with clocks and elapsed time) bughouse boards"
             ) from None
         self.board_channels = board_channels
         if attention_layers not in (1, 2):
@@ -410,6 +471,9 @@ class CrossBoardRiseV3(RiseV3):
         nn.init.trunc_normal_(self.position_embedding, std=0.02)
         nn.init.trunc_normal_(self.board_embedding, std=0.02)
         nn.init.trunc_normal_(self.context_role_embedding, std=0.02)
+        # Pooled post-attention board maps of both boards feed the aux heads.
+        # Built last: same parameter order and random init for everything else.
+        _build_aux_heads(self, 2 * attention_dim, aux_heads, aux_head_hidden)
 
     def _context_tokens(self, x):
         offset = self.board_channels
@@ -471,7 +535,7 @@ class CrossBoardRiseV3(RiseV3):
             self.use_wdl,
             policy_inputs=(board_a_map, board_b_map),
             joint_policy_heads=self.joint_policy_heads,
-        )
+        ) + _aux_outputs(self, (board_a_map, board_b_map))
 
 
 class _AttentionResidual(Module):
@@ -624,14 +688,16 @@ class DualStreamMemoryRiseV3(Module):
         memory_tokens=8,
         stage_sizes=(5, 5, 5),
         joint_policy_rank=0,
+        aux_heads=False,
+        aux_head_hidden=DEFAULT_AUX_HEAD_HIDDEN,
     ):
         super().__init__()
         try:
             board_channels = board_channels_from_total(nb_input_channels)
         except ValueError:
             raise ValueError(
-                "DualStreamMemoryRiseV3 requires two 37-plane (or 41-plane "
-                "with clocks) bughouse boards"
+                "DualStreamMemoryRiseV3 requires two 37-plane (41 with clocks, "
+                "43 with clocks and elapsed time) bughouse boards"
             ) from None
         self.board_channels = board_channels
         if board_height * board_width != 64:
@@ -783,6 +849,7 @@ class DualStreamMemoryRiseV3(Module):
         nn.init.trunc_normal_(self.board_embedding, std=0.02)
         nn.init.trunc_normal_(self.initial_memory, std=0.02)
         nn.init.trunc_normal_(self.context_role_embedding, std=0.02)
+        _build_aux_heads(self, 2 * channels, aux_heads, aux_head_hidden)
 
     def _context_tokens(self, x):
         offset = self.board_channels
@@ -886,7 +953,7 @@ class DualStreamMemoryRiseV3(Module):
             self.use_wdl,
             policy_inputs=(board_a_map, board_b_map),
             joint_policy_heads=self.joint_policy_heads,
-        )
+        ) + _aux_outputs(self, (board_a_map, board_b_map))
 
     def merge_bn(self):
         for stage in self.shared_stages:
@@ -923,6 +990,8 @@ def _rise_v33_options(args):
         use_plys_to_end=args.use_plys_to_end,
         use_mlp_wdl_ply=args.use_mlp_wdl_ply,
         joint_policy_rank=getattr(args, "joint_policy_rank", 0),
+        aux_heads=getattr(args, "aux_heads", False),
+        aux_head_hidden=getattr(args, "aux_head_hidden", DEFAULT_AUX_HEAD_HIDDEN),
     )
 
 

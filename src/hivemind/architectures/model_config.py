@@ -8,6 +8,7 @@ from hivemind.constants import (
     channels_per_board,
 )
 from hivemind.architectures.rise_mobile_v3 import (
+    DEFAULT_AUX_HEAD_HIDDEN,
     get_cross_board_rise_v33_model,
     get_dual_stream_memory_rise_v33_model,
     get_rise_v33_model,
@@ -40,11 +41,16 @@ class ModelArgs:
     attention_heads: int = 6
     attention_layers: int = 2
     memory_tokens: int = 8
+    # Spec v2: think_gain (2 logits) and arrivals (20 counts) heads.
+    aux_heads: bool = False
+    aux_head_hidden: int = DEFAULT_AUX_HEAD_HIDDEN
 
 
-def input_shape_for(clock_planes: bool = False) -> tuple[int, int, int]:
-    """Network input shape: (74, 8, 8) by default, (82, 8, 8) with clock planes."""
-    return (2 * channels_per_board(clock_planes), 8, 8)
+def input_shape_for(clock_planes: bool = False,
+                    elapsed_planes: bool = False) -> tuple[int, int, int]:
+    """Network input shape: (74, 8, 8) by default, (82, 8, 8) with clock planes,
+    (86, 8, 8) with clock and elapsed-time planes (spec v2)."""
+    return (2 * channels_per_board(clock_planes, elapsed_planes), 8, 8)
 
 
 def has_clock_planes(args) -> bool:
@@ -52,9 +58,18 @@ def has_clock_planes(args) -> bool:
 
 
 def get_model_args(train_config=None, architecture="risev33",
-                   clock_planes: bool = False) -> ModelArgs:
+                   clock_planes: bool = False, elapsed_planes: bool = False,
+                   input_channels: int | None = None,
+                   aux_heads: bool = False) -> ModelArgs:
+    """Model options. input_channels (74, 82 or 86), when given, overrides
+    clock_planes / elapsed_planes."""
     args = ModelArgs(model_type=architecture)
-    args.input_shape = input_shape_for(clock_planes)
+    if input_channels is not None:
+        board_channels_from_total(input_channels)
+        args.input_shape = (int(input_channels), 8, 8)
+    else:
+        args.input_shape = input_shape_for(clock_planes, elapsed_planes)
+    args.aux_heads = bool(aux_heads)
     if train_config is not None:
         args.use_wdl = bool(train_config.use_wdl)
         args.use_plys_to_end = bool(train_config.use_plys_to_end)
@@ -107,4 +122,8 @@ def model_args_from_state_dict(state_dict) -> ModelArgs:
     joint_weight = state_dict.get("joint_policy_heads.0.pass_factors.weight")
     if joint_weight is not None:
         args.joint_policy_rank = joint_weight.shape[0]
+    aux_weight = state_dict.get("think_gain_head.body.0.weight")
+    if aux_weight is not None:
+        args.aux_heads = True
+        args.aux_head_hidden = int(aux_weight.shape[0])
     return args
