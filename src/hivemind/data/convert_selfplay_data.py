@@ -14,12 +14,18 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from hivemind.constants import NUM_BUGHOUSE_CHANNELS, NUM_MOVE_CHANNELS
+from hivemind.constants import (
+    NUM_BUGHOUSE_CHANNELS,
+    NUM_CLOCK_BUGHOUSE_CHANNELS,
+    NUM_MOVE_CHANNELS,
+)
 
 # Constants matching C++ code
 NB_INPUT_CHANNELS = NUM_BUGHOUSE_CHANNELS
 BOARD_SIZE = 8
 NB_INPUT_VALUES = NB_INPUT_CHANNELS * BOARD_SIZE * BOARD_SIZE
+# Plane widths a chunk header may declare: 74 (stock) or 82 (clock planes).
+SUPPORTED_INPUT_CHANNELS = (NB_INPUT_CHANNELS, NUM_CLOCK_BUGHOUSE_CHANNELS)
 NB_POLICY_VALUES = NUM_MOVE_CHANNELS * BOARD_SIZE * BOARD_SIZE
 HEADER = struct.Struct('<4sIHHQ')
 SAMPLE_METADATA_V3 = struct.Struct('<QIHHBBbB')
@@ -109,11 +115,23 @@ def empty_joint_policy() -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     )
 
 
+def read_shard_channels(filepath: str | Path) -> int:
+    """Input channels declared in a chunk header (74 stock, 82 with clocks)."""
+    with open(filepath, 'rb') as f:
+        _, _, channels, _, _ = HEADER.unpack(read_exact(f, HEADER.size))
+    return int(channels)
+
+
 def read_binary_shard(
     filepath: str | Path,
     q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    input_channels: int | None = None,
 ) -> list[dict]:
-    """Read one HVM3, HVM4, or HVM5 chunk and return its samples."""
+    """Read one HVM3, HVM4, or HVM5 chunk and return its samples.
+
+    The plane width comes from the chunk header and may be 74 or 82 channels.
+    input_channels, when given, makes any other width an error.
+    """
     samples = []
     
     with open(filepath, 'rb') as f:
@@ -124,10 +142,18 @@ def read_binary_shard(
             raise ValueError(
                 f"Unsupported self-play chunk {filepath}: {magic!r} v{version}"
             )
-        if channels != NB_INPUT_CHANNELS:
-            raise ValueError(
-                f"Expected {NB_INPUT_CHANNELS} channels, found {channels}"
+        if channels not in SUPPORTED_INPUT_CHANNELS or (
+            input_channels is not None and channels != input_channels
+        ):
+            expected = (
+                input_channels
+                if input_channels is not None
+                else " or ".join(map(str, SUPPORTED_INPUT_CHANNELS))
             )
+            raise ValueError(
+                f"Expected {expected} channels, found {channels}"
+            )
+        input_values = channels * BOARD_SIZE * BOARD_SIZE
         if policy_values != NB_POLICY_VALUES:
             raise ValueError(
                 f"Expected {NB_POLICY_VALUES} policy values, found {policy_values}"
@@ -161,7 +187,7 @@ def read_binary_shard(
                 ) = sample_struct.unpack(read_exact(f, sample_struct.size))
                 root_q = float(outcome)
 
-            planes = read_exact(f, NB_INPUT_VALUES)
+            planes = read_exact(f, input_values)
             policy_a = read_sparse_policy(f)
             policy_b = read_sparse_policy(f)
             joint_a, joint_b, joint_probability, joint_count = (
@@ -259,8 +285,13 @@ def convert_to_split_parquet(
     replay_files: int = DEFAULT_REPLAY_FILES,
     replay_selection_fraction: float = DEFAULT_REPLAY_SELECTION_FRACTION,
     q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    input_channels: int | None = None,
 ) -> tuple[Path, Path, int, int]:
-    """Convert HVM chunks directly into game-disjoint train/validation shards."""
+    """Convert HVM chunks directly into game-disjoint train/validation shards.
+
+    All chunks (replay included) must share one plane width; by default it is
+    taken from the first chunk, so 74- and 82-channel data are never mixed.
+    """
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction must be between 0 and 1")
     if samples_per_shard <= 0:
@@ -280,6 +311,9 @@ def convert_to_split_parquet(
         if replay_input_dir is not None
         else []
     )
+
+    if input_channels is None:
+        input_channels = read_shard_channels(binary_files[0])
 
     output_path = Path(output_dir)
     if selected_replay_files:
@@ -314,7 +348,11 @@ def convert_to_split_parquet(
 
     for binary_file in tqdm(binary_files, desc="Converting HVM chunks"):
         run_id = _selfplay_run_id(binary_file)
-        for sample in read_binary_shard(binary_file, q_value_ratio=q_value_ratio):
+        for sample in read_binary_shard(
+            binary_file,
+            q_value_ratio=q_value_ratio,
+            input_channels=input_channels,
+        ):
             split = "val" if is_validation_game(
                 run_id,
                 sample["game_id"],
@@ -327,7 +365,11 @@ def convert_to_split_parquet(
                 flush(split)
 
     for binary_file in tqdm(selected_replay_files, desc="Adding replay chunks"):
-        for sample in read_binary_shard(binary_file, q_value_ratio=q_value_ratio):
+        for sample in read_binary_shard(
+            binary_file,
+            q_value_ratio=q_value_ratio,
+            input_channels=input_channels,
+        ):
             buffers["train"].append(sample)
             counts["train"] += 1
             if len(buffers["train"]) >= samples_per_shard:
@@ -353,6 +395,7 @@ def convert_to_parquet(
     output_dir: str,
     samples_per_shard: int = 65536,
     q_value_ratio: float = DEFAULT_Q_VALUE_RATIO,
+    input_channels: int | None = None,
 ):
     """Convert all binary shards in input_dir to parquet in output_dir.
     
@@ -368,6 +411,8 @@ def convert_to_parquet(
         raise FileNotFoundError(f"No HVM chunks found in {input_dir}")
     
     print(f"Found {len(bin_files)} binary shard files")
+    if input_channels is None:
+        input_channels = read_shard_channels(bin_files[0])
     
     # Process files in streaming fashion to avoid OOM
     current_shard_samples = []
@@ -390,7 +435,11 @@ def convert_to_parquet(
     
     for bin_file in tqdm(bin_files, desc="Converting files"):
         try:
-            samples = read_binary_shard(str(bin_file), q_value_ratio=q_value_ratio)
+            samples = read_binary_shard(
+                str(bin_file),
+                q_value_ratio=q_value_ratio,
+                input_channels=input_channels,
+            )
             
             for sample in samples:
                 current_shard_samples.append(sample)
@@ -440,6 +489,13 @@ def main():
         help=f'Ratio of root Q-value to mix with game outcome (default: {DEFAULT_Q_VALUE_RATIO})'
     )
     parser.add_argument(
+        '--input-channels',
+        type=int,
+        choices=SUPPORTED_INPUT_CHANNELS,
+        default=None,
+        help='Plane channels every chunk must have (default: taken from the first chunk)'
+    )
+    parser.add_argument(
         '--delete-binary',
         action='store_true',
         help='Delete binary files after successful conversion'
@@ -452,6 +508,7 @@ def main():
         args.output_dir,
         args.samples_per_shard,
         q_value_ratio=args.q_value_ratio,
+        input_channels=args.input_channels,
     )
     
     if args.delete_binary:

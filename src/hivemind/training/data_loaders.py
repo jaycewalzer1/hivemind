@@ -5,7 +5,11 @@ Data loading utilities for parquet files
 import numpy as np
 import polars as pl
 import torch
-from hivemind.constants import NUM_BUGHOUSE_CHANNELS, NUM_BUGHOUSE_CHANNELS_PER_BOARD
+from hivemind.constants import (
+    NUM_BUGHOUSE_CHANNELS,
+    NUM_BUGHOUSE_CHANNELS_PER_BOARD,
+    board_channels_from_total,
+)
 
 
 # Constants matching the Python representation
@@ -17,6 +21,24 @@ NB_POLICY_CHANNELS = 73
 NB_POLICY_VALUES = NB_POLICY_CHANNELS * BOARD_SIZE * BOARD_SIZE  # 4672
 NB_JOINT_POLICY_VALUES = NB_POLICY_VALUES + 1  # dedicated pass action
 MAX_JOINT_POLICY_ENTRIES = 256
+
+
+def infer_input_channels(encoded_planes_column) -> int:
+    """Input channels of a shard's planes: 74 (default) or 82 (clock planes).
+
+    An empty column keeps the default. Every row must have the same width,
+    which _decode_fixed_width_binary_column checks.
+    """
+    if not encoded_planes_column:
+        return NB_INPUT_CHANNELS
+    values = len(encoded_planes_column[0])
+    channels, remainder = divmod(values, BOARD_SIZE * BOARD_SIZE)
+    if remainder:
+        raise ValueError(f"Plane payload of {values} bytes is not whole 8x8 planes")
+    board_channels_from_total(channels)
+    return channels
+
+
 def _decode_plane_bytes(encoded_planes) -> np.ndarray:
     planes = np.frombuffer(encoded_planes, dtype=np.uint8)
     if planes.size != NB_INPUT_VALUES:
@@ -69,10 +91,12 @@ def flip_bughouse_sample(x, policy_a, policy_b):
     # Clone to avoid modifying originals
     flipped_x = x.clone()
     
-    # Swap the board channel blocks (Board A ↔ Board B)
-    offset = NB_BUGHOUSE_BOARD_CHANNELS
-    flipped_x[:offset] = x[offset:NB_INPUT_CHANNELS]
-    flipped_x[offset:NB_INPUT_CHANNELS] = x[:offset]
+    # Swap the board channel blocks (Board A ↔ Board B). Each block is half
+    # the input: 37 channels, or 41 with clock planes.
+    total_channels = x.shape[0]
+    offset = board_channels_from_total(total_channels)
+    flipped_x[:offset] = x[offset:total_channels]
+    flipped_x[offset:total_channels] = x[:offset]
     
     # Swap the policy distributions (NO MIRRORING - just swap)
     # What was Board B becomes Board A -> use policy_b as-is
@@ -97,13 +121,15 @@ def load_parquet_shard(file_path, include_auxiliary=False):
 
     df = pl.read_parquet(file_path, columns=required_columns)
 
+    x_values = df['x'].to_list()
+    input_channels = infer_input_channels(x_values)
     x_array = _decode_fixed_width_binary_column(
-        df['x'].to_list(),
+        x_values,
         dtype=np.uint8,
-        width=NB_INPUT_VALUES,
+        width=input_channels * BOARD_SIZE * BOARD_SIZE,
     )
     x_tensor = torch.from_numpy(x_array.copy()).float().view(
-        -1, NB_INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE
+        -1, input_channels, BOARD_SIZE, BOARD_SIZE
     )
     x_tensor = _normalize_input_planes(x_tensor)
 
@@ -157,13 +183,15 @@ def load_rl_parquet_shard(file_path, include_joint_policy=False):
         columns.extend(joint_columns)
     df = pl.read_parquet(file_path, columns=columns)
 
+    x_values = df['x'].to_list()
+    input_channels = infer_input_channels(x_values)
     x_array = _decode_fixed_width_binary_column(
-        df['x'].to_list(),
+        x_values,
         dtype=np.uint8,
-        width=NB_INPUT_VALUES,
+        width=input_channels * BOARD_SIZE * BOARD_SIZE,
     )
     x_tensor = torch.from_numpy(x_array.copy()).float().view(
-        -1, NB_INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE
+        -1, input_channels, BOARD_SIZE, BOARD_SIZE
     )
     x_tensor = _normalize_input_planes(x_tensor)
     

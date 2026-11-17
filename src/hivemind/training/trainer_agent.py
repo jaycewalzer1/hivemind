@@ -1102,7 +1102,8 @@ def export_model(model, batch_sizes, input_shape, dir=Path('.'), torch_cpu=True,
 
 
 def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path, model_prefix: str,
-                   has_auxiliary_output: bool, dynamic_batch_size: bool, input_version=None) -> None:
+                   has_auxiliary_output: bool, dynamic_batch_size: bool, input_version=None,
+                   fp16: bool = True, onnx_name: str = None) -> Path:
     """
     Exports the model to ONNX format to allow later import in TensorRT.
 
@@ -1115,7 +1116,9 @@ def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path,
     :param dynamic_batch_size: Whether to export model with dynamic batch size
     :param input_version: Can be used to specify the input representation version e.g. "3.0" for chess models.
     If none, the version will be read from the main_config file instead. It is used for labelling the onnx file.
-    :return:
+    :param fp16: Convert the simplified graph to FP16 with FP32 inputs/outputs (default, as before). False keeps FP32.
+    :param onnx_name: Exact file name to write instead of the generated one.
+    :return: Path of the written file
     """
     if has_auxiliary_output:
         input_names = ["data"]
@@ -1144,10 +1147,11 @@ def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path,
     if input_version is None:
         input_version = f"{main_config['version']}.0"
 
-    onnx_name = f"{model_prefix}-v{input_version}"
-    if not dynamic_batch_size:
-        onnx_name += f"-bsize-{batch_size}"
-    onnx_name += ".onnx"
+    if onnx_name is None:
+        onnx_name = f"{model_prefix}-v{input_version}"
+        if not dynamic_batch_size:
+            onnx_name += f"-bsize-{batch_size}"
+        onnx_name += ".onnx"
 
     model_filepath = str(dir / Path(onnx_name))
 
@@ -1173,7 +1177,11 @@ def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path,
     model_simp, check = simplify(model)
     if not check:
         raise Exception("Simplified ONNX model could not be validated")
-    model_fp16 = convert_float_to_float16(model_simp, keep_io_types=True)
+    model_fp16 = (
+        convert_float_to_float16(model_simp, keep_io_types=True)
+        if fp16
+        else model_simp
+    )
     topologically_sort_graph(model_fp16)
     onnx.checker.check_model(model_fp16)
     if has_auxiliary_output:
@@ -1182,6 +1190,7 @@ def export_to_onnx(model, batch_size: int, dummy_input: torch.Tensor, dir: Path,
         del model_fp16.graph.output[:]
         model_fp16.graph.output.extend(outputs)
     onnx.save(model_fp16, model_filepath)
+    return Path(model_filepath)
 
 
 def export_as_script_module(model, batch_size, dummy_input, dir) -> None:

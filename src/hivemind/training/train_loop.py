@@ -8,7 +8,11 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 from hivemind.config.train_config import TrainConfig, TrainObjects, rl_train_config
 from hivemind.config.main_config import main_config
-from hivemind.training.data_loaders import load_parquet_shard, StreamingRLDataset
+from hivemind.training.data_loaders import (
+    load_parquet_shard,
+    StreamingRLDataset,
+    infer_input_channels,
+)
 from hivemind.data.convert_selfplay_data import (
     DEFAULT_Q_VALUE_RATIO,
     DEFAULT_REPLAY_FILES,
@@ -21,11 +25,18 @@ from hivemind.data.convert_selfplay_data import (
 from hivemind.training.schedules import (
     CosineAnnealingSchedule, LinearWarmUp, MomentumSchedule, OneCycleSchedule,
 )
-from hivemind.architectures.model_config import MODEL_FACTORIES, create_model, get_model_args
+from hivemind.architectures.model_config import (
+    MODEL_FACTORIES,
+    create_model,
+    get_model_args,
+)
 from hivemind.training.trainer_agent import TrainerAgentPytorch, save_torch_state,\
     restore_torch_state, export_to_onnx, get_context
 from hivemind.training.train_util import get_metrics
-from hivemind.constants import NUM_BUGHOUSE_CHANNELS
+from hivemind.constants import (
+    NUM_BUGHOUSE_CHANNELS,
+    NUM_CLOCK_BUGHOUSE_CHANNELS,
+)
 
 
 SUPERVISED_WEIGHTS_DIR = TRAINING_OUTPUT_DIR / "weights" / "supervised"
@@ -286,6 +297,23 @@ def train_supervised(
     trainer.train(cur_it=resume_iteration)
 
 
+def rl_parquet_input_channels(parquet_file) -> int:
+    """Input channels of an RL Parquet shard: 74 stock, 82 with clock planes."""
+    first = pl.scan_parquet(parquet_file).select("x").head(1).collect()
+    return infer_input_channels(first["x"].to_list())
+
+
+def checkpoint_input_channels(state_dict) -> int | None:
+    """Input channels the checkpoint's input stem expects, if it has one."""
+    stem_weight = state_dict.get("body_spatial.0.body.0.weight")
+    if stem_weight is not None:
+        return int(stem_weight.shape[1])
+    shared_stem_weight = state_dict.get("shared_stem.body.0.weight")
+    if shared_stem_weight is not None:
+        return 2 * int(shared_stem_weight.shape[1])
+    return None
+
+
 def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
              augment_flip: bool = True, architecture: str = "risev33",
              batch_size: int = None, precision: str = None,
@@ -418,8 +446,19 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
     to.lr_schedule = LinearWarmUp(cosine_schedule, start_lr=tc.min_lr, length=int(tc.total_it * 0.25))
     to.momentum_schedule = MomentumSchedule(to.lr_schedule, tc.min_lr, tc.max_lr, tc.min_momentum, tc.max_momentum)
     
-    # Load model
-    args = get_model_args(tc, architecture)
+    # Load model. The input width follows the data: 74 channels (stock) or
+    # 82 with clock planes; train and validation shards must agree.
+    input_channels = rl_parquet_input_channels(parquet_files[0])
+    val_input_channels = rl_parquet_input_channels(val_parquet_files[0])
+    if val_input_channels != input_channels:
+        raise ValueError(
+            f"Training data has {input_channels} input channels but "
+            f"validation data has {val_input_channels}"
+        )
+    clock_planes = input_channels == NUM_CLOCK_BUGHOUSE_CHANNELS
+    args = get_model_args(tc, architecture, clock_planes=clock_planes)
+    print(f"Input planes: {input_channels} channels"
+          f"{' (clock planes)' if clock_planes else ''}")
     model = create_model(args)
     
     # Optionally load checkpoint
@@ -430,6 +469,15 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
         # Stage on CPU so a CUDA-saved checkpoint cannot create a second,
         # transient GPU copy during deserialization.
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint_channels = checkpoint_input_channels(
+            checkpoint['model_state_dict']
+        )
+        if checkpoint_channels not in (None, input_channels):
+            raise RuntimeError(
+                f"Checkpoint expects {checkpoint_channels} input channels but "
+                f"the RL data has {input_channels}; widen it first "
+                "(tools/make_clock_net.py) or use matching data"
+            )
         incompatible = model.load_state_dict(
             checkpoint['model_state_dict'], strict=False
         )
@@ -491,7 +539,7 @@ def train_rl(rl_data_dir: str, val_data_dir: str, checkpoint_path: str = None,
 
     print(f"Exporting final model to ONNX with prefix: {model_prefix}...")
     ctx = get_context(tc.context, tc.device_id)
-    dummy_input = torch.zeros(1, NUM_BUGHOUSE_CHANNELS, 8, 8).to(ctx)
+    dummy_input = torch.zeros(1, *args.input_shape).to(ctx)
     export_to_onnx(model, 1, dummy_input, weights_dir, model_prefix, True, True)
     print(f"Final RL ONNX exported under {weights_dir} as {model_prefix}.onnx")
 
