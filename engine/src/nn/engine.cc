@@ -320,6 +320,10 @@ Engine::ExecutionState::~ExecutionState() {
     if (deviceMovesLeftBuffer) cudaFree(deviceMovesLeftBuffer);
     if (deviceJointFactorsABuffer) cudaFree(deviceJointFactorsABuffer);
     if (deviceJointFactorsBBuffer) cudaFree(deviceJointFactorsBBuffer);
+    if (deviceThinkGainBuffer) cudaFree(deviceThinkGainBuffer);
+    for (void* buffer : deviceIgnoredBuffers) {
+        if (buffer) cudaFree(buffer);
+    }
     if (hostObsHalf) cudaFreeHost(hostObsHalf);
     if (hostValueHalf) cudaFreeHost(hostValueHalf);
     if (hostPolicyAHalf) cudaFreeHost(hostPolicyAHalf);
@@ -328,6 +332,7 @@ Engine::ExecutionState::~ExecutionState() {
     if (hostMovesLeftHalf) cudaFreeHost(hostMovesLeftHalf);
     if (hostJointFactorsAHalf) cudaFreeHost(hostJointFactorsAHalf);
     if (hostJointFactorsBHalf) cudaFreeHost(hostJointFactorsBHalf);
+    if (hostThinkGainHalf) cudaFreeHost(hostThinkGainHalf);
     if (stream) cudaStreamDestroy(stream);
 }
 
@@ -578,7 +583,11 @@ bool Engine::initializeResources() {
     m_movesLeftName.clear();
     m_jointFactorsAName.clear();
     m_jointFactorsBName.clear();
+    m_thinkGainName.clear();
     m_jointFactorRank = 0;
+    // Spec v2 outputs the search never reads ('arrivals', or a think_gain of
+    // an unexpected shape): name and elements per batch row.
+    std::vector<std::pair<std::string, size_t>> ignoredOutputs;
 
     auto normalizedName = [](std::string name) {
         std::transform(name.begin(), name.end(), name.begin(), [](unsigned char character) {
@@ -633,6 +642,10 @@ bool Engine::initializeResources() {
                     return false;
                 }
                 m_jointFactorRank = rank;
+            } else if (lowerName == "think_gain" && outputElements == 2) {
+                m_thinkGainName = tensorName;
+            } else if (lowerName == "think_gain" || lowerName == "arrivals") {
+                ignoredOutputs.emplace_back(tensorName, outputElements);
             } else {
                 std::cerr << "Unexpected TensorRT output tensor " << tensorName << std::endl;
                 return false;
@@ -689,6 +702,20 @@ bool Engine::initializeResources() {
              !checkCuda(cudaMallocHost(&state->hostJointFactorsBHalf, jointFactorsSize), "cudaMallocHost(joint factors B)"))) {
             return false;
         }
+        const size_t thinkGainSize = m_batchSize * 2 * sizeof(__half);
+        if (!m_thinkGainName.empty() &&
+            (!checkCuda(cudaMalloc(&state->deviceThinkGainBuffer, thinkGainSize), "cudaMalloc(think gain)") ||
+             !checkCuda(cudaMallocHost(&state->hostThinkGainHalf, thinkGainSize), "cudaMallocHost(think gain)"))) {
+            return false;
+        }
+        for (const auto& ignored : ignoredOutputs) {
+            void* buffer = nullptr;
+            if (!checkCuda(cudaMalloc(&buffer, m_batchSize * ignored.second * sizeof(__half)),
+                           "cudaMalloc(unused output)")) {
+                return false;
+            }
+            state->deviceIgnoredBuffers.push_back(buffer);
+        }
         state->context.reset(m_engine->createExecutionContext());
         if (!state->context ||
             !state->context->setOptimizationProfileAsync(workerIndex, state->stream) ||
@@ -726,6 +753,18 @@ bool Engine::initializeResources() {
              !state->context->setTensorAddress(m_jointFactorsBName.c_str(), state->deviceJointFactorsBBuffer))) {
             std::cerr << "Failed to bind joint policy factor outputs" << std::endl;
             return false;
+        }
+        if (!m_thinkGainName.empty() &&
+            !state->context->setTensorAddress(m_thinkGainName.c_str(), state->deviceThinkGainBuffer)) {
+            std::cerr << "Failed to bind the think_gain output" << std::endl;
+            return false;
+        }
+        for (size_t i = 0; i < ignoredOutputs.size(); ++i) {
+            if (!state->context->setTensorAddress(ignoredOutputs[i].first.c_str(),
+                                                  state->deviceIgnoredBuffers[i])) {
+                std::cerr << "Failed to bind output " << ignoredOutputs[i].first << std::endl;
+                return false;
+            }
         }
 
         // TensorRT graph capture mutates execution-context state and its
@@ -867,6 +906,14 @@ bool Engine::enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
         state.inferencePending = false;
         return false;
     }
+    if (copyAuxiliaryOutputs && !m_thinkGainName.empty() &&
+        !checkCuda(cudaMemcpyAsync(state.hostThinkGainHalf, state.deviceThinkGainBuffer,
+                                   m_batchSize * 2 * sizeof(__half), cudaMemcpyDeviceToHost, state.stream),
+                   "cudaMemcpyAsync(think gain)")) {
+        cudaStreamSynchronize(state.stream);
+        state.inferencePending = false;
+        return false;
+    }
 
     return true;
 }
@@ -899,7 +946,30 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsA = static_cast<const __half*>(state.hostJointFactorsAHalf);
     outputs.jointFactorsB = static_cast<const __half*>(state.hostJointFactorsBHalf);
     outputs.jointFactorRank = m_jointFactorRank;
+    outputs.thinkGain = static_cast<const __half*>(state.hostThinkGainHalf);
 
+    return true;
+}
+
+bool Engine::evaluateThinkGain(const float* planes, float logits[2]) {
+    if (!planes || m_thinkGainName.empty() || m_executionStates.empty()) {
+        return false;
+    }
+    ExecutionState& state = *m_executionStates[0];
+    // A fixed-batch engine: fill every row with this position.
+    std::vector<float> batch(static_cast<size_t>(m_batchSize) * NB_INPUT_VALUES());
+    for (int row = 0; row < m_batchSize; ++row) {
+        std::copy_n(planes, NB_INPUT_VALUES(), batch.data() + row * NB_INPUT_VALUES());
+    }
+    floatsToHalves(batch.data(), state.hostObsHalf, batch.size());
+    HalfInferenceOutputs outputs;
+    if (!runInferenceHalfImpl(static_cast<const __half*>(state.hostObsHalf),
+                              outputs, 0, true)
+        || !outputs.thinkGain) {
+        return false;
+    }
+    logits[0] = __half2float(outputs.thinkGain[0]);
+    logits[1] = __half2float(outputs.thinkGain[1]);
     return true;
 }
 

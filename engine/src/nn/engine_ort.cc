@@ -85,6 +85,29 @@ struct Engine::OrtState {
     int movesLeftIdx = -1;
     int jointFactorsAIdx = -1;
     int jointFactorsBIdx = -1;
+    int thinkGainIdx = -1;
+
+    // Channels per board the network reads. Equal to the build's
+    // NB_INPUT_CHANNELS_PER_BOARD, except a v1 clock network (41) in the
+    // 43-channel clock build, whose input drops each block's last 2 planes.
+    int netChannelsPerBoard = NB_INPUT_CHANNELS_PER_BOARD;
+    bool dynamicBatch = false;
+
+    size_t net_values_per_row() const {
+        return static_cast<size_t>(2 * netChannelsPerBoard) * BOARD_HEIGHT * BOARD_WIDTH;
+    }
+
+    // Copies `rows` rows of build-layout planes into network layout.
+    template <typename Src, typename Dst, typename Convert>
+    void pack_rows(const Src* src, Dst* dst, size_t rows, Convert convert) const {
+        constexpr size_t planeSize = BOARD_HEIGHT * BOARD_WIDTH;
+        const size_t srcBlock = NB_INPUT_CHANNELS_PER_BOARD * planeSize;
+        const size_t dstBlock = static_cast<size_t>(netChannelsPerBoard) * planeSize;
+        for (size_t block = 0; block < rows * 2; ++block) {
+            std::transform(src + block * srcBlock, src + block * srcBlock + dstBlock,
+                           dst + block * dstBlock, convert);
+        }
+    }
 };
 
 const char* Engine::backendName() { return "ONNX Runtime (CPU)"; }
@@ -161,56 +184,101 @@ bool Engine::loadNetwork(const std::string& onnxFile,
                 << std::endl;
         }
 
-        const size_t outputCount = state.session->GetOutputCount();
-        state.outputNameStorage.reserve(outputCount);
-        for (size_t i = 0; i < outputCount; ++i) {
-            auto name = state.session->GetOutputNameAllocated(i, allocator);
-            state.outputNameStorage.emplace_back(name.get());
-            const auto type = state.session->GetOutputTypeInfo(i)
-                                  .GetTensorTypeAndShapeInfo()
-                                  .GetElementType();
-            if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 &&
-                type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-                std::cerr << "Unsupported network output type for " << name.get()
-                          << ": " << type << std::endl;
+        // The network's input channels: the build's layout, or a v1 clock
+        // network (41 per board) in the 43-channel clock build.
+        {
+            const auto inputShape = state.session->GetInputTypeInfo(0)
+                                        .GetTensorTypeAndShapeInfo()
+                                        .GetShape();
+            const int64_t channels = inputShape.size() == 4 ? inputShape[1] : -1;
+            state.dynamicBatch = inputShape.size() == 4 && inputShape[0] <= 0;
+            if (channels == NB_INPUT_CHANNELS || channels <= 0) {
+                state.netChannelsPerBoard = NB_INPUT_CHANNELS_PER_BOARD;
+            } else if (HAS_ELAPSED_PLANES
+                       && channels == 2 * NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD) {
+                state.netChannelsPerBoard = NB_V1_CLOCK_INPUT_CHANNELS_PER_BOARD;
+                std::cout << "info string v1 clock network (" << channels
+                          << " input channels): elapsed planes are not given to it"
+                          << std::endl;
+            } else {
+                std::cerr << "Network expects " << channels
+                          << " input channels; this build makes "
+                          << NB_INPUT_CHANNELS << std::endl;
                 return false;
             }
+        }
+
+        // Classify every output, then run only the ones the engine reads:
+        // extra heads such as 'arrivals' (spec v2 C) are training targets.
+        const size_t graphOutputCount = state.session->GetOutputCount();
+        std::vector<std::string> graphNames;
+        std::vector<ONNXTensorElementDataType> graphTypes;
+        for (size_t i = 0; i < graphOutputCount; ++i) {
+            auto name = state.session->GetOutputNameAllocated(i, allocator);
+            graphNames.emplace_back(name.get());
+            graphTypes.push_back(state.session->GetOutputTypeInfo(i)
+                                     .GetTensorTypeAndShapeInfo()
+                                     .GetElementType());
+        }
+        auto use_output = [&](size_t graphIndex, int& slot, std::string& name) -> bool {
+            const auto type = graphTypes[graphIndex];
+            if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 &&
+                type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                std::cerr << "Unsupported network output type for "
+                          << graphNames[graphIndex] << ": " << type << std::endl;
+                return false;
+            }
+            slot = static_cast<int>(state.outputNameStorage.size());
+            state.outputNameStorage.push_back(graphNames[graphIndex]);
             state.outputTypes.push_back(type);
+            name = graphNames[graphIndex];
+            return true;
+        };
+        for (size_t i = 0; i < graphOutputCount; ++i) {
+            const std::string norm = lowered(graphNames[i]);
+            bool ok = true;
+            // Order matters: "jointfactors_a" also contains "_a".
+            if (matches(norm, {"think_gain", "thinkgain"})) {
+                const auto shape = state.session->GetOutputTypeInfo(i)
+                                       .GetTensorTypeAndShapeInfo()
+                                       .GetShape();
+                if (shape.size() == 2 && shape[1] == 2) {
+                    ok = use_output(i, state.thinkGainIdx, m_thinkGainName);
+                } else {
+                    std::cout << "info string think_gain output is not [batch, 2];"
+                              << " ignored" << std::endl;
+                }
+            } else if (matches(norm, {"arrival"})) {
+                // Training target only; the engine never reads it.
+            } else if (matches(norm, {"jointfactor", "joint_factor"})) {
+                if (matches(norm, {"_a", "a_"}) || norm.back() == 'a') {
+                    ok = use_output(i, state.jointFactorsAIdx, m_jointFactorsAName);
+                } else {
+                    ok = use_output(i, state.jointFactorsBIdx, m_jointFactorsBName);
+                }
+            } else if (matches(norm, {"wdl"})) {
+                ok = use_output(i, state.wdlIdx, m_wdlName);
+            } else if (matches(norm, {"moves_left", "movesleft"})) {
+                ok = use_output(i, state.movesLeftIdx, m_movesLeftName);
+            } else if (matches(norm, {"pi_a", "policy_a", "policya"})) {
+                ok = use_output(i, state.policyAIdx, m_policyAName);
+            } else if (matches(norm, {"pi_b", "policy_b", "policyb"})) {
+                ok = use_output(i, state.policyBIdx, m_policyBName);
+            } else if (matches(norm, {"value"})) {
+                ok = use_output(i, state.valueIdx, m_valueName);
+            } else {
+                // Unknown heads used to be fetched and never read; now
+                // they are simply not computed.
+            }
+            if (!ok) {
+                return false;
+            }
         }
         for (const auto& name : state.outputNameStorage) {
             state.outputNames.push_back(name.c_str());
         }
         state.inputNames[0] = m_inputName.c_str();
-
-        for (size_t i = 0; i < state.outputNameStorage.size(); ++i) {
-            const std::string norm = lowered(state.outputNameStorage[i]);
-            const int idx = static_cast<int>(i);
-            // Order matters: "jointfactors_a" also contains "_a".
-            if (matches(norm, {"jointfactor", "joint_factor"})) {
-                if (matches(norm, {"_a", "a_"}) || norm.back() == 'a') {
-                    state.jointFactorsAIdx = idx;
-                    m_jointFactorsAName = state.outputNameStorage[i];
-                } else {
-                    state.jointFactorsBIdx = idx;
-                    m_jointFactorsBName = state.outputNameStorage[i];
-                }
-            } else if (matches(norm, {"wdl"})) {
-                state.wdlIdx = idx;
-                m_wdlName = state.outputNameStorage[i];
-            } else if (matches(norm, {"moves_left", "movesleft"})) {
-                state.movesLeftIdx = idx;
-                m_movesLeftName = state.outputNameStorage[i];
-            } else if (matches(norm, {"pi_a", "policy_a", "policya"})) {
-                state.policyAIdx = idx;
-                m_policyAName = state.outputNameStorage[i];
-            } else if (matches(norm, {"pi_b", "policy_b", "policyb"})) {
-                state.policyBIdx = idx;
-                m_policyBName = state.outputNameStorage[i];
-            } else if (matches(norm, {"value"})) {
-                state.valueIdx = idx;
-                m_valueName = state.outputNameStorage[i];
-            }
-        }
+        const size_t outputCount = state.outputNameStorage.size();
 
         if (state.valueIdx < 0 || state.policyAIdx < 0 || state.policyBIdx < 0) {
             std::cerr << "Network is missing a required head (value/pi_a/pi_b)."
@@ -222,7 +290,10 @@ bool Engine::loadNetwork(const std::string& onnxFile,
         m_jointFactorRank = 0;
         if (state.jointFactorsAIdx >= 0) {
             const auto shape =
-                state.session->GetOutputTypeInfo(state.jointFactorsAIdx)
+                state.session->GetOutputTypeInfo(
+                        static_cast<size_t>(std::find(graphNames.begin(), graphNames.end(),
+                                                      m_jointFactorsAName)
+                                            - graphNames.begin()))
                     .GetTensorTypeAndShapeInfo()
                     .GetShape();
             // [batch, rank, vocabulary]
@@ -235,7 +306,7 @@ bool Engine::loadNetwork(const std::string& onnxFile,
         state.workers.resize(workerCount);
         for (auto& worker : state.workers) {
             const size_t inputElements =
-                static_cast<size_t>(m_batchSize) * NB_INPUT_VALUES();
+                static_cast<size_t>(m_batchSize) * state.net_values_per_row();
             if (state.usesFp16) {
                 worker.inputHalf.resize(inputElements);
             } else {
@@ -275,12 +346,22 @@ bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex) {
 
     // Copy rather than alias the caller's buffer: the search reuses its
     // double-buffered observation slabs as soon as it has enqueued.
+    const bool sameLayout = m_ort->netChannelsPerBoard == NB_INPUT_CHANNELS_PER_BOARD;
     if (m_ort->usesFp16) {
-        std::memcpy(worker.inputHalf.data(), obs,
-                    worker.inputHalf.size() * sizeof(__half));
-    } else {
+        if (sameLayout) {
+            std::memcpy(worker.inputHalf.data(), obs,
+                        worker.inputHalf.size() * sizeof(__half));
+        } else {
+            m_ort->pack_rows(obs, worker.inputHalf.data(),
+                             static_cast<size_t>(m_batchSize),
+                             [](__half v) { return v; });
+        }
+    } else if (sameLayout) {
         std::transform(obs, obs + worker.inputFloat.size(),
                        worker.inputFloat.begin(), __half2float);
+    } else {
+        m_ort->pack_rows(obs, worker.inputFloat.data(),
+                         static_cast<size_t>(m_batchSize), __half2float);
     }
 
     auto& state = *m_ort;
@@ -288,7 +369,7 @@ bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex) {
     worker.pending = std::async(std::launch::async, [&state, &worker, batch]() {
         try {
             const std::array<int64_t, 4> shape{
-                batch, NB_INPUT_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH};
+                batch, 2 * state.netChannelsPerBoard, BOARD_HEIGHT, BOARD_WIDTH};
             Ort::Value input{nullptr};
             if (state.usesFp16) {
                 input = Ort::Value::CreateTensor(
@@ -361,7 +442,64 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsA = at(state.jointFactorsAIdx);
     outputs.jointFactorsB = at(state.jointFactorsBIdx);
     outputs.jointFactorRank = outputs.jointFactorsA ? m_jointFactorRank : 0;
+    outputs.thinkGain = at(state.thinkGainIdx);
     return outputs.value && outputs.policyA && outputs.policyB;
+}
+
+bool Engine::evaluateThinkGain(const float* planes, float logits[2]) {
+    if (!planes || !m_ort || !m_ort->session || m_ort->thinkGainIdx < 0) {
+        return false;
+    }
+    auto& state = *m_ort;
+    try {
+        // One row when the graph's batch is dynamic, else a full batch of
+        // copies. Only the think_gain output is requested, so ORT skips the
+        // policy and value heads.
+        const int64_t rows = state.dynamicBatch ? 1 : m_batchSize;
+        const size_t rowValues = state.net_values_per_row();
+        const std::array<int64_t, 4> shape{
+            rows, 2 * state.netChannelsPerBoard, BOARD_HEIGHT, BOARD_WIDTH};
+        std::vector<float> inputFloat(static_cast<size_t>(rows) * rowValues);
+        state.pack_rows(planes, inputFloat.data(), 1, [](float v) { return v; });
+        for (int64_t row = 1; row < rows; ++row) {
+            std::copy_n(inputFloat.data(), rowValues, inputFloat.data() + row * rowValues);
+        }
+        std::vector<__half> inputHalf;
+        Ort::Value input{nullptr};
+        if (state.usesFp16) {
+            inputHalf.resize(inputFloat.size());
+            std::transform(inputFloat.begin(), inputFloat.end(), inputHalf.begin(),
+                           __float2half_rn);
+            input = Ort::Value::CreateTensor(
+                state.memoryInfo, inputHalf.data(), inputHalf.size() * sizeof(__half),
+                shape.data(), shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
+        } else {
+            input = Ort::Value::CreateTensor<float>(
+                state.memoryInfo, inputFloat.data(), inputFloat.size(),
+                shape.data(), shape.size());
+        }
+        const char* outputName = state.outputNames[static_cast<size_t>(state.thinkGainIdx)];
+        auto outputs = state.session->Run(Ort::RunOptions{nullptr},
+                                          state.inputNames.data(), &input, 1,
+                                          &outputName, 1);
+        if (outputs.empty() || outputs[0].GetTensorTypeAndShapeInfo().GetElementCount() < 2) {
+            return false;
+        }
+        if (state.outputTypes[static_cast<size_t>(state.thinkGainIdx)]
+            == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            const auto* values = static_cast<const __half*>(outputs[0].GetTensorRawData());
+            logits[0] = __half2float(values[0]);
+            logits[1] = __half2float(values[1]);
+        } else {
+            const auto* values = outputs[0].GetTensorData<float>();
+            logits[0] = values[0];
+            logits[1] = values[1];
+        }
+        return true;
+    } catch (const Ort::Exception& e) {
+        std::cerr << "think_gain inference failed: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 bool Engine::runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,

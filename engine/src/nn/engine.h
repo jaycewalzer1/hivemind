@@ -65,6 +65,10 @@ public:
         const __half* jointFactorsA = nullptr;
         const __half* jointFactorsB = nullptr;
         size_t jointFactorRank = 0;
+        /// Spec v2 'think_gain' head: 2 logits per row (board A, board B),
+        /// or nullptr when the network has no such output. Never used by
+        /// the search.
+        const __half* thinkGain = nullptr;
     };
 
     explicit Engine(int deviceId, int batchSize = SearchParams::BATCH_SIZE);
@@ -91,6 +95,18 @@ public:
     bool enqueueInferenceHalf(const __half* obs, size_t workerIndex = 0);
     bool synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
                                   size_t workerIndex = 0);
+
+    /// True when the network exports a 'think_gain' output (spec v2 B).
+    bool hasThinkGain() const { return !m_thinkGainName.empty(); }
+
+    /**
+     * @brief Evaluates one position and returns its think_gain logits.
+     * @param planes NB_INPUT_VALUES() floats, as board_to_planes fills them.
+     * @param logits receives the board A and board B logits.
+     * Uses inference worker 0, so call it only while no search is running.
+     * Returns false when the network has no think_gain output.
+     */
+    bool evaluateThinkGain(const float* planes, float logits[2]);
 
     /**
      * @brief Get the batch size this engine was built with.
@@ -119,6 +135,10 @@ private:
         void* deviceMovesLeftBuffer = nullptr;
         void* deviceJointFactorsABuffer = nullptr;
         void* deviceJointFactorsBBuffer = nullptr;
+        void* deviceThinkGainBuffer = nullptr;
+        // Outputs the engine never reads ('arrivals'), bound so TensorRT
+        // has somewhere to write them.
+        std::vector<void*> deviceIgnoredBuffers;
         void* hostObsHalf = nullptr;
         void* hostValueHalf = nullptr;
         void* hostPolicyAHalf = nullptr;
@@ -127,6 +147,7 @@ private:
         void* hostMovesLeftHalf = nullptr;
         void* hostJointFactorsAHalf = nullptr;
         void* hostJointFactorsBHalf = nullptr;
+        void* hostThinkGainHalf = nullptr;
     };
 #else
     // Opaque so onnxruntime headers stay out of every translation unit that
@@ -156,6 +177,7 @@ private:
     std::string m_movesLeftName;
     std::string m_jointFactorsAName;
     std::string m_jointFactorsBName;
+    std::string m_thinkGainName;
     size_t m_jointFactorRank = 0;
 
 #if defined(HIVEMIND_BACKEND_TENSORRT)
