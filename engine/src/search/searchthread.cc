@@ -60,7 +60,9 @@ bool has_unavoidable_waiting_board_mate(Board& board,
     }
 
     std::vector<Stockfish::Move> replies = board.legal_moves(activeBoard);
-    if (teamToPlayHasTimeAdvantage) {
+    // Under FreePass a pass on the active board is always legal (spec v2 D4),
+    // so it is a reply the mate has to survive too.
+    if (teamToPlayHasTimeAdvantage || g_freePass) {
         replies.push_back(Stockfish::MOVE_NONE);
     }
     if (replies.empty()) {
@@ -150,6 +152,19 @@ TerminalOutcome classify_terminal_position(Board& board,
             *endInPly = 1;
         }
         return weFlagged ? TerminalOutcome::LOSS : TerminalOutcome::WIN;
+    }
+    // Spec v2 D1: a full round with no move on either board is a sit-off,
+    // decided by which seat on turn would flag first.
+    if (const int losers = board.sit_off_losers()) {
+        const bool weLose = losers & (1 << teamToPlay);
+        const bool theyLose = losers & (1 << ~teamToPlay);
+        if (weLose && theyLose) {
+            return TerminalOutcome::DRAW;
+        }
+        if (endInPly) {
+            *endInPly = 1;
+        }
+        return weLose ? TerminalOutcome::LOSS : TerminalOutcome::WIN;
     }
     Board::LegalMoveCache legalMoveCache;
 

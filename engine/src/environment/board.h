@@ -46,6 +46,22 @@ class Board {
         int64_t treeMoveMs = 0;
         /// Macro-plies charged since the clocks were set (flags only count after one).
         int treeClockPlies = 0;
+        /// Spec v2 'elapsed <ea> <eb>': ms since the last move landed on each
+        /// board. Only meaningful with clocks; planes 41..42 read it in the
+        /// clock build. With tree clocks, a move on a board resets its value to
+        /// 0 and a pass there adds treeMoveMs.
+        bool hasElapsed = false;
+        int64_t elapsedMs[2] = {0, 0};
+        /// Consecutive tree macro-plies with no move on either board (tree
+        /// clocks only). Two in a row is a full round of passes: a sit-off.
+        int treePassStreak = 0;
+        /// What make_moves() changed besides the clocks, so unmake_moves()
+        /// can restore it (tree clocks only).
+        struct TreeClockUndo {
+            int64_t elapsedMs[2];
+            int passStreak;
+        };
+        std::vector<TreeClockUndo> treeClockUndo;
 
         void set_clocks(int64_t aWhite, int64_t aBlack, int64_t bWhite, int64_t bBlack) {
             hasClocks = true;
@@ -54,13 +70,36 @@ class Board {
             clockMs[1][Stockfish::WHITE] = bWhite;
             clockMs[1][Stockfish::BLACK] = bBlack;
             treeClockPlies = 0;
+            treePassStreak = 0;
+            treeClockUndo.clear();
         }
 
+        /// Clears the clocks and everything that only exists with them.
         void clear_clocks() {
             hasClocks = false;
             clockMs[0][0] = clockMs[0][1] = clockMs[1][0] = clockMs[1][1] = 0;
             treeClockPlies = 0;
+            treePassStreak = 0;
+            treeClockUndo.clear();
+            clear_elapsed();
         }
+
+        void set_elapsed(int64_t boardA, int64_t boardB) {
+            hasElapsed = true;
+            elapsedMs[0] = std::max<int64_t>(0, boardA);
+            elapsedMs[1] = std::max<int64_t>(0, boardB);
+        }
+
+        void clear_elapsed() {
+            hasElapsed = false;
+            elapsedMs[0] = elapsedMs[1] = 0;
+        }
+
+        bool has_elapsed() const { return hasElapsed; }
+
+        int64_t elapsed_ms(int board_num) const { return elapsedMs[board_num]; }
+
+        int tree_pass_streak() const { return treePassStreak; }
 
         bool has_clocks() const { return hasClocks; }
 
@@ -100,6 +139,32 @@ class Board {
             return flags;
         }
 
+        /**
+         * @brief Spec v2 D1: a sit-off decided by the clocks.
+         *
+         * Clock build with tree clocks only. After a full round in the tree
+         * with no move on either board (two macro-plies in a row that passed
+         * on both boards), nothing changes but the clocks, so the game is
+         * scored as if nobody ever moved again: of the two seats on turn, the
+         * one with less time flags first and loses for its team.
+         * @return bit (1 << team) for the losing team; both bits = draw (equal
+         *         clocks on seats of different teams); 0 = no sit-off.
+         */
+        int sit_off_losers() const {
+            if (!HAS_CLOCK_PLANES || !tree_clocks_active() || treePassStreak < 2) {
+                return 0;
+            }
+            const Stockfish::Color seatA = pos[0]->side_to_move();
+            const Stockfish::Color seatB = pos[1]->side_to_move();
+            const int64_t timeA = clockMs[0][seatA];
+            const int64_t timeB = clockMs[1][seatB];
+            const int teamA = 1 << team_of_seat(0, seatA);
+            const int teamB = 1 << team_of_seat(1, seatB);
+            if (timeA < timeB) return teamA;
+            if (timeB < timeA) return teamB;
+            return teamA | teamB;
+        }
+
         Board();
         Board(const Board& board);
 
@@ -131,6 +196,19 @@ class Board {
                 for (int b = 0; b < 2; ++b) {
                     combined = mix_hash(combined, static_cast<uint64_t>(clockMs[b][0]));
                     combined = mix_hash(combined, static_cast<uint64_t>(clockMs[b][1]));
+                }
+                // Clock build only, so the default build's keys stay as they were.
+                if constexpr (HAS_ELAPSED_PLANES) {
+                    if (hasElapsed) {
+                        combined = mix_hash(combined, static_cast<uint64_t>(elapsedMs[0]) ^ 0x656c617073656441ULL);
+                        combined = mix_hash(combined, static_cast<uint64_t>(elapsedMs[1]) ^ 0x656c617073656442ULL);
+                    }
+                }
+                if constexpr (HAS_CLOCK_PLANES) {
+                    if (tree_clocks_active() && treePassStreak > 0) {
+                        combined = mix_hash(combined, 0x7061737300000000ULL
+                            | static_cast<uint64_t>(std::min(treePassStreak, 2)));
+                    }
                 }
             }
             // XOR in time advantage key if team is up on time

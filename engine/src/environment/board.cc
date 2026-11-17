@@ -94,6 +94,11 @@ Board::Board(const Board& board) {
     }
     treeMoveMs = board.treeMoveMs;
     treeClockPlies = board.treeClockPlies;
+    hasElapsed = board.hasElapsed;
+    elapsedMs[0] = board.elapsedMs[0];
+    elapsedMs[1] = board.elapsedMs[1];
+    treePassStreak = board.treePassStreak;
+    treeClockUndo = board.treeClockUndo;
 }
 
 // Executes a move on the board and updates the corresponding state.
@@ -506,6 +511,16 @@ void Board::make_moves(Stockfish::Move moveA, Stockfish::Move moveB) {
         clockMs[BOARD_A][side_to_move(BOARD_A)] -= treeMoveMs;
         clockMs[BOARD_B][side_to_move(BOARD_B)] -= treeMoveMs;
         ++treeClockPlies;
+        // Spec v2: elapsed resets on the board that moved and grows on the
+        // board that passed; a macro-ply with no move anywhere extends the
+        // pass streak that decides sit-offs.
+        treeClockUndo.push_back({{elapsedMs[0], elapsedMs[1]}, treePassStreak});
+        if (hasElapsed) {
+            elapsedMs[BOARD_A] = moveA == Stockfish::MOVE_NONE ? elapsedMs[BOARD_A] + treeMoveMs : 0;
+            elapsedMs[BOARD_B] = moveB == Stockfish::MOVE_NONE ? elapsedMs[BOARD_B] + treeMoveMs : 0;
+        }
+        treePassStreak = (moveA == Stockfish::MOVE_NONE && moveB == Stockfish::MOVE_NONE)
+            ? treePassStreak + 1 : 0;
     }
     apply_move(BOARD_A, moveA);
     apply_move(BOARD_B, moveB);
@@ -532,5 +547,12 @@ void Board::unmake_moves(Stockfish::Move moveA, Stockfish::Move moveB) {
         clockMs[BOARD_A][side_to_move(BOARD_A)] += treeMoveMs;
         clockMs[BOARD_B][side_to_move(BOARD_B)] += treeMoveMs;
         --treeClockPlies;
+        if (!treeClockUndo.empty()) {
+            const TreeClockUndo& undo = treeClockUndo.back();
+            elapsedMs[0] = undo.elapsedMs[0];
+            elapsedMs[1] = undo.elapsedMs[1];
+            treePassStreak = undo.passStreak;
+            treeClockUndo.pop_back();
+        }
     }
 }
