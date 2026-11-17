@@ -37,6 +37,69 @@ class Board {
         std::unordered_map<uint64_t, uint32_t> repetitionCounts[2];
         uint64_t repetitionFingerprint[2] = {0, 0};
 
+        // Custom-engine clocks. Inactive (stock behaviour) until set_clocks()
+        // is called; UCI sets them from 'position ... clocks'.
+        bool hasClocks = false;
+        int64_t clockMs[2][2] = {{0, 0}, {0, 0}};  ///< [board][color], ms left
+        /// TreeMoveMs: with clocks set and > 0, every make_moves() charges this
+        /// much to the seat on turn on each board (and unmake_moves() refunds it).
+        int64_t treeMoveMs = 0;
+        /// Macro-plies charged since the clocks were set (flags only count after one).
+        int treeClockPlies = 0;
+
+        void set_clocks(int64_t aWhite, int64_t aBlack, int64_t bWhite, int64_t bBlack) {
+            hasClocks = true;
+            clockMs[0][Stockfish::WHITE] = aWhite;
+            clockMs[0][Stockfish::BLACK] = aBlack;
+            clockMs[1][Stockfish::WHITE] = bWhite;
+            clockMs[1][Stockfish::BLACK] = bBlack;
+            treeClockPlies = 0;
+        }
+
+        void clear_clocks() {
+            hasClocks = false;
+            clockMs[0][0] = clockMs[0][1] = clockMs[1][0] = clockMs[1][1] = 0;
+            treeClockPlies = 0;
+        }
+
+        bool has_clocks() const { return hasClocks; }
+
+        int64_t clock_ms(int board_num, Stockfish::Color color) const {
+            return clockMs[board_num][color];
+        }
+
+        bool tree_clocks_active() const { return hasClocks && treeMoveMs > 0; }
+
+        /// Clocks change the search (planes or flags), so they belong in the node key.
+        bool clocks_affect_search() const {
+            return hasClocks && (treeMoveMs > 0 || HAS_CLOCK_PLANES);
+        }
+
+        /// Team that owns a seat: White on A and Black on B are one team.
+        static Stockfish::Color team_of_seat(int board_num, Stockfish::Color color) {
+            return board_num == 0 ? color : ~color;
+        }
+
+        /**
+         * @brief Teams whose clock ran out inside the search tree.
+         * @return bit (1 << team) set for each flagged team; 0 unless tree
+         *         clocks are active and at least one macro-ply was charged.
+         */
+        int flagged_teams() const {
+            if (!tree_clocks_active() || treeClockPlies <= 0) {
+                return 0;
+            }
+            int flags = 0;
+            for (int b = 0; b < 2; ++b) {
+                for (Stockfish::Color c : {Stockfish::WHITE, Stockfish::BLACK}) {
+                    if (clockMs[b][c] <= 0) {
+                        flags |= 1 << team_of_seat(b, c);
+                    }
+                }
+            }
+            return flags;
+        }
+
         Board();
         Board(const Board& board);
 
@@ -64,6 +127,12 @@ class Board {
             // visited. That makes future repetition transitions node-local.
             combined = mix_hash(combined, repetitionFingerprint[0]);
             combined = mix_hash(combined, repetitionFingerprint[1]);
+            if (clocks_affect_search()) {
+                for (int b = 0; b < 2; ++b) {
+                    combined = mix_hash(combined, static_cast<uint64_t>(clockMs[b][0]));
+                    combined = mix_hash(combined, static_cast<uint64_t>(clockMs[b][1]));
+                }
+            }
             // XOR in time advantage key if team is up on time
             return teamHasTimeAdvantage ? (combined ^ Stockfish::Zobrist::timeAdvantage) : combined;
         }

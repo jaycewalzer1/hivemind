@@ -21,6 +21,7 @@ option(HIVEMIND_NATIVE_ARCH "Optimize for the build machine's CPU" ON)
 option(HIVEMIND_USE_PEXT "Use BMI2 PEXT for sliding attacks (benchmark first; slower on most CPUs tested)" OFF)
 option(HIVEMIND_ORT_FP16 "Use native FP16 tensors with the ONNX Runtime backend" OFF)
 option(HIVEMIND_PORTABLE_BUNDLE "Use relocatable runtime search paths for release packaging" OFF)
+option(HIVEMIND_CLOCK_PLANES "Build hivemind-clock: 41 input channels per board (37 + 4 clock planes)" OFF)
 
 # Set C++ version and optimization level. Keep compiler flags portable: GNU
 # switches passed unconditionally here used to make the ONNX Runtime backend
@@ -89,6 +90,7 @@ set(LIB_SOURCES
     src/tools/benchmark.cc
     src/tools/selfplay.cc
     src/tools/tournament.cc
+    src/tools/training_sample.cc
 )
 
 if(HIVEMIND_BACKEND STREQUAL "tensorrt")
@@ -205,6 +207,12 @@ else()
     endif()
 endif()
 target_include_directories(${PROJECT_NAME}_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(HIVEMIND_CLOCK_PLANES)
+    target_compile_definitions(${PROJECT_NAME}_lib PUBLIC HIVEMIND_CLOCK_PLANES)
+    set(HIVEMIND_BINARY_NAME hivemind-clock)
+else()
+    set(HIVEMIND_BINARY_NAME hivemind)
+endif()
 if(HIVEMIND_BACKEND STREQUAL "tensorrt")
     target_compile_definitions(${PROJECT_NAME}_lib PUBLIC
         TENSORRT_LIBRARY_DIR="${TensorRT_DIR}/lib"
@@ -225,9 +233,9 @@ target_link_libraries(${PROJECT_NAME}_lib PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(${PROJECT_NAME} src/main.cc)
 if(WIN32)
-    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME hivemind)
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME ${HIVEMIND_BINARY_NAME})
 else()
-    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME hivemind.bin)
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME ${HIVEMIND_BINARY_NAME}.bin)
 endif()
 if(HIVEMIND_USE_UNITY_BUILD)
     set_target_properties(${PROJECT_NAME} PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 8)
@@ -242,22 +250,28 @@ if(WIN32 AND HIVEMIND_BACKEND STREQUAL "onnxruntime")
             "${ONNXRuntime_DLL}" "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
         COMMENT "Copying ONNX Runtime beside hivemind.exe")
 elseif(UNIX AND HIVEMIND_BACKEND STREQUAL "tensorrt")
-    file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
+    file(WRITE "${CMAKE_BINARY_DIR}/${HIVEMIND_BINARY_NAME}"
     "#!/bin/sh\n"
     "set -e\n"
     "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
     "export LD_LIBRARY_PATH=\"${TensorRT_DIR}/lib:${CUDA_TOOLKIT_ROOT_DIR}/lib64:${CUDA_TOOLKIT_ROOT_DIR}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}\"\n"
-    "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
+    "exec \"$SCRIPT_DIR/${HIVEMIND_BINARY_NAME}.bin\" \"$@\"\n")
 else()
     # RPATH already points at the runtime; the wrapper just keeps the same entry point.
-    file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
+    file(WRITE "${CMAKE_BINARY_DIR}/${HIVEMIND_BINARY_NAME}"
     "#!/bin/sh\n"
     "set -e\n"
     "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
-    "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
+    "exec \"$SCRIPT_DIR/${HIVEMIND_BINARY_NAME}.bin\" \"$@\"\n")
 endif()
 if(UNIX)
-    execute_process(COMMAND /bin/chmod 755 "${CMAKE_BINARY_DIR}/hivemind")
+    execute_process(COMMAND /bin/chmod 755 "${CMAKE_BINARY_DIR}/${HIVEMIND_BINARY_NAME}")
+endif()
+
+# Out-of-step self-play loop (custom engine spec section 4), clock build only.
+if(HIVEMIND_CLOCK_PLANES)
+    add_executable(async_selfplay src/tools/async_selfplay.cc)
+    target_link_libraries(async_selfplay PRIVATE ${PROJECT_NAME}_lib)
 endif()
 
 include(CTest)

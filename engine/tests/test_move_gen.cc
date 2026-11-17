@@ -125,8 +125,13 @@ uint64_t recomputed_position_key(Board& board, int boardNum) {
 }
 
 TEST_F(EngineTest, NewInputRepresentationStartsWithEmptyHistoryPlanes) {
+#ifdef HIVEMIND_CLOCK_PLANES
+    EXPECT_EQ(NB_INPUT_CHANNELS, 82);
+    EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 41);
+#else
     EXPECT_EQ(NB_INPUT_CHANNELS, 74);
     EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 37);
+#endif
 
     Board board;
     std::vector<float> planes(NB_INPUT_VALUES());

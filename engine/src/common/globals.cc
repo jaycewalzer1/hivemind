@@ -43,6 +43,7 @@ LogLevel g_logLevel = LOG_NONE;
 
 // Board the team must move on (default: neither, so passing stays legal)
 RequiredMoveBoard g_requiredMoveBoard = REQUIRE_MOVE_NONE;
+bool g_freePass = false;
 
 std::unordered_map<std::string, int> POLICY_INDEX;
 int POLICY_TABLE_NORMAL[2][64][64][2];

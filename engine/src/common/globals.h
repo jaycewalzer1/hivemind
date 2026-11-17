@@ -43,6 +43,16 @@ extern RequiredMoveBoard g_requiredMoveBoard;
 RequiredMoveBoard parseRequiredMoveBoard(const std::string& str);
 
 /**
+ * @brief FreePass rule (UCI option, default false).
+ *
+ * When true, a team may pass on any board where it is on turn, on one board or
+ * on both, whatever its time advantage and whether the partner board captures.
+ * A board where the team is not on turn still only has the pass. The stock
+ * single-pass and double-sit rules apply while this is false.
+ */
+extern bool g_freePass;
+
+/**
  * @brief Parse a log level string to LogLevel enum.
  * @param str The string to parse ("none", "info", "debug")
  * @return The corresponding LogLevel, defaults to LOG_NONE for unrecognized strings.

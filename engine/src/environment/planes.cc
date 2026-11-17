@@ -1,6 +1,7 @@
 #include "environment/planes.h"
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <type_traits>
 
@@ -212,6 +213,29 @@ inline void set_plane_history_board(PlaneData<T>& p, int boardIdx) {
     p.set_plane_to_value(repetitions >= 3 ? 1.0f : 0.0f);
 }
 
+// Clock planes (hivemind-clock build only): channels 37..40 of a board block.
+// "Our seat" is teamSide's seat on this board; t is its remaining seconds.
+//   37: min(t / 300, 1) ours    38: exp(-t / 10) ours
+//   39: min(t / 300, 1) theirs  40: exp(-t / 10) theirs
+// All four stay 0 when no clocks were given.
+template <typename T>
+inline void set_plane_clocks_board(PlaneData<T>& p, int boardIdx) {
+    if (!p.board.has_clocks()) {
+        for (int channel = 0; channel < 4; ++channel) {
+            p.increment_channel();
+        }
+        return;
+    }
+    const Stockfish::Color ours = (boardIdx == 0) ? p.teamSide : ~p.teamSide;
+    for (Stockfish::Color seat : {ours, ~ours}) {
+        // A flagged seat is terminal in the tree and never evaluated; clamp so
+        // the planes stay inside [0, 1] regardless.
+        const double seconds = std::max<int64_t>(0, p.board.clock_ms(boardIdx, seat)) / 1000.0;
+        p.set_plane_to_value(static_cast<float>(std::min(seconds / 300.0, 1.0)));
+        p.set_plane_to_value(static_cast<float>(std::exp(-seconds / 10.0)));
+    }
+}
+
 template <typename T>
 void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSide, bool hasTimeAdvantage) {
     // Initialize all to 0 using SIMD when available
@@ -245,6 +269,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     set_plane_castling_rights_board(planeData, 0);  
     planeData.set_plane_to_value(hasTimeAdvantage ? 1.0f : 0.0f); 
     set_plane_history_board(planeData, 0);
+    if constexpr (HAS_CLOCK_PLANES) {
+        set_plane_clocks_board(planeData, 0);
+    }
     
     // Process Board 1
     set_plane_pieces_board(planeData, 1);           
@@ -256,6 +283,9 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     set_plane_castling_rights_board(planeData, 1);  
     planeData.set_plane_to_value(hasTimeAdvantage ? 1.0f : 0.0f);
     set_plane_history_board(planeData, 1);
+    if constexpr (HAS_CLOCK_PLANES) {
+        set_plane_clocks_board(planeData, 1);
+    }
 }
 
 void board_to_planes(Board& board, float* inputPlanes, Stockfish::Color teamSide, bool hasTimeAdvantage) {
