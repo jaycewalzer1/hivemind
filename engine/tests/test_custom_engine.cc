@@ -8,7 +8,11 @@
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <set>
+#include <thread>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -603,8 +607,9 @@ TEST_F(CustomEngineTest, SamplePoliciesFollowRootVisits) {
 
 TEST_F(CustomEngineTest, ClockBuildHas43ChannelsPerBoard) {
     if constexpr (HAS_CLOCK_PLANES) {
-        EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 43);
-        EXPECT_EQ(NB_INPUT_CHANNELS, 86);
+        // Spec v3 (WP-F) appends the diagonal plane as channel 43.
+        EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, HAS_DIAGONAL_PLANE ? 44 : 43);
+        EXPECT_EQ(NB_INPUT_CHANNELS, 2 * NB_INPUT_CHANNELS_PER_BOARD);
         EXPECT_TRUE(HAS_ELAPSED_PLANES);
     } else {
         EXPECT_EQ(NB_INPUT_CHANNELS_PER_BOARD, 37);
@@ -879,6 +884,312 @@ TEST_F(CustomEngineTest, WaitingBoardMateCountsThePassUnderFreePass) {
               TerminalOutcome::LOSS);
 }
 
+// ================================================================ spec v3
+
+// ----------------------------------------- E1: double flag (D4)
+
+TEST_F(CustomEngineTest, DoubleFlagMostNegativeSeatLosesTieDraws) {
+    // Start position: A white (white team) and B white (black team) are on
+    // turn and both run out on one macro-ply of 1000 ms.
+    Board board;
+    board.set_clocks(100, 60000, 600, 60000);
+    board.treeMoveMs = 1000;
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    const int both = (1 << Stockfish::WHITE) | (1 << Stockfish::BLACK);
+    ASSERT_EQ(board.flagged_teams(), both);
+    // A white is at -900, B white at -400: the white team ran out first.
+    EXPECT_EQ(board.flag_losers(), 1 << Stockfish::WHITE);
+    int endInPly = -1;
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::BLACK, Stockfish::WHITE, false,
+                                         std::array<int, 2>{0, 0}, &endInPly),
+              TerminalOutcome::WIN);
+    EXPECT_EQ(endInPly, 1);
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false,
+                                         std::array<int, 2>{0, 0}),
+              TerminalOutcome::LOSS);
+
+    Board mirrored;
+    mirrored.set_clocks(600, 60000, 100, 60000);
+    mirrored.treeMoveMs = 1000;
+    mirrored.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(mirrored.flag_losers(), 1 << Stockfish::BLACK);
+    EXPECT_EQ(classify_terminal_position(mirrored, Stockfish::WHITE, Stockfish::WHITE, false,
+                                         std::array<int, 2>{0, 0}),
+              TerminalOutcome::WIN);
+
+    // An exact tie between the two teams' lowest seats is a draw.
+    Board tied;
+    tied.set_clocks(100, 60000, 100, 60000);
+    tied.treeMoveMs = 1000;
+    tied.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(tied.flag_losers(), both);
+    EXPECT_EQ(classify_terminal_position(tied, Stockfish::WHITE, Stockfish::WHITE, false,
+                                         std::array<int, 2>{0, 0}),
+              TerminalOutcome::DRAW);
+}
+
+// ------------------------------- E1: time advantage from the node's clocks
+
+TEST_F(CustomEngineTest, TimeAdvantageFollowsTreeClocksAtEveryNode) {
+    // After 1. e4 on B the white team is on turn on both boards (A white,
+    // B black), so a double pass charges both of its seats.
+    Board board;
+    board.push_move(BOARD_B, Stockfish::make_move(Stockfish::SQ_E2, Stockfish::SQ_E4));
+    board.set_clocks(10000, 10000, 10000, 11000);
+    board.treeMoveMs = 600;
+    EXPECT_EQ(board.team_time_edge(Stockfish::WHITE), 1000);
+    EXPECT_EQ(board.team_time_edge(Stockfish::BLACK), -1000);
+    // The clocks decide, whatever the root option said.
+    EXPECT_TRUE(board.node_time_advantage(Stockfish::WHITE, Stockfish::WHITE, false));
+    EXPECT_FALSE(board.node_time_advantage(Stockfish::BLACK, Stockfish::WHITE, true));
+
+    std::vector<float> planes(NB_INPUT_VALUES());
+    auto plane31_and_clock_sign = [&](Stockfish::Color team) {
+        board_to_planes(board, planes.data(), team,
+                        board.node_time_advantage(team, Stockfish::WHITE, true));
+        const float plane31 = plane_at(planes, 31);
+        EXPECT_EQ(plane31, plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 31));
+        if constexpr (HAS_CLOCK_PLANES) {
+            // Planes 37 (ours) and 39 (theirs) of both blocks give the same
+            // team edge, scaled; plane 31 has to agree with its sign.
+            const float edge = plane_at(planes, 37) - plane_at(planes, 39)
+                + plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 37)
+                - plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 39);
+            EXPECT_EQ(plane31 == 1.0f, edge > 0.0f);
+        }
+        return plane31;
+    };
+    EXPECT_EQ(plane31_and_clock_sign(Stockfish::WHITE), 1.0f);
+    EXPECT_EQ(plane31_and_clock_sign(Stockfish::BLACK), 0.0f);
+    const uint64_t rootKey = board.search_hash_key(Stockfish::WHITE, true);
+
+    // One double pass by the white team: its edge falls to -200 and the
+    // advantage, plane 31 and the node key all change sides.
+    board.make_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.team_time_edge(Stockfish::WHITE), -200);
+    EXPECT_FALSE(board.node_time_advantage(Stockfish::WHITE, Stockfish::WHITE, true));
+    EXPECT_TRUE(board.node_time_advantage(Stockfish::BLACK, Stockfish::WHITE, true));
+    EXPECT_EQ(plane31_and_clock_sign(Stockfish::BLACK), 1.0f);
+    EXPECT_EQ(plane31_and_clock_sign(Stockfish::WHITE), 0.0f);
+    // The legacy alternation from a root that was ahead would have handed the
+    // black team no advantage here; the node key now says it has one.
+    EXPECT_NE(board.search_hash_key(Stockfish::BLACK,
+                                    board.node_time_advantage(Stockfish::BLACK, Stockfish::WHITE, true)),
+              board.search_hash_key(Stockfish::BLACK, false));
+    board.unmake_moves(Stockfish::MOVE_NONE, Stockfish::MOVE_NONE);
+    EXPECT_EQ(board.search_hash_key(Stockfish::WHITE, true), rootKey);
+
+    // An exact tie is an advantage for neither team.
+    Board even;
+    even.set_clocks(5000, 5000, 5000, 5000);
+    even.treeMoveMs = 100;
+    EXPECT_FALSE(even.node_time_advantage(Stockfish::WHITE, Stockfish::WHITE, true));
+    EXPECT_FALSE(even.node_time_advantage(Stockfish::BLACK, Stockfish::WHITE, true));
+}
+
+TEST_F(CustomEngineTest, FrozenTreeClocksKeepTheLegacyTimeAdvantage) {
+    // TreeMoveMs 0 (or no clocks): the root's TimeAdvantage for the root team
+    // and its negation below, so the planes are the old ones bit for bit.
+    Board board;
+    board.set_clocks(1000, 60000, 60000, 1000);  // white team far behind
+    for (bool rootAdvantage : {false, true}) {
+        EXPECT_EQ(board.node_time_advantage(Stockfish::WHITE, Stockfish::WHITE, rootAdvantage),
+                  rootAdvantage);
+        EXPECT_EQ(board.node_time_advantage(Stockfish::BLACK, Stockfish::WHITE, rootAdvantage),
+                  !rootAdvantage);
+        for (Stockfish::Color team : {Stockfish::WHITE, Stockfish::BLACK}) {
+            const bool legacy = (team == Stockfish::WHITE) == rootAdvantage;
+            std::vector<float> expected(NB_INPUT_VALUES()), actual(NB_INPUT_VALUES());
+            board_to_planes(board, expected.data(), team, legacy);
+            board_to_planes(board, actual.data(), team,
+                            board.node_time_advantage(team, Stockfish::WHITE, rootAdvantage));
+            EXPECT_EQ(std::memcmp(expected.data(), actual.data(),
+                                  expected.size() * sizeof(float)), 0);
+        }
+    }
+    Board plain;
+    EXPECT_TRUE(plain.node_time_advantage(Stockfish::WHITE, Stockfish::WHITE, true));
+    EXPECT_EQ(plain.team_time_edge(Stockfish::WHITE), 0);
+}
+
+// ----------------------------- E1: repetition and rule50 under tree clocks
+
+TEST_F(CustomEngineTest, RepetitionAndRule50AreNotTerminalUnderTreeClocks) {
+    Board board;
+    const auto shuffle = [&](Stockfish::Square from, Stockfish::Square to) {
+        board.push_move(BOARD_A, Stockfish::make_move(from, to));
+    };
+    for (int round = 0; round < 2; ++round) {
+        shuffle(Stockfish::SQ_G1, Stockfish::SQ_F3);
+        shuffle(Stockfish::SQ_G8, Stockfish::SQ_F6);
+        shuffle(Stockfish::SQ_F3, Stockfish::SQ_G1);
+        shuffle(Stockfish::SQ_F6, Stockfish::SQ_G8);
+    }
+    ASSERT_EQ(board.repetition_count(BOARD_A), 3);
+    const std::array<int, 2> searched{2, 0};
+
+    // Stock and frozen clocks: a draw, as before.
+    EXPECT_TRUE(board.is_draw());
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false, searched),
+              TerminalOutcome::DRAW);
+    board.set_clocks(60000, 60000, 60000, 60000);
+    EXPECT_TRUE(board.is_draw(searched));
+
+    // Tree clocks: the repeated line goes on and is scored by its clocks.
+    board.treeMoveMs = 100;
+    EXPECT_FALSE(board.is_draw());
+    EXPECT_FALSE(board.is_draw(searched));
+    EXPECT_FALSE(board.is_repetition_draw(searched));
+    EXPECT_EQ(classify_terminal_position(board, Stockfish::WHITE, Stockfish::WHITE, false, searched),
+              TerminalOutcome::NONE);
+    // The repetition planes still show the count.
+    std::vector<float> planes(NB_INPUT_VALUES());
+    board_to_planes(board, planes.data(), Stockfish::WHITE, false);
+    EXPECT_EQ(plane_at(planes, 35), 1.0f);
+    EXPECT_EQ(plane_at(planes, 36), 1.0f);
+
+    // The fifty-move counter does not end a game under tree clocks either.
+    Board quiet;
+    quiet.set_fen(BOARD_A, "4k3/8/8/8/8/8/8/R3K3[] w - - 100 90");
+    EXPECT_TRUE(quiet.is_draw_on_board(BOARD_A));
+    quiet.set_clocks(60000, 60000, 60000, 60000);
+    quiet.treeMoveMs = 100;
+    EXPECT_FALSE(quiet.is_draw_on_board(BOARD_A));
+}
+
+TEST_F(CustomEngineTest, PositionParsesRepsAndPace) {
+    UCI uci;
+    Board& board = UCIClockTestPeer::board(uci);
+    uci_command(uci, "position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1"
+                     " | rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1"
+                     " clocks 60000 59000 58000 57000 reps 2 3 pace 500 600 700 800");
+    EXPECT_EQ(board.fen(BOARD_A), Board().fen(BOARD_A));
+    EXPECT_EQ(board.repetition_count(BOARD_A), 2);
+    EXPECT_EQ(board.repetition_count(BOARD_B), 3);
+    ASSERT_TRUE(board.has_pace());
+    EXPECT_EQ(board.pace_ms(BOARD_A, Stockfish::WHITE), 500);
+    EXPECT_EQ(board.pace_ms(BOARD_A, Stockfish::BLACK), 600);
+    EXPECT_EQ(board.pace_ms(BOARD_B, Stockfish::WHITE), 700);
+    EXPECT_EQ(board.pace_ms(BOARD_B, Stockfish::BLACK), 800);
+    EXPECT_EQ(board.clock_ms(BOARD_B, Stockfish::BLACK), 57000);
+    std::vector<float> planes(NB_INPUT_VALUES());
+    board_to_planes(board, planes.data(), Stockfish::WHITE, false);
+    EXPECT_EQ(plane_at(planes, 35), 1.0f);
+    EXPECT_EQ(plane_at(planes, 36), 0.0f);
+    EXPECT_EQ(plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 35), 1.0f);
+    EXPECT_EQ(plane_at(planes, NB_INPUT_CHANNELS_PER_BOARD + 36), 1.0f);
+    // The count is part of the node key, as a repetition reached in-tree is.
+    Board fresh;
+    fresh.set_clocks(60000, 59000, 58000, 57000);
+    EXPECT_NE(board.hash_key(), fresh.hash_key());
+
+    // Order does not matter, and 'moves' still ends at the new keywords.
+    uci_command(uci, "position startpos moves 1e2e4 pace 1 2 3 4 clocks 60000 60000 60000 60000");
+    EXPECT_NE(board.last_move(BOARD_A), Stockfish::MOVE_NONE);
+    EXPECT_TRUE(board.has_pace());
+    EXPECT_EQ(board.pace_ms(BOARD_B, Stockfish::BLACK), 4);
+
+    // Without clocks a pace is ignored; a new position clears it.
+    uci_command(uci, "position startpos pace 500 600 700 800");
+    EXPECT_FALSE(board.has_clocks());
+    EXPECT_FALSE(board.has_pace());
+    EXPECT_EQ(board.repetition_count(BOARD_A), 1);
+    uci_command(uci, "position startpos clocks 60000 60000 60000 60000");
+    EXPECT_FALSE(board.has_pace());
+    Board copy(board);
+    EXPECT_FALSE(copy.has_pace());
+}
+
+// ------------------------------------------------- E1/E3: UCI options
+
+TEST_F(CustomEngineTest, MateRaceAndExplorationOptionsDefaultOff) {
+    UCI uci;
+    SearchParams::RuntimeConfig config = UCIClockTestPeer::config(uci);
+    EXPECT_TRUE(config.mateRacePessimism);
+    EXPECT_EQ(config.passExplorationDepth, 0);
+    EXPECT_EQ(config.moveTemperature, 0.0f);
+    EXPECT_EQ(config.rootDirichletAlpha, 0.0f);
+
+    uci_command(uci, "setoption name MateRacePessimism value false");
+    uci_command(uci, "setoption name PassExploration value 2");
+    EXPECT_FALSE(UCIClockTestPeer::config(uci).mateRacePessimism);
+    EXPECT_EQ(UCIClockTestPeer::config(uci).passExplorationDepth, 2);
+    uci_command(uci, "setoption name PassExploration value 9");
+    EXPECT_EQ(UCIClockTestPeer::config(uci).passExplorationDepth, 2);
+
+    // Move temperature: every ply with MoveTemperaturePlies 0, otherwise only
+    // inside the horizon; a fresh seed each search.
+    uci_command(uci, "setoption name MoveTemperaturePermille value 1000");
+    uci_command(uci, "position startpos");
+    const SearchParams::RuntimeConfig first = UCIClockTestPeer::config(uci);
+    EXPECT_FLOAT_EQ(first.moveTemperature, 1.0f);
+    EXPECT_NE(first.moveTemperatureSeed, UCIClockTestPeer::config(uci).moveTemperatureSeed);
+    uci_command(uci, "setoption name MoveTemperaturePlies value 10");
+    EXPECT_FLOAT_EQ(UCIClockTestPeer::config(uci).moveTemperature, 1.0f);
+    const char* lateFen =
+        "position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 30"
+        " | rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 30";
+    uci_command(uci, lateFen);
+    EXPECT_EQ(UCIClockTestPeer::config(uci).moveTemperature, 0.0f);
+
+    // Root noise past OpeningNoisePlies only with RootNoiseAllGame.
+    uci_command(uci, "setoption name OpeningNoise value true");
+    uci_command(uci, "setoption name OpeningNoisePlies value 16");
+    EXPECT_EQ(UCIClockTestPeer::config(uci).rootDirichletAlpha, 0.0f);
+    uci_command(uci, "setoption name RootNoiseAllGame value true");
+    EXPECT_GT(UCIClockTestPeer::config(uci).rootDirichletAlpha, 0.0f);
+    EXPECT_GT(UCIClockTestPeer::config(uci).rootDirichletEpsilon, 0.0f);
+}
+
+TEST_F(CustomEngineTest, JointGeneratorQueuesBothPassActionsFirst) {
+    // Both boards ours (white team after 1. e4 on B), FreePass, the passes
+    // are the least likely actions on each board.
+    g_freePass = true;
+    Board board;
+    board.push_move(BOARD_B, Stockfish::make_move(Stockfish::SQ_E2, Stockfish::SQ_E4));
+    std::vector<Stockfish::Move> actionsA = board.legal_moves(BOARD_A);
+    std::vector<Stockfish::Move> actionsB = board.legal_moves(BOARD_B);
+    actionsA.push_back(Stockfish::MOVE_NONE);
+    actionsB.push_back(Stockfish::MOVE_NONE);
+    std::vector<float> priorsA(actionsA.size()), priorsB(actionsB.size());
+    for (size_t i = 0; i < priorsA.size(); ++i) priorsA[i] = 1.0f / static_cast<float>(i + 1);
+    for (size_t i = 0; i < priorsB.size(); ++i) priorsB[i] = 1.0f / static_cast<float>(i + 1);
+
+    JointCandidateGenerator generator;
+    generator.initialize(actionsA, actionsB, priorsA, priorsB, false, true, true);
+    const JointActionCandidate best = generator.getNext();
+    EXPECT_EQ(best.moveA, actionsA[0]);
+    EXPECT_EQ(best.moveB, actionsB[0]);
+    EXPECT_EQ(generator.queuePassExploration(), 2U);
+    EXPECT_EQ(generator.queuePassExploration(), 0U);  // already queued
+    const JointActionCandidate first = generator.getNext();
+    const JointActionCandidate second = generator.getNext();
+    EXPECT_EQ(first.moveA, Stockfish::MOVE_NONE);
+    EXPECT_EQ(first.moveB, actionsB[0]);
+    EXPECT_EQ(second.moveA, actionsA[0]);
+    EXPECT_EQ(second.moveB, Stockfish::MOVE_NONE);
+    EXPECT_TRUE(generator.isChoicePass(first));
+    EXPECT_FALSE(generator.isChoicePass(best));
+
+    // The rest of the order comes out once, without the queued pair again.
+    size_t generated = 3;
+    while (generator.hasNext()) {
+        const JointActionCandidate next = generator.getNext();
+        EXPECT_FALSE(next.moveA == first.moveA && next.moveB == first.moveB);
+        EXPECT_FALSE(next.moveA == second.moveA && next.moveB == second.moveB);
+        ++generated;
+    }
+    EXPECT_EQ(generated, actionsA.size() * actionsB.size());
+
+    // Without FreePass and time advantage, passing beside a quiet move on the
+    // other board is illegal and nothing is queued.
+    g_freePass = false;
+    JointCandidateGenerator strict;
+    strict.initialize(actionsA, actionsB, priorsA, priorsB, false, true, true);
+    strict.getNext();
+    EXPECT_EQ(strict.queuePassExploration(), 0U);
+}
+
 // --------------------------------------- B, C: think_gain and arrivals heads
 
 #if !defined(HIVEMIND_BACKEND_TENSORRT)
@@ -983,6 +1294,207 @@ TEST_F(CustomEngineTest, V1ClockNetworkStillLoadsInTheClockBuild) {
     ASSERT_TRUE(engine.runInferenceHalf(batch.data(), outputs));
     ASSERT_NE(outputs.thinkGain, nullptr);
     EXPECT_NEAR(__half2float(outputs.thinkGain[2 * 2 + 1]), expectedB, 1e-3);
+}
+
+// ------------------------------------- spec v3 E3/E1: searches on a network
+
+// The tiny fixture network (uniform policy, value 0) by default; set
+// HIVEMIND_PASS_TEST_NETWORK to a real ONNX network of this build's width to
+// run the same checks on it.
+std::string search_test_network() {
+    if (const char* path = std::getenv("HIVEMIND_PASS_TEST_NETWORK"); path && *path) {
+        return path;
+    }
+    return fixture("plain_" + std::to_string(NB_INPUT_CHANNELS) + ".onnx");
+}
+
+struct RecordedPosition {
+    std::string fen;
+    Stockfish::Color team = Stockfish::WHITE;
+    int64_t clocks[4] = {0, 0, 0, 0};
+    int64_t elapsed[2] = {0, 0};
+    int treeMoveMs = 0;
+};
+
+std::vector<RecordedPosition> recorded_positions() {
+    std::vector<RecordedPosition> positions;
+    std::ifstream input(fixture("pass_exploration_positions.tsv"));
+    for (std::string line; std::getline(input, line);) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream fields(line);
+        RecordedPosition position;
+        std::string team, clocks, elapsed, tree;
+        std::getline(fields, position.fen, '\t');
+        std::getline(fields, team, '\t');
+        std::getline(fields, clocks, '\t');
+        std::getline(fields, elapsed, '\t');
+        std::getline(fields, tree, '\t');
+        position.team = team == "white" ? Stockfish::WHITE : Stockfish::BLACK;
+        std::istringstream(clocks) >> position.clocks[0] >> position.clocks[1]
+                                   >> position.clocks[2] >> position.clocks[3];
+        std::istringstream(elapsed) >> position.elapsed[0] >> position.elapsed[1];
+        position.treeMoveMs = std::stoi(tree);
+        positions.push_back(position);
+    }
+    return positions;
+}
+
+void set_recorded(Board& board, const RecordedPosition& position) {
+    board.set(position.fen);
+    board.set_clocks(position.clocks[0], position.clocks[1],
+                     position.clocks[2], position.clocks[3]);
+    board.set_elapsed(position.elapsed[0], position.elapsed[1]);
+    board.treeMoveMs = position.treeMoveMs;
+}
+
+bool is_choice_pass(Board& board, Stockfish::Color team, const JointActionCandidate& action) {
+    const bool canMoveA = board.side_to_move(BOARD_A) == team
+        && board.has_any_legal_move(BOARD_A);
+    const bool canMoveB = board.side_to_move(BOARD_B) == ~team
+        && board.has_any_legal_move(BOARD_B);
+    return (action.moveA == Stockfish::MOVE_NONE && canMoveA)
+        || (action.moveB == Stockfish::MOVE_NONE && canMoveB);
+}
+
+SearchOptions node_search(size_t nodes, const SearchParams::RuntimeConfig& config) {
+    SearchOptions options;
+    options.targetNodes = nodes;
+    options.moveTimeMs = 0;
+    options.verbose = false;
+    options.enablePonder = false;
+    options.search = config;
+    return options;
+}
+
+TEST_F(CustomEngineTest, PassExplorationVisitsAPassAtEveryRecordedRoot) {
+    const std::vector<RecordedPosition> positions = recorded_positions();
+    ASSERT_EQ(positions.size(), 100U);
+    Engine engine(0, SearchParams::BATCH_SIZE);
+    ASSERT_TRUE(engine.loadNetwork(search_test_network(), ""));
+    const std::vector<Engine*> engines = {&engine};
+    g_freePass = true;
+
+    int searched = 0;
+    int withPassVisit[2] = {0, 0};
+    int prunedBelowRaw = 0;
+    int provenMates = 0;
+    for (int depth : {0, 2}) {
+        SearchParams::RuntimeConfig config;
+        config.passExplorationDepth = depth;
+        for (const RecordedPosition& position : positions) {
+            Board board;
+            set_recorded(board, position);
+            Agent agent;
+            agent.run_search(board, engines, position.team, false, node_search(100, config));
+            const std::vector<RootEdgeStats> raw = agent.root_edge_stats(true);
+            const std::vector<RootEdgeStats> target = agent.root_edge_stats();
+            ASSERT_FALSE(raw.empty()) << position.fen;
+            ASSERT_EQ(raw.size(), target.size());
+            bool passVisited = false;
+            int rawTotal = 0, targetTotal = 0;
+            for (size_t i = 0; i < raw.size(); ++i) {
+                if (raw[i].visits > 0 && is_choice_pass(board, position.team, raw[i].action)) {
+                    passVisited = true;
+                }
+                rawTotal += raw[i].visits;
+                targetTotal += target[i].visits;
+                // Pruning only ever takes visits away, and only from passes.
+                EXPECT_LE(target[i].visits, raw[i].visits);
+                if (target[i].visits != raw[i].visits) {
+                    EXPECT_TRUE(is_choice_pass(board, position.team, raw[i].action));
+                }
+            }
+            if (depth == 0) {
+                EXPECT_EQ(targetTotal, rawTotal);
+            } else {
+                ++searched;
+                prunedBelowRaw += targetTotal < rawTotal ? 1 : 0;
+                // A root the mate scan settled is replaced by the one mating
+                // action before any tree is grown; there is nothing to explore.
+                const bool provenMate = raw.size() == 1 && agent.root_q() >= 0.99f;
+                provenMates += provenMate && !passVisited ? 1 : 0;
+                EXPECT_TRUE(passVisited || provenMate)
+                    << "no root visit on a pass: " << position.fen;
+            }
+            withPassVisit[depth == 0 ? 0 : 1] += passVisited ? 1 : 0;
+        }
+    }
+    std::cout << "[ pass exploration ] network " << search_test_network()
+              << ": roots with a visited pass, off " << withPassVisit[0]
+              << "/100, on " << withPassVisit[1] << "/100; targets pruned at "
+              << prunedBelowRaw << "/" << searched << " roots; " << provenMates
+              << " roots settled by the mate scan" << std::endl;
+    EXPECT_EQ(withPassVisit[1] + provenMates, 100);
+}
+
+TEST_F(CustomEngineTest, MoveTemperatureSpreadsThePlayedMove) {
+    Engine engine(0, SearchParams::BATCH_SIZE);
+    ASSERT_TRUE(engine.loadNetwork(search_test_network(), ""));
+    const std::vector<Engine*> engines = {&engine};
+    auto played = [&](float temperature, uint64_t seed) {
+        Board board;
+        SearchParams::RuntimeConfig config;
+        config.moveTemperature = temperature;
+        config.moveTemperatureSeed = seed;
+        // One search thread, so the visit counts (and the argmax) are the
+        // same on every run and only the temperature draw varies.
+        Agent agent(1);
+        const JointActionCandidate action = agent.run_search(
+            board, engines, Stockfish::WHITE, false, node_search(64, config));
+        return static_cast<uint64_t>(action.moveA) << 32 | static_cast<uint32_t>(action.moveB);
+    };
+    std::set<uint64_t> argmax, sampled;
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+        argmax.insert(played(0.0f, seed));
+        sampled.insert(played(1.0f, seed));
+    }
+    EXPECT_EQ(argmax.size(), 1U);
+    EXPECT_GE(sampled.size(), 3U);
+}
+
+TEST_F(CustomEngineTest, TreeReuseSurvivesJitteredClocks) {
+    // reset_tree=False in the arena: no ucinewgame between searches, and the
+    // clocks of the next search differ from the ones the tree predicted.
+    Engine engine(0, SearchParams::BATCH_SIZE);
+    ASSERT_TRUE(engine.loadNetwork(search_test_network(), ""));
+    const std::vector<Engine*> engines = {&engine};
+    g_freePass = true;
+    SearchParams::RuntimeConfig config;
+    Agent agent;
+
+    Board board;
+    board.set_clocks(60000, 60000, 60000, 60000);
+    board.treeMoveMs = 300;
+    const SearchOptions options = node_search(200, config);
+    const JointActionCandidate played =
+        agent.run_search(board, engines, Stockfish::WHITE, false, options);
+    // Think on in the position our move creates, as UCI does, then stop.
+    std::thread brain([&] {
+        agent.run_permanent_brain(board, engines, Stockfish::WHITE, false, played, options);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    agent.set_is_running(false);
+    brain.join();
+
+    // The next search: our move landed, the opponents are to play, and every
+    // clock is off the tree's prediction by some jitter.
+    Board next;
+    next.make_moves(played.moveA, played.moveB);
+    next.set_clocks(60000 - 300 - 37, 60000, 60000 - 300 + 23, 60000);
+    next.treeMoveMs = 300;
+    SearchOptions verbose = node_search(100, config);
+    verbose.verbose = true;
+    std::ostringstream output;
+    std::streambuf* previous = std::cout.rdbuf(output.rdbuf());
+    agent.run_search(next, engines, Stockfish::BLACK, false, verbose);
+    std::cout.rdbuf(previous);
+    const std::string text = output.str();
+    const size_t at = text.find("info string Tree reuse: ");
+    ASSERT_NE(at, std::string::npos) << text.substr(0, 2000);
+    const int recovered = std::stoi(text.substr(at + std::strlen("info string Tree reuse: ")));
+    EXPECT_GT(recovered, 0);
 }
 #endif
 

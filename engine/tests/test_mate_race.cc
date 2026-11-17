@@ -194,6 +194,46 @@ TEST_F(MateRaceTest, InteriorNodeStillAwardsAWaitingMateThatSurvives) {
     EXPECT_EQ(board.uci_move(BOARD_B, continuation.matingMove), "R@c1");
 }
 
+// Spec v3 E1: the same both-sides-mate-in-one node, classified once with
+// White as the root team and once with Black. With the pessimism (default)
+// the root team loses the race from either side, so the two searches disagree
+// about who is winning; with MateRacePessimism off the verdict no longer
+// depends on which team is at the root.
+TEST_F(MateRaceTest, MateRacePessimismOffMakesTheRaceSymmetric) {
+    Board board;
+    board.set_fen(BOARD_A, kFedBoardA);
+    board.set_fen(BOARD_B, kFedBoardB);
+    const std::array<int, 2> searched{1, 1};
+
+    // Black to play holds Nxf2 mate on A; White waits with R@c1 mate on B.
+    const TerminalOutcome whiteRoot = classify_terminal_position(
+        board, Stockfish::BLACK, Stockfish::WHITE, true, searched);
+    const TerminalOutcome blackRoot = classify_terminal_position(
+        board, Stockfish::BLACK, Stockfish::BLACK, false, searched);
+    EXPECT_EQ(whiteRoot, TerminalOutcome::NONE);
+    EXPECT_EQ(blackRoot, TerminalOutcome::LOSS);
+
+    for (const auto& [rootTeam, rootAdvantage] :
+         {std::pair{Stockfish::WHITE, true}, std::pair{Stockfish::BLACK, false}}) {
+        EXPECT_EQ(classify_terminal_position(
+                      board, Stockfish::BLACK, rootTeam, rootAdvantage, searched,
+                      nullptr, false, false, nullptr, false),
+                  TerminalOutcome::NONE);
+    }
+
+    // A waiting mate that survives every reply is still a loss either way.
+    Board survives;
+    survives.set_fen(BOARD_A, kFedBoardANoMate);
+    survives.set_fen(BOARD_B, kFedBoardB);
+    for (const auto& [rootTeam, rootAdvantage] :
+         {std::pair{Stockfish::WHITE, true}, std::pair{Stockfish::BLACK, false}}) {
+        EXPECT_EQ(classify_terminal_position(
+                      survives, Stockfish::BLACK, rootTeam, rootAdvantage, searched,
+                      nullptr, false, false, nullptr, false),
+                  TerminalOutcome::LOSS);
+    }
+}
+
 TEST_F(MateRaceTest, SpentBudgetRaisesNoVeto) {
     Board board;
     board.set_fen(BOARD_A, kRaceBoardA);
