@@ -44,6 +44,10 @@ struct SearchOptions {
     bool background = false;
     
     SearchParams::RuntimeConfig search;
+
+    // Called on the search thread right before a verbose search prints its
+    // bestmove line ('go ... sample' uses it to print the training sample).
+    std::function<void()> beforeBestmove;
     
     // Convenience constructors
     static SearchOptions uci(int moveTimeMs, int multiPV = 1, bool isPonder = false) {

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -136,6 +137,20 @@ TerminalOutcome classify_terminal_position(Board& board,
     const bool teamToPlayHasTimeAdvantage = teamToPlay == rootTeam
         ? rootTeamHasTimeAdvantage
         : !rootTeamHasTimeAdvantage;
+
+    // TreeMoveMs: a clock that ran out inside the tree ends the game like a
+    // checkmate. Both teams out on the same macro-ply is scored as a draw.
+    if (const int flags = board.flagged_teams()) {
+        const bool weFlagged = flags & (1 << teamToPlay);
+        const bool theyFlagged = flags & (1 << ~teamToPlay);
+        if (weFlagged && theyFlagged) {
+            return TerminalOutcome::DRAW;
+        }
+        if (endInPly) {
+            *endInPly = 1;
+        }
+        return weFlagged ? TerminalOutcome::LOSS : TerminalOutcome::WIN;
+    }
     Board::LegalMoveCache legalMoveCache;
 
     if (board.is_checkmate(
@@ -370,12 +385,17 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         }
     }
 
+    // Every trajectory entry after the root was applied with make_moves, a
+    // double pass included, so each one is unmade (a double pass only refunds
+    // tree clocks; without them unmake_moves(pass, pass) is a no-op). The root
+    // entry carries no action and was never made.
     auto restore_selection = [&]() {
         cancel_virtual_losses(trajectoryBuffer);
         for (auto it = trajectoryBuffer.rbegin();
              it != trajectoryBuffer.rend(); ++it) {
             const JointActionCandidate& action = it->action;
-            if (action.moveA != Stockfish::MOVE_NONE
+            if (std::next(it) != trajectoryBuffer.rend()
+                || action.moveA != Stockfish::MOVE_NONE
                 || action.moveB != Stockfish::MOVE_NONE) {
                 board.unmake_moves(action.moveA, action.moveB);
             }
@@ -494,7 +514,7 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             batchContexts.push_back(std::move(ctx));
             for (auto it = trajectoryBuffer.rbegin(); it != trajectoryBuffer.rend(); ++it) {
                 const JointActionCandidate& action = it->action;
-                if (action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
+                if (std::next(it) != trajectoryBuffer.rend() || action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
                     board.unmake_moves(action.moveA, action.moveB);
                 }
             }
@@ -533,7 +553,7 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             batchContexts.push_back(std::move(ctx));
             for (auto it = trajectoryBuffer.rbegin(); it != trajectoryBuffer.rend(); ++it) {
                 const JointActionCandidate& action = it->action;
-                if (action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
+                if (std::next(it) != trajectoryBuffer.rend() || action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
                     board.unmake_moves(action.moveA, action.moveB);
                 }
             }
@@ -591,7 +611,7 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         // Undo moves to restore board for next selection
         for (auto it = trajectoryBuffer.rbegin(); it != trajectoryBuffer.rend(); ++it) {
             const JointActionCandidate& action = it->action;
-            if (action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
+            if (std::next(it) != trajectoryBuffer.rend() || action.moveA != Stockfish::MOVE_NONE || action.moveB != Stockfish::MOVE_NONE) {
                 board.unmake_moves(action.moveA, action.moveB);
             }
         }

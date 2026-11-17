@@ -782,6 +782,9 @@ struct RuntimeConfig {
     int jointPolicyTopK = JOINT_POLICY_TOP_K;
     int rootJointPolicyTopK = ROOT_JOINT_POLICY_TOP_K;
     float jointPolicyResidualScale = JOINT_POLICY_RESIDUAL_SCALE;
+    // MateProbeAnyTime (UCI, default off): run the root Fairy-Stockfish mate
+    // probe even when the team is not ahead on time.
+    bool mateProbeAnyTime = false;
 };
 
 // =============================================================================

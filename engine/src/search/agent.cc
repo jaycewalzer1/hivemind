@@ -4804,8 +4804,14 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 options.search.internalMateProbeMode);
         const bool certifyOnly = options.search.internalMateProbeMode
             == SearchParams::InternalMateProbeMode::CERTIFY_ONLY;
+        // Stock runs the root probe only when ahead on time, because its
+        // single-board mates pass on the other board. MateProbeAnyTime lifts
+        // that gate under FreePass, where such a pass is always legal; without
+        // FreePass a probed mate could need an illegal pass, so it stays off.
+        const bool rootProbeAllowed = teamHasTimeAdvantage
+            || (options.search.mateProbeAnyTime && g_freePass);
         if (!runRootScan || !options.search.enableMateProbe
-            || (!teamHasTimeAdvantage && !runInternalProbe
+            || (!rootProbeAllowed && !runInternalProbe
                 && !runConcurrentVerifier)) {
             return;
         }
@@ -4815,14 +4821,14 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         const uint64_t internalProbeNodeBudget = runInternalProbe
             ? std::min<uint64_t>(
                   SearchParams::INTERNAL_MATE_PROBE_NODE_BUDGET,
-                  teamHasTimeAdvantage
+                  rootProbeAllowed
                       ? totalProbeNodeBudget
                           * (100 - SearchParams::
                               INTERNAL_MATE_PROBE_ROOT_NODE_SHARE_PERCENT)
                           / 100
                       : totalProbeNodeBudget)
             : 0;
-        const uint64_t rootProbeNodeBudget = teamHasTimeAdvantage
+        const uint64_t rootProbeNodeBudget = rootProbeAllowed
             ? totalProbeNodeBudget - internalProbeNodeBudget : 0;
         const int totalProbeBudgetMs = options.completeMateProbe
             ? 0
@@ -4830,7 +4836,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             ? std::max(1, moveTimeMs - static_cast<int>(searchInfo.elapsed()))
             : SearchParams::MATE_PROBE_UNTIMED_BUDGET_MS;
         const int rootProbeBudgetMs = runInternalProbe
-                && teamHasTimeAdvantage && totalProbeBudgetMs > 0
+                && rootProbeAllowed && totalProbeBudgetMs > 0
             ? std::max(
                   1, totalProbeBudgetMs
                       * SearchParams::internal_mate_probe_root_time_percent(
@@ -4848,6 +4854,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         rootProbeThread = thread(
             [&, rootProbeNodeBudget, internalProbeNodeBudget,
              rootProbeBudgetMs, runInternalProbe, certifyOnly, probeRoot,
+             rootProbeAllowed,
              probeBoard = std::move(probeBoard)]() mutable {
                 JointActionCandidate action;
                 int plyToMate = 0;
@@ -4874,7 +4881,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 try {
                     const bool rootFound = rootProbeNodeBudget > 0
                         && probe_position_mate(
-                            *probeBoard, teamSide, teamHasTimeAdvantage,
+                            *probeBoard, teamSide, rootProbeAllowed,
                             rootProbeNodeBudget, rootProbeBudgetMs, rootSettled,
                             action, plyToMate, pv,
                             publish, options.search.drawContempt > 0.0f);
@@ -5474,6 +5481,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             cout << "info depth " << plyToMate << " score mate " << mateScore
                  << " nodes 1 nps 1000 time 0 pv "
                  << (proofPv.empty() ? bestMoveStr : proofPv) << endl;
+            if (options.beforeBestmove) {
+                options.beforeBestmove();
+            }
             cout << "bestmove " << bestMoveStr << endl;
             if (const string scanSummary = root_scan_summary();
                 !scanSummary.empty()) {
@@ -5699,6 +5709,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             cout << "info depth " << rootLossPly << " score mate -"
                  << mateScore << " nodes 1 nps 1000 time 0 pv "
                  << (proofPv.empty() ? bestMoveStr : proofPv) << endl;
+            if (options.beforeBestmove) {
+                options.beforeBestmove();
+            }
             cout << "bestmove " << bestMoveStr << endl;
             if (const string scanSummary = root_scan_summary();
                 !scanSummary.empty()) {
@@ -6442,6 +6455,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 + ")"
             : extract_best_move(board);
         string ponderMoveStr = options.enablePonder ? extract_ponder_move(board) : "";
+        if (options.beforeBestmove) {
+            options.beforeBestmove();
+        }
         if (!ponderMoveStr.empty()) {
             cout << "bestmove " << bestMoveStr << " ponder " << ponderMoveStr << endl;
         } else {
