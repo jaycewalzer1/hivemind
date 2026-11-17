@@ -86,6 +86,14 @@ Board::Board(const Board& board) {
     repetitionFingerprint[1] = board.repetitionFingerprint[1];
     moveHistory[0] = board.moveHistory[0];
     moveHistory[1] = board.moveHistory[1];
+
+    hasClocks = board.hasClocks;
+    for (int b = 0; b < 2; ++b) {
+        clockMs[b][0] = board.clockMs[b][0];
+        clockMs[b][1] = board.clockMs[b][1];
+    }
+    treeMoveMs = board.treeMoveMs;
+    treeClockPlies = board.treeClockPlies;
 }
 
 // Executes a move on the board and updates the corresponding state.
@@ -303,6 +311,13 @@ bool Board::is_checkmate(Stockfish::Color side,
         }
     }
 
+    // Free mode: a stuck board (stalemate, or a blockable check with no move)
+    // is not a loss. The team simply waits, as the arena allows; only the
+    // unblockable checkmate above ends the game.
+    if (g_freePass) {
+        return false;
+    }
+
     // If the team has no legal move, it loses unless time advantage makes
     // double-sit legal. Double-sit is still forbidden when both boards are on turn.
     if (isOnTurnOnA || isOnTurnOnB) {
@@ -338,6 +353,21 @@ bool Board::can_partner_provide_blocking_piece(int board_in_check, Stockfish::Co
     // Check if it's currently partner's turn
     bool is_partner_turn = (pos[partner_board]->side_to_move() == partner_side);
     
+    if (g_freePass) {
+        // Free mode follows the arena's mate rule (arena/state.py
+        // is_bughouse_mate): a single sliding check with an empty square
+        // between king and checker can always be blocked by a later drop,
+        // whatever the clocks, TimeAdvantage or the partner's turn.
+        const Stockfish::Bitboard freeCheckers = pos[board_in_check]->checkers();
+        if (!freeCheckers || Stockfish::more_than_one(freeCheckers)) {
+            return false;
+        }
+        const Stockfish::Square freeKsq =
+            pos[board_in_check]->square<Stockfish::KING>(checked_side);
+        return (Stockfish::between_bb(freeKsq, Stockfish::lsb(freeCheckers))
+                & ~pos[board_in_check]->pieces()) != 0;
+    }
+
     // If it's not partner's turn and we don't have time advantage, they can't help
     // But if we have time advantage, they might capture something in the future
     if (!is_partner_turn && !teamHasTimeAdvantage && !assumePartnerCanBlock) {
@@ -470,6 +500,13 @@ void Board::make_moves(Stockfish::Move moveA, Stockfish::Move moveB) {
         moveHistory[boardNum].push_back(move);
     };
 
+    if (tree_clocks_active()) {
+        // One macro-ply: the seat on turn on each board spends treeMoveMs,
+        // whether it moves or passes.
+        clockMs[BOARD_A][side_to_move(BOARD_A)] -= treeMoveMs;
+        clockMs[BOARD_B][side_to_move(BOARD_B)] -= treeMoveMs;
+        ++treeClockPlies;
+    }
     apply_move(BOARD_A, moveA);
     apply_move(BOARD_B, moveB);
 }
@@ -491,4 +528,9 @@ void Board::unmake_moves(Stockfish::Move moveA, Stockfish::Move moveB) {
 
     undo_move(BOARD_B, moveB);
     undo_move(BOARD_A, moveA);
+    if (tree_clocks_active()) {
+        clockMs[BOARD_A][side_to_move(BOARD_A)] += treeMoveMs;
+        clockMs[BOARD_B][side_to_move(BOARD_B)] += treeMoveMs;
+        --treeClockPlies;
+    }
 }

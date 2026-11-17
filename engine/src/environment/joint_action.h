@@ -19,6 +19,11 @@
 inline bool is_double_sit_legal(bool teamHasTimeAdvantage,
                                 bool boardAOnTurn,
                                 bool boardBOnTurn) {
+    if (g_freePass) {
+        // Passing is a free choice on every board the team is on turn, and
+        // the only action on a board where it is not.
+        return true;
+    }
     return teamHasTimeAdvantage && (boardAOnTurn != boardBOnTurn);
 }
 
@@ -32,6 +37,9 @@ inline bool is_single_pass_legal(bool teamHasTimeAdvantage,
                                  bool boardAOnTurn,
                                  bool boardBOnTurn,
                                  bool partnerMoveIsCapture) {
+    if (g_freePass) {
+        return true;
+    }
     return teamHasTimeAdvantage
         || !(boardAOnTurn && boardBOnTurn)
         || partnerMoveIsCapture;
