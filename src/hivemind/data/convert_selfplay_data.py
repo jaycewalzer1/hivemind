@@ -103,6 +103,9 @@ DEFAULT_RL_SAMPLES_PER_SHARD = 4096
 # Spec v3 defaults for clock-build data (more than NB_INPUT_CHANNELS channels).
 DEFAULT_CLOCK_Q_VALUE_RATIO = 0.2
 DEFAULT_CLOCK_WEIGHT_NODES_REF = 400
+# Roots searched with fewer nodes than this keep r = 0 (value target = outcome): a root the mate scan settled after
+# one node carries root_q = +-1 even where the defender could sit (audit 2026-11-17, WP-D minor).
+DEFAULT_CLOCK_Q_MIN_NODES = 16
 NON_TRAINING_REASONS = ("aborted", "max_plies")
 CLOCK_SEAT_ORDER = ("A_white", "A_black", "B_white", "B_black")
 CLOCKS_MASK_BIT = 1
@@ -125,6 +128,13 @@ def resolve_weight_nodes_ref(weight_nodes_ref, input_channels: int) -> float:
     if weight_nodes_ref is not None:
         return float(weight_nodes_ref)
     return float(DEFAULT_CLOCK_WEIGHT_NODES_REF) if is_clock_data(input_channels) else 0.0
+
+
+def resolve_q_min_nodes(q_min_nodes, input_channels: int) -> int:
+    """None -> 16 for clock-build data, 0 (root_q always blended) for stock data."""
+    if q_min_nodes is not None:
+        return int(q_min_nodes)
+    return DEFAULT_CLOCK_Q_MIN_NODES if is_clock_data(input_channels) else 0
 
 
 def sample_weight(nodes: float, weight_nodes_ref: float) -> float:
@@ -312,13 +322,15 @@ def read_binary_shard(
     weight_nodes_ref: float | None = None,
     drop_non_training: bool = False,
     mask_arrivals_past_end: bool = False,
+    q_min_nodes: int | None = None,
 ) -> list[dict]:
     """Read one HVM3, HVM4, HVM5 or HVM6 chunk and return its samples.
 
     The plane width comes from the chunk header and may be 74, 82, 86 or 88 channels.
     input_channels, when given, makes any other width an error.
     q_value_ratio / weight_nodes_ref: None picks the default for the chunk's
-    width (resolve_q_value_ratio, resolve_weight_nodes_ref).
+    width (resolve_q_value_ratio, resolve_weight_nodes_ref). q_min_nodes (None:
+    resolve_q_min_nodes): roots searched with fewer nodes blend no root_q.
     sidecar: "auto" reads <chunk>.pos.jsonl when present; a list of dicts (one
     per sample) or None. drop_non_training / mask_arrivals_past_end use the
     sidecar's reason / gameEndMs (convert_to_split_parquet turns both on for
@@ -354,6 +366,7 @@ def read_binary_shard(
         
         q_value_ratio = resolve_q_value_ratio(q_value_ratio, channels)
         weight_nodes_ref = resolve_weight_nodes_ref(weight_nodes_ref, channels)
+        q_min_nodes = resolve_q_min_nodes(q_min_nodes, channels)
         if metas is not None and len(metas) != num_samples:
             raise ValueError(
                 f"Sidecar of {filepath} has {len(metas)} lines for {num_samples} samples"
@@ -410,7 +423,8 @@ def read_binary_shard(
             clocks_ms, elapsed_ms, clock_mask = exact_clock_scalars(meta)
             nodes_searched = int(meta.get("nodes_searched") or nodes) if meta else int(nodes)
 
-            blended_value = (1.0 - q_value_ratio) * float(outcome) + q_value_ratio * float(root_q)
+            r = q_value_ratio if nodes_searched >= q_min_nodes else 0.0
+            blended_value = (1.0 - r) * float(outcome) + r * float(root_q)
 
             samples.append({
                 'x': planes,
@@ -581,6 +595,7 @@ def convert_to_split_parquet(
     split_by: str = "auto",
     dedupe_validation: bool | None = None,
     weight_nodes_ref: float | None = None,
+    q_min_nodes: int | None = None,
 ) -> tuple[Path, Path, int, int]:
     """Convert HVM chunks directly into game-disjoint train/validation shards.
 
@@ -689,6 +704,7 @@ def convert_to_split_parquet(
         q_value_ratio=q_value_ratio,
         input_channels=input_channels,
         weight_nodes_ref=weight_nodes_ref,
+        q_min_nodes=q_min_nodes,
         drop_non_training=clock_data,
         mask_arrivals_past_end=clock_data,
     )
@@ -706,9 +722,16 @@ def convert_to_split_parquet(
                 )
             add("val" if is_val else "train", sample, (run_id, sample["game_id"]), True)
 
+    replay_val_skipped = 0
     for binary_file in tqdm(selected_replay_files, desc="Adding replay chunks"):
         run_id = _selfplay_run_id(binary_file)
         for sample in read_binary_shard(binary_file, **read_kw):
+            # The opening split keeps the same opening pairs in validation every iteration (fixed split_seed):
+            # replayed games from those openings stay out of training, or validation leaks through replay.
+            if (effective_split == "opening" and sample["opening"]
+                    and is_validation_key(sample["opening"], validation_fraction, split_seed)):
+                replay_val_skipped += 1
+                continue
             add("train", sample, (run_id, sample["game_id"]), False)
 
     flush("train")
@@ -742,7 +765,9 @@ def convert_to_split_parquet(
         "split_by": effective_split,
         "q_value_ratio": q_value_ratio,
         "weight_nodes_ref": weight_nodes_ref,
+        "q_min_nodes": resolve_q_min_nodes(q_min_nodes, input_channels),
         "replay_dirs": [str(d) for d in replay_dirs],
+        "replay_samples_skipped_validation_opening": replay_val_skipped,
         "replay_chunks": len(selected_replay_files),
         "val_planes_also_in_train": len(shared),
         "val_samples_dropped_as_duplicates": dropped,

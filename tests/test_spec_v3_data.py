@@ -210,3 +210,38 @@ def test_sample_weights_reach_the_streaming_loader(tmp_path):
     assert len(items) == 2 * n_train and all(len(item) == 11 for item in items)
     assert float(items[0][-1]) == float(items[1][-1]) == pytest.approx(min(1.0, 40 * (gids[0] + 1) / 400))
     assert not math.isnan(float(items[0][-1]))
+
+
+def test_replay_keeps_validation_openings_out_of_training(tmp_path):
+    """Audit 2026-11-17: the opening split puts the same openings in validation every iteration (fixed split
+    seed); replayed games from those openings went into training unchecked."""
+    src = tmp_path / "it03"
+    src.mkdir()
+    openings = [f"pair{i}" for i in range(12)]
+    _chunk(src / "chunk_r3_000000.hvm", [_sample(g, seed=g) for g in range(48)],
+           [_meta(g, openings[g % 12]) for g in range(48)])
+    old = tmp_path / "it02"
+    old.mkdir()
+    _chunk(old / "chunk_r2_000000.hvm", [_sample(500 + g, seed=500 + g) for g in range(12)],
+           [_meta(500 + g, openings[g]) for g in range(12)])
+    train, _, _, _ = convert_to_split_parquet(src, tmp_path / "rl", validation_fraction=0.3, split_seed=3,
+                                              replay_input_dir=[old])
+    tr = pl.concat([pl.read_parquet(p) for p in train.glob("*.parquet")])
+    assert not any(is_validation_key(o, 0.3, 3) for o in tr["opening"])
+    report = json.loads((tmp_path / "rl" / "report.json").read_text())
+    n_val_openings = sum(is_validation_key(o, 0.3, 3) for o in openings)
+    assert report["split_by"] == "opening" and 0 < n_val_openings < 12
+    assert report["replay_samples_skipped_validation_opening"] == n_val_openings
+
+
+def test_shallow_roots_blend_no_root_q(tmp_path):
+    """Audit 2026-11-17: a root the mate scan settled after one node has root_q +-1 even where the defender
+    could sit; below q_min_nodes (16 for clock data) the value target is the outcome alone."""
+    path = tmp_path / "chunk_r_000000.hvm"
+    _chunk(path, [_sample(1, nodes=100, root_q=1.0, outcome=-1), _sample(1, nodes=100, root_q=1.0, outcome=-1)],
+           [_meta(1, "o", nodes_searched=1), _meta(1, "o", nodes_searched=40)])
+    shallow, deep = read_binary_shard(path)
+    assert shallow["y_value"] == -1.0 and shallow["root_q"] == 1.0
+    assert deep["y_value"] == pytest.approx(0.8 * -1 + 0.2 * 1.0)
+    shallow, _ = read_binary_shard(path, q_min_nodes=0)
+    assert shallow["y_value"] == pytest.approx(-0.6)
