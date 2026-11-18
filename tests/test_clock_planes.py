@@ -307,3 +307,42 @@ def test_stock_flip_is_unchanged():
     x = torch.arange(74 * 64, dtype=torch.float32).view(74, 8, 8)
     flipped, _, _ = flip_bughouse_sample(x, torch.zeros(1), torch.zeros(1))
     assert torch.equal(flipped[:37], x[37:]) and torch.equal(flipped[37:], x[:37])
+
+
+@pytest.mark.parametrize("team", [0, 1])
+def test_flip_rebuilds_the_diagonal_plane_from_the_swapped_clocks(team):
+    """Audit 2026-11-17 blocker: the diagonal plane is ours-on-A minus the
+    partner's opponent, so a board swap must recompute it, not carry it."""
+    from hivemind.constants import (
+        CLOCK_CHANNEL_OFFSET, DIAGONAL_CHANNEL_OFFSET, DIAGONAL_SCALE_S,
+        NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD)
+    from hivemind.training.data_loaders import rebuild_clock_planes
+    per_board = NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD
+    x = torch.zeros(1, 2 * per_board, 8, 8)
+    clocks = torch.tensor([[60000.0, 30000.0, 50000.0, 10000.0]])  # Aw Ab Bw Bb
+    rebuild_clock_planes(x, clocks, torch.zeros(1, 2), torch.tensor([1]),
+                         torch.tensor([team]))
+    aw, ab, bw, bb = (60.0, 30.0, 50.0, 10.0)
+    ours_a, theirs_a, ours_b, theirs_b = (aw, ab, bb, bw) if team == 0 else (ab, aw, bw, bb)
+    assert float(x[0, DIAGONAL_CHANNEL_OFFSET, 0, 0]) == pytest.approx(
+        math.tanh((ours_a - theirs_b) / DIAGONAL_SCALE_S), abs=1e-5)
+
+    flipped, _, _ = flip_bughouse_sample(x[0], torch.zeros(4672), torch.zeros(4672))
+    expected = math.tanh((ours_b - theirs_a) / DIAGONAL_SCALE_S)
+    for base in (0, per_board):
+        assert float(flipped[base + DIAGONAL_CHANNEL_OFFSET].min()) == pytest.approx(expected, abs=1e-5)
+        assert float(flipped[base + DIAGONAL_CHANNEL_OFFSET].max()) == pytest.approx(expected, abs=1e-5)
+    # The swapped clock planes say the same thing.
+    c = CLOCK_CHANNEL_OFFSET
+    assert float(flipped[c, 0, 0]) == pytest.approx(ours_b / 300.0, abs=1e-6)
+    assert float(flipped[per_board + c + 2, 0, 0]) == pytest.approx(theirs_a / 300.0, abs=1e-6)
+    # Flipping twice gives the original sample back.
+    again, _, _ = flip_bughouse_sample(flipped, torch.zeros(4672), torch.zeros(4672))
+    assert torch.allclose(again, x[0], atol=1e-5)
+
+
+@pytest.mark.parametrize("seconds", [0.0, 0.4, 9.0, 45.0, 120.0, 299.0, 450.0])
+def test_clock_ms_from_planes_inverts_the_clock_planes(seconds):
+    from hivemind.training.data_loaders import clock_ms_from_planes, clock_plane_tensors
+    lin, decay = clock_plane_tensors(torch.tensor([seconds * 1000.0]))
+    assert float(clock_ms_from_planes(lin, decay)[0]) == pytest.approx(seconds * 1000.0, abs=5.0)

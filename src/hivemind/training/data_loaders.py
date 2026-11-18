@@ -184,6 +184,36 @@ def _normalize_input_planes(x_tensor: torch.Tensor) -> torch.Tensor:
     return x_tensor / 255.0
 
 
+def clock_ms_from_planes(lin: torch.Tensor, decay: torch.Tensor) -> torch.Tensor:
+    """Remaining ms from a block's (min(t/300, 1), exp(-t/10)) clock planes.
+
+    Inverts clock_plane_tensors: the exp plane is the precise one up to ~46 s
+    (and the only fine one in uint8 planes), the linear plane below 300 s, the
+    exp plane again above (until it underflows, ~1000 s in float32).
+    """
+    lin = lin.double()
+    decay = decay.double()
+    from_decay = -10.0 * torch.log(decay.clamp_min(1e-300))
+    from_lin = 300.0 * lin
+    seconds = torch.where(
+        decay >= 0.01, from_decay,
+        torch.where(lin < 1.0, from_lin, torch.where(decay > 0, from_decay,
+                                                     torch.full_like(lin, 1e4))))
+    return (seconds.clamp_min(0.0) * 1000.0)
+
+
+def _rebuild_flipped_diagonal(flipped_x: torch.Tensor, per_board: int) -> None:
+    """Set channel DIAGONAL_CHANNEL_OFFSET of both blocks of one (C, 8, 8)
+    sample to tanh((ours on A - theirs on B) / s) from its own clock planes."""
+    c = CLOCK_CHANNEL_OFFSET
+    ours_a = clock_ms_from_planes(flipped_x[c, 0, 0], flipped_x[c + 1, 0, 0])
+    theirs_b = clock_ms_from_planes(flipped_x[per_board + c + 2, 0, 0],
+                                    flipped_x[per_board + c + 3, 0, 0])
+    value = diagonal_plane_tensor(ours_a, theirs_b).to(flipped_x.dtype)
+    for base in (0, per_board):
+        flipped_x[base + DIAGONAL_CHANNEL_OFFSET] = value
+
+
 def flip_bughouse_sample(x, policy_a, policy_b):
     """
     Apply bughouse board flip augmentation by swapping the two boards.
@@ -214,7 +244,12 @@ def flip_bughouse_sample(x, policy_a, policy_b):
     offset = board_channels_from_total(total_channels)
     flipped_x[:offset] = x[offset:total_channels]
     flipped_x[offset:total_channels] = x[:offset]
-    
+    if offset >= NUM_DIAGONAL_BUGHOUSE_CHANNELS_PER_BOARD:
+        # The diagonal plane (same value in both blocks) is ours-on-A minus
+        # the partner's opponent; swapping the blocks changes both seats, so
+        # rebuild it from the swapped clock planes.
+        _rebuild_flipped_diagonal(flipped_x, offset)
+
     # Swap the policy distributions (NO MIRRORING - just swap)
     # What was Board B becomes Board A -> use policy_b as-is
     # What was Board A becomes Board B -> use policy_a as-is
