@@ -143,7 +143,9 @@ std::optional<GameResult> BughouseState::advance_clocks(int64_t nowMs) {
     const int64_t elapsed = std::max<int64_t>(0, nowMs - lastMs);
     lastMs = std::max(lastMs, nowMs);
     // The clock with less time left before the charge ran out first and loses;
-    // an exact tie is a double flag, a draw (state.py, spec v3 D4).
+    // an exact tie is a double flag, a draw (state.py, spec v3 D4), when the two
+    // seats are on different teams; two partners flagging together lose for
+    // their team (board.h flag_losers).
     int flagged = 0;
     int64_t bestBefore = 0;
     int loser = -1;
@@ -153,7 +155,8 @@ std::optional<GameResult> BughouseState::advance_clocks(int64_t nowMs) {
         const int64_t before = clocks[seat];
         clocks[seat] = std::max<int64_t>(0, before - elapsed);
         if (clocks[seat] == 0) {
-            if (flagged && before == bestBefore) tie = true;
+            if (flagged && before == bestBefore &&
+                std::string(TEAMS[seat]) != TEAMS[loser]) tie = true;
             if (!flagged || before < bestBefore) {
                 bestBefore = before;
                 loser = seat;
@@ -288,7 +291,10 @@ bool Simulator::advance() {
         for (int b = 0; b < 2; ++b) {
             const int seat = st_.to_move(b);
             if (st_.clocks[seat] <= 0) {
-                res = res ? GameResult{"draw", "double_flag", -1, -1} : GameResult{TEAMS[opponent_of(seat)], "flag", b, seat};
+                // Two flagged seats are a draw only across teams (state.py, sim.py).
+                if (!res) res = GameResult{TEAMS[opponent_of(seat)], "flag", b, seat};
+                else if (res->loserSeat >= 0 && std::string(TEAMS[res->loserSeat]) != TEAMS[seat])
+                    res = GameResult{"draw", "double_flag", -1, -1};
             }
         }
     }
