@@ -54,7 +54,7 @@ networks under the same wave 2 options. The headline numbers vs **stock** v3 (it
 `upstream` kind, at 120 s and 180 s) are the arena's job (`cluster/launch_checks.sh` wave2 group), not the loop's.
 
 Ablations: every option has its own flag (`--durative-tree false`, `--sit-gate true`, `--instant-transfer true`,
-`--mate-race-by-landing false`, `--pass-cap-k N`, `--base-mix ...`, `--seat-move-times false`). Without `--wave2` the
+`--mate-race-by-landing true` (off in the preset: it switches off the root mate provers and cost drop mates with the gate off, talisman docs/wave2_local_check.md), `--pass-cap-k N`, `--base-mix ...`, `--seat-move-times false`). Without `--wave2` the
 same flags apply on top of stock v3, so `--durative-tree true` alone is a one-option run.
 
 `--distributed` is refused with wave 2 options: work orders do not carry them to `hivemind contribute` yet.

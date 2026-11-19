@@ -29,7 +29,7 @@ def test_wave2_preset_sends_every_changed_option():
     args = wave2.WAVE2.engine_args()
     pairs = dict(zip(args[::2], args[1::2]))
     assert pairs == {"--durative-tree": "true", "--sit-gate": "false", "--flag-loss": "true",
-                     "--instant-transfer": "false", "--mate-race-by-landing": "true",
+                     "--instant-transfer": "false",
                      "--base-mix": "60000:0.25,120000:0.25,180000:0.35,300000:0.15",
                      "--seat-move-times": "true"}
 
@@ -71,7 +71,7 @@ def test_bad_base_mix_is_refused(text):
 
 def test_missing_options_are_read_off_the_engine_help():
     assert wave2.missing_engine_options(wave2.WAVE2, "--durative-tree --sit-gate --flag-loss") == [
-        "--instant-transfer", "--mate-race-by-landing", "--base-mix", "--seat-move-times"]
+        "--instant-transfer", "--base-mix", "--seat-move-times"]
     assert wave2.missing_engine_options(wave2.STOCK, "") == []
 
 

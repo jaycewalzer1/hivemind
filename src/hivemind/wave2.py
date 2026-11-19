@@ -93,8 +93,11 @@ class Options:
 
 
 STOCK = Options()
+# MateRaceByLanding stays off: it switches off the engine's root mate provers,
+# and with the gate off the tree then passed instead of mating in won positions
+# (talisman docs/wave2_local_check.md). --mate-race-by-landing true ablates it.
 WAVE2 = Options(durative_tree=True, sit_gate=False, flag_loss=True, instant_transfer=False,
-                mate_race_by_landing=True, pass_cap_k=8, base_mix=DEFAULT_BASE_MIX,
+                mate_race_by_landing=False, pass_cap_k=8, base_mix=DEFAULT_BASE_MIX,
                 seat_move_times=True)
 
 # The engine flags rl-loop overrides, by Options field.
@@ -124,7 +127,7 @@ def add_arguments(parser):
                   "Each option overrides the --wave2 preset; without --wave2 they override stock v3.")
     group.add_argument("--wave2", action="store_true",
                        help="Self-play and matches with the wave 2 preset: durative tree, sit gate off, "
-                            "flag loss, delayed transfer, mate races by landing, pass cap 8, base mix "
+                            "flag loss, delayed transfer, pass cap 8, base mix "
                             f"{format_base_mix(DEFAULT_BASE_MIX)}, per-seat move times")
     for name in BOOLEAN_FIELDS:
         group.add_argument("--" + name.replace("_", "-"), choices=("true", "false"), default=None)
