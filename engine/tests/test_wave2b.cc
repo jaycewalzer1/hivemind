@@ -263,6 +263,21 @@ TEST_F(Wave2bTest, PocketLandingCountsUseTheHeadsOrderAndAHalfOpenWindow) {
     EXPECT_EQ(counts[1 * 5 + 1], 1);  // Aw is theirs on A for black
 }
 
+TEST_F(Wave2bTest, RecentLandingCountsKeepAsManyAsTheSearch) {
+    // A burst of 15 pawns into Aw's pocket: the search keeps the newest
+    // MAX_RECENT_LANDINGS, and so must the recent counts training reads.
+    std::vector<SeatClockGame::Landing> log;
+    for (int i = 0; i < 15; ++i) {
+        log.push_back({1000 + 100 * i, AW, Stockfish::PAWN});
+    }
+    log.push_back({1000 + 100 * 15, BB, Stockfish::QUEEN});
+    auto counts = pocket_landing_counts(log, WHITE, 0, 5000, MAX_RECENT_LANDINGS);
+    EXPECT_EQ(counts[0 * 5 + 0], MAX_RECENT_LANDINGS - 1);
+    EXPECT_EQ(counts[2 * 5 + 4], 1);
+    counts = pocket_landing_counts(log, WHITE, 0, 5000);
+    EXPECT_EQ(counts[0 * 5 + 0], 15);
+}
+
 TEST_F(Wave2bTest, TheSeatClockGameLogsCapturesIntoThePartnersPocket) {
     Wave2GameOptions options;
     options.durativeTree = true;

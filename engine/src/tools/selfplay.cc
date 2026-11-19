@@ -1111,7 +1111,7 @@ SeatClockGameResult play_seat_clock_game(
             }
             row.recent = pocket_landing_counts(game.landings(), team,
                                                game.now_ms() - RECENT_LANDING_WINDOW_MS,
-                                               game.now_ms());
+                                               game.now_ms(), MAX_RECENT_LANDINGS);
             result.seats.rows.push_back(row);
             result.samples.push_back(std::move(sample));
 

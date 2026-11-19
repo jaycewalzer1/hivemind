@@ -421,10 +421,12 @@ public:
                 config.seatSitting[seat] = sitting_[seat];
             }
         }
-        if (wideInputs_) {
+        if (wideInputs_ || !options_.instantTransfer) {
             // Wave 2b: a wide network also reads each board's thinking time
-            // and the pockets' recent landings.
-            config.wideInputs = true;
+            // and the pockets' recent landings. Without InstantTransfer the
+            // landings also tell the tree what reached an opponent seat's
+            // pocket during its current decision (TimeState::durative).
+            config.wideInputs = wideInputs_;
             for (int board = 0; board < 2; ++board) {
                 config.boardElapsedMs[board] = board_elapsed_ms(board);
             }
@@ -530,19 +532,26 @@ private:
  * @brief Wave 2b: counts of pieces landing in each pocket, in the arrivals
  * head's order from @p team's view: ours on A, theirs on A, ours on B,
  * theirs on B, each P N B R Q. A landing at time t counts when
- * fromMs < t <= toMs.
+ * fromMs < t <= toMs. With @p maxLandings only the newest that many count:
+ * the recent-landing planes pass MAX_RECENT_LANDINGS, as many as the
+ * engine's search keeps (search_clock, TimeState), so a burst of landings
+ * reads the same in training as in the search; the arrivals labels count all.
  */
 inline std::array<int, 20> pocket_landing_counts(const std::vector<SeatClockGame::Landing>& landings,
                                                  Stockfish::Color team, int64_t fromMs,
-                                                 int64_t toMs) {
+                                                 int64_t toMs,
+                                                 int maxLandings = std::numeric_limits<int>::max()) {
     const int pockets[4] = {TimeState::seat_of(0, team), TimeState::seat_of(0, ~team),
                             TimeState::seat_of(1, ~team), TimeState::seat_of(1, team)};
     std::array<int, 20> counts{};
-    for (const SeatClockGame::Landing& landing : landings) {
+    int kept = 0;
+    for (auto it = landings.rbegin(); it != landings.rend() && kept < maxLandings; ++it) {
+        const SeatClockGame::Landing& landing = *it;
         const int type = static_cast<int>(landing.type);
         if (landing.timeMs <= fromMs || landing.timeMs > toMs || type < 1 || type > 5) {
             continue;
         }
+        ++kept;
         for (int pocket = 0; pocket < 4; ++pocket) {
             if (pockets[pocket] == landing.seat) {
                 ++counts[pocket * 5 + type - 1];
