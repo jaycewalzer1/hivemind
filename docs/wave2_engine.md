@@ -323,7 +323,7 @@ it13.
 
 ### Wave 2b tests
 
-`engine/tests/test_wave2b.cc` (14 tests; `--gtest_filter='Wave2b*'`):
+`engine/tests/test_wave2b.cc` (13 tests; `--gtest_filter='Wave2b*'`):
 - plane values on a hand-built position with pockets on both boards, for the white team and the black team (every
   one of the 52 values checked); no timing (v3 clock, legacy flag, narrow durative state, derived clocks): only the
   presence planes; the wide layout is each 39-plane block followed by its 26;
@@ -346,7 +346,7 @@ it13.
 clearing, and no effect with a narrow network.
 
 Checks run 2026-11-19 (ONNX Runtime on the Mac):
-- full suite 513 tests: 512 pass, 1 skipped (upstream's perf test, as before);
+- full suite 514 tests: 513 pass, 1 skipped (upstream's perf test, as before);
 - `engine/tests/stock_parity.sh`: 8/8 identical to the stock v3.0.3 binary at defaults;
 - C++ `dumpplanes --wide-planes` vs Python `board2planes_wide` (`hivemind.domain.wide_planes`) on 300 random
   positions with random pockets (231 with timing and landings): the 52 extra values identical (max difference 0)
