@@ -1,4 +1,4 @@
-# Wave 2 engine: the durative clock (part 1)
+# Wave 2 engine: the durative clock (parts 1 and 2)
 
 Branch `talisman/wave2`, based on aminwoo/hivemind v3.0.3 (7a4dbdb). Design source:
 `docs/custom_engine_spec_v4_durative.md` in the talisman repo (spec v4), written for the old fork and built here into
@@ -16,8 +16,8 @@ and, for the binary, by `engine/tests/stock_parity.sh`.
 | `DurativeTree` | check, false | Per-seat clocks and ready times in the tree (below). |
 | `SitGate` | check, true | Upstream's hard `can_sit = lead > 0`. Off: a pass is always legal, priced by the tree (durative trees keep the sit-off rule). Applies to v3 clocked states too. |
 | `FlagLoss` | check, false | Durative only: a seat whose clock runs out is a terminal loss for its team; two teams out at the same millisecond = draw (arena RULES.md). |
-| `InstantTransfer` | check, true | Parsed and carried in every node's state (`TimeState::instant_transfer()`); **behaviour is part 2's** (today a capture is always usable at once). |
-| `MateRaceByLanding` | check, false | Parsed and carried (`TimeState::mate_race_by_landing()`); **behaviour is part 2's**. |
+| `InstantTransfer` | check, true | Durative only. Off: a captured piece is in the partner's pocket from the capture's landing but droppable only from the partner's next decision (below). |
+| `MateRaceByLanding` | check, false | Durative only. Mate races go to the earlier landing; exact ties to the opponent of the last capturer (below). The root mate provers are off under it. |
 | `PassCapK` | spin 1..64, 8 | A pass lasts at most `k x` the root budget. |
 | `SeatClocksMs` | string `<Aw> <Ab> <Bw> <Bb>`, empty | The four real clocks. Empty: derived from `TimeLeadMs` around 2^29 ms (no flag can happen), as v3. |
 | `SeatPaceMs` | string, empty | Per-seat ms per action (EMA). Empty: `TeamMoveTimeMs` / `OpponentMoveTimeMs` per team, as v3. Given: the speed plane uses each team's mean pace. |
@@ -33,14 +33,14 @@ Seat order everywhere: Aw, Ab, Bw, Bb (indices 0-3, `TimeState::SEAT_*`). The wh
 ## The model as built
 
 **State.** `TimeState` (`engine/src/environment/time_state.h`) carries, besides v3's lead and move times, a `sitGate_`
-flag and a `Durative` block (`time_state.h:507`): four clocks, four ready times (relative to the node's own time,
+flag and a `Durative` block (`time_state.h:598`): four clocks, four ready times (relative to the node's own time,
 meaningful for the two seats on turn), four paces, four "sitting" bits, who is to move on each board, the root team,
 whose turn the next cross-team tie is, `atRoot`, the root budget, the pass cap, the flags, and an `outcome`. Built by
-`TimeState::durative()` (`time_state.h:129`) from a v3 clocked state plus `DurativeConfig` (`time_state.h:18`).
-`exact_key()` mixes all of it in (`time_state.h:473`), so transpositions and node hashes separate clocks; in default
+`TimeState::durative()` (`time_state.h:132`) from a v3 clocked state plus `DurativeConfig` (`time_state.h:18`).
+`exact_key()` mixes all of it in (`time_state.h:547`), so transpositions and node hashes separate clocks; in default
 mode the key and `operator==` are v3's.
 
-**Who acts.** `turn_at_node()` (`time_state.h:559`):
+**Who acts.** `turn_at_node()` (`time_state.h:668`):
 - At the root, the root team decides on every board it is on turn, landing at its budget (`RootMoveTimeMs`, else its
   team move time). If an opponent seat would land earlier, its ready time drops to 0 and it acts right after.
 - Elsewhere, time advances to the earliest ready time of the two seats on turn; only that seat's team acts, on that
@@ -49,15 +49,16 @@ mode the key and `operator==` are v3's.
 
 **Waiting keeps the tree alternating.** Upstream's tree assumes teams alternate (child team = `~team`, values negate
 each ply, the solver's WIN/LOSS flip). So a node whose team does not act gets exactly one action, (pass, pass), and
-time does not move on it. `collect_batch` sets this up (`searchthread.cc:820-857`, `LeafContext::forcedWait`,
+time does not move on it. `collect_batch` sets this up (`searchthread.cc:913-965`, `LeafContext::forcedWait`,
 `searchthread.h:161`): the on-turn flags passed to the joint-action generator are restricted to the boards the team
 acts on; a waiting team is given board A "on turn" with only the pass, and the sit right in `process_batch`
-(`searchthread.cc:934`), which makes (pass, pass) its one legal action. Cost: a wait node is a network evaluation, so
+(`searchthread.cc:1042`), which makes (pass, pass) its one legal action. Cost: a wait node is a network evaluation, so
 lines where one team acts twice in a row spend an extra node. An in-place expansion that skips the evaluation is a
 possible optimisation (not done).
 
-**Charging an action.** `advance_action(team, movedA, movedB)` (`time_state.h:333`), called by the tree's
-`time_after_action` (`searchthread.cc:1313`) with the action actually played:
+**Charging an action.** `advance_action(team, movedA, movedB, handA, handB)` (`time_state.h:338`), called by the tree's
+`time_after_action` (`searchthread.cc:1421`) with the action actually played:
+(`handA`/`handB`: the piece type each board's move sends to the partner's pocket, `Board::hand_piece_type`.)
 1. `dt` = time to the landing. With `FlagLoss`, if either clock on turn is <= `dt`, the lower one flagged first
    (equal across teams: draw) and the state's `outcome` is set; nothing else happens.
 2. Both clocks on turn and both ready times run by `dt`.
@@ -65,13 +66,13 @@ possible optimisation (not done).
    the root team's seats, its pace for the others.
 4. A seat that passed waits until 1 ms after the next event on the other board (that seat's ready time), or until
    its own flag, or `PassCapK x` the root budget, whichever is first (at least 1 ms), and is marked sitting.
-5. The lead is re-read from the clocks: white lead = ((Aw - Bw) + (Bb - Ab)) / 2 (`sync_lead`, `time_state.h:609`),
+5. The lead is re-read from the clocks: white lead = ((Aw - Bw) + (Bb - Ab)) / 2 (`sync_lead`, `time_state.h:718`),
    so the lead and speed planes (`planes.cc`) see the node's clocks.
 6. Sit-off draw: both seats on turn sitting, on different teams, with equal clocks: nothing can change and neither
    has to move; the arena adjudicates that as a draw, so the state's `outcome` is DRAW.
 
-**Sitting.** `can_sit(team)` (`time_state.h:239`): with `SitGate` on, v3's `lead > 0` (the lead from the clocks in a
-durative tree). Off: always, except the **sit-off rule** (`sit_off_forces_move`, `time_state.h:591`): a team deciding on
+**Sitting.** `can_sit(team)` (`time_state.h:244`): with `SitGate` on, v3's `lead > 0` (the lead from the clocks in a
+durative tree). Off: always, except the **sit-off rule** (`sit_off_forces_move`, `time_state.h:700`): a team deciding on
 one board while the other team's seat on the other board sits may not sit too if its clock is lower; it must move. At
 equal clocks it may sit, which then ends the line as the sit-off draw. A seat that must move but has no legal move is
 mated by upstream's own rule (`is_checkmate(team, canSit=false)`), which matches the arena's adjudication (the lower
@@ -79,18 +80,95 @@ clock loses). The sit plane the network sees stays upstream's sit right, `lead >
 `planes.cc:218` and `planes.cc:246`), whatever the gate, because that is what twin-s-clock was trained on.
 
 **Terminals.** `collect_batch` asks `outcome_for(team)` before the board's own classification
-(`searchthread.cc:754`): a flag or sit-off draw ends the line whatever the board shows. The frozen-board loss, which
-assumes the team must act now, is not used in durative trees (`searchthread.cc:769`).
+(`searchthread.cc:847`): a flag or sit-off draw ends the line whatever the board shows. The frozen-board loss, which
+assumes the team must act now, is not used in durative trees (`searchthread.cc:862`).
 
 **UCI.** Options parsed in `UCI::setoption` (`uci.cc:674` onward), state in `uci.h` (`durativeTree`, `sitGate`,
 `durativeConfig`); `UCI::current_clock()` (`uci.cc:732`) returns v3's `TimeState::clocked(...)` unchanged with
 defaults, `.with_sit_gate(false)` for `SitGate false`, and `TimeState::durative(...)` (root sides read off the board)
 for `DurativeTree true`. Advertised in the `uci` handshake.
 
+## Part 2: delayed transfer, landing-time mate races, repetition
+
+**Delayed transfer (`InstantTransfer false`).** The board still puts a captured piece in the partner's pocket at once
+(`Board::push_move`); the durative state holds, per seat and piece type, how many pieces in that seat's pocket landed
+during its current decision (`Durative::pending`, `TimeState::pending_in_hand`, `time_state.h:485`). A seat's decision
+starts when its board is handed to it (the opponent moved there: its pending list is cleared) or when a pass of its
+own ends (a seat back from a pass sees no pending pieces, and its list is cleared when it acts). So a piece is usable
+from the partner's next decision after the capture lands: the "sit for the knight" line works (pass until the capture
+lands, then drop), but a seat that was already thinking when the piece arrived cannot use it in that action. A
+capture and a drop of the same piece in one joint action never happened anyway: drops come from the pre-action
+pocket. `collect_batch` removes drops of held pieces from the seat's actions (`searchthread.cc:930`); the pending
+counts are in the node key. The network still sees the whole pocket (its inputs do not change in wave 2).
+Not done: `Board::is_checkmate` still counts held pieces as possible blockers.
+
+**Mate races by landing (`MateRaceByLanding`).** Inside the durative tree, landings are already in time order, so a
+mate that lands first ends the line. Two places decided races by rule instead, and now use landing times:
+- *The waiting-board mate* (`classify_terminal_position` -> `has_unavoidable_waiting_board_mate`): upstream lets the
+  waiting mate win the race exactly when the team to play is the root team (pessimism). Now
+  (`waiting_mate_wins_by_landing`, `searchthread.cc:159`) the defenders' reply wins if its seat's ready time is
+  earlier, the waiting mate wins if its seat's is earlier.
+- *The root.* The root team decides first even when an opponent seat would land before its budget (part 1). The root
+  action now records, per opponent seat, how much earlier it would have landed (`mate_race_early_ms`,
+  `time_state.h:510`). When the root action mates, and the mated team's early seat has a mate in one of its own, that
+  mate landed first: the node is a WIN for the mated team (`early_mate_race`, `searchthread.cc:193`).
+- *Exact ties* (`landing_tie_won_by`, `searchthread.cc:145`): **the opponent of the team that captured last wins**.
+  The tree tracks the last capturing team (`last_capture_team()`; the root does not know the game's history, so it
+  starts unknown). With no capture in the line, upstream's rule stays. Chosen over "draw" because the arena never
+  draws a mate race and the rule is cheap to test from both teams.
+- The root mate provers (mate probe, root mate scan, selected-move certification) judge races in v3 alternation and
+  would overrule the tree, so `Agent::run_search` switches them off for a search whose clock has
+  `MateRaceByLanding` (`agent.cc`, top of `run_search`). The tree's solver still finds mates; it is slower at it.
+
+**Repetition.** Under a durative clock a repeated position is not the same state (every action costs time), so the
+tree no longer calls a threefold or the fifty-move rule a draw (`searchthread.cc:299`; spec v3 D4: repetition is
+non-terminal under tree clocks). The arena still adjudicates FICS threefold; self-play adjudicates `board.is_draw()`
+on landing (below).
+
+## Self-play and tournament (`tools/seat_clock_game.h`, `tools/selfplay.cc`, `tools/tournament.cc`)
+
+Flags (both commands, listed in `--help`, contract in `docs/wave2_training.md`): `--durative-tree`, `--sit-gate`,
+`--flag-loss`, `--instant-transfer`, `--mate-race-by-landing`, `--pass-cap-k`, `--base-mix MS:W,...`,
+`--seat-move-times`, plus the timing knobs `--min-move-ms` (100), `--lag-max-ms` (150), `--pace-jitter` (0.25),
+`--sitoff-ms` (5000), `--pace-ema-alpha` (0.3), which only act in seat-clock games. Any wave 2 option implies
+`--time-model clock`. With none, both commands are stock: a 2-game self-play run is byte-identical (HVM6 chunks and
+PGN) to the stock v3.0.3 binary built the same way.
+
+**Tree options without `--base-mix`:** the v3 game loop (alternating team turns, one lead), with every search on the
+durative clock derived from the lead and SitGate as given.
+
+**`--base-mix`: games on four seat clocks** (`SeatClockGame`):
+- Start: a base drawn from the mix; the lead sampler (`--level-start-fraction`, `--start-lead-*`) gives time odds,
+  white seats +lead/2, black -lead/2 (clamped so no seat starts under 1 s); move times per team from
+  `--move-time-*`, or per seat with `--seat-move-times`. Tournament: both games of a pair share start and cost draws;
+  `--movetime` stands in for each seat's move time unless `--seat-move-times`.
+- Each seat on turn is deciding or has a committed move. A decision is one search by the deciding seat's team (one
+  record), rooted then: `SeatClocksMs` = the clocks, `SeatPaceMs` = each seat's observed pace (EMA of its landings),
+  `SeatElapsedMs` and a sitting flag (`DurativeConfig::seatSitting`, used by the sit-off rule at the root) for the
+  other team's seats, `RootMoveTimeMs` = the deciding seat's drawn cost. Only the deciding seats' boards of the
+  chosen action are played: a move lands after its cost (move time x jitter in [1/1.25, 1.25], floor 100 ms, plus
+  0-150 ms lag); a pass lasts until 1 ms after the next landing on the other board (a landing wakes it), its flag,
+  or `k x` its move time. Pieces that arrive during a decision are not in its search: the game has delayed transfer
+  whatever `--instant-transfer` says (that option is the tree's model of it).
+- Ends: a seat at 0 with `--flag-loss` -> `flag` (the first to 0 loses; two teams at the same ms -> `double_flag`);
+  both seats on turn sitting `--sitoff-ms` at once -> `sitoff_adjudicated` (lower clock loses, equal draws); a mate
+  on landing -> `checkmate`; `board.is_draw()` on landing -> `draw`; `--max-macro-plies` decisions ->
+  `macro-ply limit`. Ties at one millisecond: landings before decisions, then the teams alternate (or, with
+  MateRaceByLanding, the opponent of the last capturer goes first).
+- Outputs: HVM6/HDST records unchanged (one per search, planes from the search's clock). The clocks are not in those
+  formats, so `seat_clocks.tsv` in the output directory has one row per record (game, record, team, game ms, nodes,
+  four clocks, elapsed of the seats on turn, four paces). PGN tags `BaseMs`, `StartClocksMs`, `SeatMoveTimesMs`,
+  `FinalClocksMs`, `GameMs`; move comments carry the mover's real clock. The game line adds ` flag-seat <seat>` and
+  ` clocks <Aw> <Ab> <Bw> <Bb>`. Raw-policy opening moves work as in v3 (not recorded). Tree reuse is refused
+  with `--base-mix`.
+
+Smoke (it13, ONNX Runtime on the Mac, 48 nodes, 15 s base, all wave 2 options): 2 self-play games in 2 s (a flag,
+a resignation), 4 tournament games in 5 s.
+
 ## What still reasons in v3 alternation
 
 Callers that charge an action without saying which boards moved use the old `advance(team, onBoth)`. On a durative
-state that call first drops the durative block (`time_state.h:272`), so from there the state is v3's clocked state at
+state that call first drops the durative block (`time_state.h:276`), so from there the state is v3's clocked state at
 the current lead (with the gate setting kept). This covers:
 - the root mate provers and scans in `agent.cc` (mate probe, frozen race, conditional probe, selected-move
   certification, root loss scan) and the waiting-board mate inside `classify_terminal_position`
@@ -99,6 +177,7 @@ the current lead (with the gate setting kept). This covers:
   (`agent.cc:8491`): their keys will not match the durative children, so under `DurativeTree` a reused tree is
   simply not found and the search starts fresh (correct, just no reuse; the arena sends `ucinewgame` anyway);
 - PV printing, which labels wait steps as `(pass,pass)`.
+- `Board::is_checkmate` and `adjudicate_game` (pocket pieces held by delayed transfer still count as blockers).
 
 ## Tests
 
@@ -114,6 +193,32 @@ the current lead (with the gate setting kept). This covers:
 - **acceptance 7**: defaults give v3's states, keys and planes; a durative state with v3's lead gives v3's planes.
 `engine/tests/test_uci.cc` (`*Wave2*`): option parsing and that defaults root on `TimeState::clocked(...)` exactly.
 
+`engine/tests/test_durative_part2.cc` (part 2):
+- delayed transfer: a capture mid-decision is held until the partner's board comes back to it; a seat back from a
+  pass may drop it; InstantTransfer and v3 states hold nothing; held pieces separate node keys;
+  `hand_piece_type` (promoted pieces go as pawns); in a real search no held knight is ever dropped, while with
+  InstantTransfer the same decision drops it;
+- **acceptance 2** ("sit for the knight", needs `engine/models/twin-s-clock-it13.onnx`, skipped without it): A needs
+  a knight for N@f7#, our partner wins Bw's knight in two moves with a queen check. Wave 2 has no gate, so the
+  deficit case is decided by the sit-off rule: with a 10 s diagonal lead Bw (lower clock) must answer the check, the
+  root plays (pass, check) and the root is a proven WIN; with a 10 s deficit Bw sits in check, Aw must move first,
+  and the root is not a win; with upstream's gate and the deficit the pass beside a quiet move is not legal;
+- **acceptance 5** (mirror): both teams have a smothered mate in one on their own board; with Aw landing at 300 and
+  Bw at 500 the white root is WIN and the black root LOSS, and mirrored with the paces swapped. Without
+  MateRaceByLanding both roots claim the win. Exact ties: both mates captures, so each root's own capture is the
+  last one and each root loses (both teams tested); a tie with no capture keeps upstream's rule (the root's mate);
+- **acceptance 6** (rules level plus search): a threefold is DRAW in v3's classifier and not in the durative one; a
+  search one move from a threefold has DRAW nodes on v3's clock and none on the durative clock. Not covered: the
+  "mate in 2 on B evaluates near +1" half (no fixture).
+`engine/tests/test_seat_clock_game.cc`: option parsing (the full wave 2 preset, refusals), start sampling (the base
+mix weights within 3 points over 4000 draws, lead odds about half the games, per-seat move times), cost floor, lag
+and jitter, decisions and landings, elapsed time reaching the search clock, pass length and wake-up, the pass cap,
+flag, double flag, no flag without FlagLoss, sit-off adjudication both ways, and that without DurativeTree the search
+clock is v3's clocked state at the clocks' lead.
+`engine/tests/test_selfplay_wave2.cc`: `run_selfplay` with the preset on the uniform net (3 games, 4 s base): one
+`seat_clocks.tsv` row per HVM6 record, game-line sample counts that add up, the PGN tags, a flag game; tree options
+without a base mix keep the lead-only game; `run_tournament` plays a seat-clock pair.
+
 `engine/tests/stock_parity.sh` (acceptance 7, binary): builds this engine and stock v3.0.3
 (`third_party/upstream-hivemind`, built out of tree, source untouched) with one search worker, then runs `policy` and
 `go nodes N` on `engine/tests/data/stock_parity_positions.txt` (8 positions, both teams, leads -15 s..+15 s, unequal
@@ -124,30 +229,17 @@ so differ between two stock runs too; the last `info depth` line (nodes, score, 
 results depend on wall time. Result on 2026-11-19: **8/8 identical**. Build cost: two extra builds
 (`engine/build-parity`, `engine/build-parity-stock`, git-ignored), a few minutes at `JOBS=2`.
 
-Upstream's own suite stays green.
+Upstream's own suite stays green: 498 tests, 497 pass, 1 skipped (upstream's `MeasureFrozenRaceOnTheGame` perf
+test, skipped on the stock baseline too). `stock_parity.sh` after part 2: **8/8 identical**.
 
-## Notes for part 2
+## Open after part 2
 
-- **Delayed transfer (`InstantTransfer false`).** `Board::push_move` (`board.cc:213`) puts a captured piece in the
-  partner's pocket at once. The durative state knows when the capture lands (the `advance_action` call that carries
-  it) and when the partner seat next decides (its ready time). Suggested: keep a per-seat "arrives after" list of
-  pieces in `TimeState::Durative` (or a pocket mask), and filter drop moves of not-yet-arrived pieces in
-  `collect_batch`'s `prepare_actions` (`searchthread.cc` after line 830) when `!time.instant_transfer()`. The piece
-  becomes droppable from the partner's first decision whose node time is after the landing: i.e. it is usable at the
-  partner's next `acting_boards` node, not at a node where the partner was already deciding. The state key must
-  include the pending pieces.
-- **Mate race by landing (`MateRaceByLanding`).** The mate-race pessimism lives in `classify_terminal_position` and
-  `has_unavoidable_waiting_board_mate` (`searchthread.cc` top) and in the agent's provers. In a durative tree a race
-  is decided by which mate lands first: compare the ready times of the two seats (`seat_ready_ms`) at the node; on an
-  exact tie spec v4 leaves the rule open (opponent of the last capturer, or draw): pick one, document it, test both
-  teams.
-- **Self-play hooks.** `tools/selfplay.cc` builds `TimeState::clocked` from `sample_clock` (`selfplay.cc:1029`) and
-  charges each played action with `time.advance(...)` (`selfplay.cc:1064`, `1207`). For durative self-play it should
-  keep four seat clocks per game, build each search's clock with `TimeState::durative(base, team, sideA, sideB, cfg)`
-  (sides from the board, `rootMoveTimeMs` = this search's budget, paces from per-seat EMAs), and advance its game
-  clocks by real landing times, not through `advance`. The UCI path (arena) already does this per search through
-  `SeatClocksMs` / `SeatPaceMs` / `SeatElapsedMs`.
-- **Provers.** If the root provers should be landing-aware, give them the action-aware `after_action` instead of
-  `after(team, onBoth)`; until then they are v3 reasoners on the root's lead.
-- **Wait-node cost.** If the extra evaluation per wait node matters at self-play budgets, expand a forced-wait leaf in
-  place in `select_and_expand` and continue to its child.
+- Strength of wave 2 against stock twin-s-clock is unmeasured: only smoke runs.
+- Root provers are off under MateRaceByLanding (they reason in v3 alternation). Landing-aware provers would win back
+  their speed on mates.
+- At the root, the root team still decides first and its other seat (if on turn) is part of the root action, even
+  when in a seat-clock game that seat is mid-decision; self-play plays only the deciding seat's board.
+- Two sitting seats in the tree can still leapfrog 1 ms at a time until the sit-off rule forces one (the game model
+  fixes this by waking passes only on landings).
+- A wait node costs one network evaluation (part 1 note).
+- `seat_clocks.tsv` is not trimmed by `--resume` (checkpointed runs append the replayed games again).
