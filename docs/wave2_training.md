@@ -257,6 +257,12 @@ output, checkpoint variant wide. Wall time 2 min 20 s. Not run: matches, any GPU
 same settings, same seeds: rl-loop seeds segment k of iteration n with 1000 n + k). Both gate against it13 at equal
 movetime under the wave 2 rules; the headline against stock v3 rules is the arena's.
 
+Same seeds do not mean same games. Integration 2026-11-19 (talisman `docs/wave2_local_check.md`): with the one-worker
+`build-sp1` the narrow and wide arms of a 4-game A/B still played different games (958 vs 555 records). Wide node
+keys include landing history and thinking time, so a wide tree does not merge transpositions a narrow tree merges,
+and searches diverge even while the wide net's outputs equal it13's. Compare the arms by their gate scores, not game
+by game.
+
 No self-play rate has been measured on PACE yet, so the estimate is a formula with a guess:
 GPU-hours ~= games / R + iterations x (training + 2 matches), with R games per GPU-hour for 800-node self-play at 6
 parallel games. Guess R = 300 (a game is ~200 searches x 800 nodes; the arena's D1 rate of 150 games/GPU-hour is for
