@@ -169,6 +169,12 @@ C++ `wide_extra_planes` is checked against); `extend_planes` does the same for a
 the chunk's timing fields. `parse_seat_arrivals` reads the UCI `SeatArrivalsMs` value
 (`<Aw|Ab|Bw|Bb>:<P|N|B|R|Q>:<ms_ago>,...`).
 
+Cross-check against the C++ encoder (`hivemind dumpplanes --wide-planes true`, engine `build-ninja` built 11:16 on
+2026-11-19), 300 random positions, half with seat clocks, board elapsed times and 0-6 landings aged 0-8 s: the 26
+extra planes of all 600 blocks equal (max |diff| 0). `test_python_wide_extras_equal_the_engines` repeats it on 60
+positions when an engine is built. (The board planes were not compared: the FEN lines carry no move history, so the
+last-move, en passant and sit planes differ by construction.)
+
 ### Network (`architectures/twin_board.py`, `src/hivemind/wide.py`)
 
 * `TwinBoardNet(planes_per_board=65, arrivals=True)`. `widen_to_wide_planes` appends 26 zero input columns per block
