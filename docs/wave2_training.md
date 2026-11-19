@@ -139,3 +139,128 @@ Run 2026-11-19 on this Mac (stock v3.0.3 binary `third_party/upstream-hivemind/e
 it13 as generator): 4 + 2 games in 20 s, label check clean (348 + 86 records, 6 checkmates, no flags as no seat
 clocks), 3 training steps from it13 (trunk 5e-5, heads 1e-4) in 40 s with search validation loss 3.6366 -> 3.6339,
 ONNX exported. Exit 0. Not run: matches (`--no-gate`), any wave 2 option (the engine had none yet).
+
+## Wave 2b: the wide network and the arrivals head
+
+Wave 2b widens it13's inputs and adds an auxiliary head, so the network can see what wave 2's rules put in play
+(each seat's own clock, how long the side on turn has been thinking, which pieces just landed) and learn piece flow.
+Everything new starts at zero: the widened network computes exactly what it13 computes, whatever the new planes hold,
+and the engine plays it exactly as it13 until training moves the new weights.
+
+### Planes (`src/hivemind/domain/wide_planes.py`)
+
+Each board block grows from 39 to 65 planes (block A 0..64, block B 65..129): it13's 39 (37 board planes, lead,
+speed), then 26 constant planes in the same order in both blocks, "our"/"their" from the searching team's view on
+that board (block B: the partner's seat and pocket):
+
+| Offset | Plane | No timing |
+|---|---|---|
+| +0, +1 | our seat clock: `min(t/300, 1)`, `exp(-t/10)` (t in s) | 0, 0 |
+| +2, +3 | the same-board opponent's clock, same two | 0, 0 |
+| +4, +5 | the side on turn on this board has been thinking e s (since the last action landed here): `min(e/10, 1)`, `1 - exp(-e/2)` | 0, 0 |
+| +6..+10 | our pocket holds at least one P, N, B, R, Q (0/1) | always set |
+| +11..+15 | their pocket, the same | always set |
+| +16..+20 | our pocket: P, N, B, R, Q that landed in the last 5 s (`0 <= ms_ago < 5000`), `min(n/2, 1)` | 0 |
+| +21..+25 | their pocket, the same | 0 |
+
+Seats from the team's view: the white team (Aw + Bb) has ours/theirs = Aw/Ab on A and Bb/Bw on B; the black team
+Ab/Aw and Bw/Bb. `board2planes_wide(board, team, lead, speed, timing)` encodes a `BughouseBoard` (the reference the
+C++ `wide_extra_planes` is checked against); `extend_planes` does the same for a batch of narrow plane values plus
+the chunk's timing fields. `parse_seat_arrivals` reads the UCI `SeatArrivalsMs` value
+(`<Aw|Ab|Bw|Bb>:<P|N|B|R|Q>:<ms_ago>,...`).
+
+### Network (`architectures/twin_board.py`, `src/hivemind/wide.py`)
+
+* `TwinBoardNet(planes_per_board=65, arrivals=True)`. `widen_to_wide_planes` appends 26 zero input columns per block
+  to the stem conv; `load_twin_board_checkpoint(..., wide=True)` widens a narrow checkpoint, and a wide checkpoint
+  (variant `planes_per_board: 65`) stays wide on every later load.
+* Arrivals head: each board's pooled trunk features with the other board's -> Linear(256, 64) -> ReLU -> Linear(64, 10)
+  (ours P..Q, theirs P..Q), shared by both boards, so swapping the boards swaps the halves (tested). Output
+  `arrivals` [batch, 20] = ours A, theirs A, ours B, theirs B x P, N, B, R, Q: pieces landing within the next 5
+  simulated seconds. Last layer zero. It is the sixth PyTorch output and the last ONNX output; the engine matches
+  outputs by name and does not read it.
+* `python -m hivemind.wave2 widen` makes the files from the pinned it13 checkpoint and records them in
+  `engine/models/twin-s-clock-wide.json`:
+
+| File | SHA-256 |
+|---|---|
+| `artifacts/distill/twin-s-clock-wide/twin-s-clock-wide.pt` (training checkpoint) | `ab834c1e3ae7b4a24ab2fbd23097b50d69597af1278437bc79fe48b7e0e6232d` |
+| `engine/models/twin-s-clock-wide.onnx` (FP16 weights, FP32 I/O, as it13 is published) | `42588f4cb00831eff34c7af80c836d5ae497d6a6f1bc006b6bbec2cad41d97ad` |
+| `engine/models/twin-s-clock-wide-fp32.onnx` (that file through `engine/scripts/convert_onnx_fp32.py`, as upstream's FP32 copy) | `942606d56449de2e0144c9b5fb446418384017a4e753a200b4c1ad2eb80e3f24` |
+
+  Widened from `twin-s-clock-it13.pt` (`5bb43c7f...`); the .pt is deterministic (seed 0 for the head's hidden
+  layer), so a rerun gives the same hashes.
+* Parity, 2026-11-19 on this Mac, 300 random legal positions (random walks of up to 80 actions with drops), random
+  lead/speed planes, the new planes empty for a third, from random timing for a third and uniform noise in [-2, 2]
+  for a third. Max |diff| on value, pi_a, pi_b, wdl_out, moves_left, and arrivals max |value|: **0 on every output,
+  all four ways**: PyTorch it13 vs PyTorch wide; it13 vs wide exported to FP32 ONNX by the same exporter (ONNX
+  Runtime CPU); the wide FP16 ONNX vs the published `twin-s-clock-it13.onnx`; the wide FP32 ONNX vs the published
+  FP32 copy (`efe731c0...`). `tests/test_wave2b_wide.py::test_it13_widened_equals_it13_on_300_positions` repeats
+  the PyTorch check (tolerance 1e-5) whenever the checkpoint is downloaded.
+
+### Samples: HDST v3 and `seat_clocks.tsv`
+
+The engine still writes each search as a narrow (78-plane) HDST record; for seat-clock games it writes a
+`seat_clocks.tsv` row per record in the same order (`selfplay.cc` `write_seat_rows`), which for wave 2b carries
+`board_elapsed_a/b`, `recent_<pocket>_<piece>` (landed in the last 5 s) and `arrivals_<pocket>_<piece>` (the label:
+landed in the 5 s after the search started, `from < t <= to`, written at game end), pockets ours_a, theirs_a, ours_b,
+theirs_b from the record team's view. `hivemind.distill.timing.attach_timing(log, seat_clocks.tsv, chunks)` moves them
+into the chunks as **HDST v3**: the v2 layout with version 3 and a trailing block per record, team-relative in block
+order:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `seatClocksMs` | f32[N x 4] | ours A, theirs A, ours B, theirs B; < 0 = unknown |
+| `elapsedMs` | f32[N x 2] | block A, block B: ms since the last action landed there; < 0 = unknown |
+| `recentLanded` | u8[N x 20] | landed in the last 5 s, the arrivals order |
+| `arrivals` | f32[N x 20] | the label; `arrivals[0] < 0` = no label |
+
+It checks records = tsv rows = the game lines' samples (else the stage fails), keeps the last copy of a game's rows
+when a resumed run appended them twice, and gives the records of a game cut at the macro-ply limit no arrivals label
+(the window was cut short). `read_chunk(path, layout="wide")` widens a 78-plane chunk from the pocket planes and that
+block (a v2 chunk gets presence planes only); a 130-plane v3 chunk's own planes are used as written, and
+`layout="narrow"` cuts them back, so a narrow lineage trains on the same chunks. `chunk_problem` also rejects
+arrivals labels outside [0, 16].
+
+### Training
+
+* Loss: weighted MSE over the 20 counts, per type P 1, N 2, B 2, R 2, Q 4 (the same in all four pockets), divided by
+  the weights' sum (44); only rows with a label; overall weight `distill-train --arrivals-weight` (0.05). The head
+  trains at the heads' learning rate (`--lr`), the stem's new columns with the trunk (`--trunk-lr`).
+* `distill-train` reads the layout the network reads (`--init` a wide checkpoint, or `--wide` to widen a narrow one).
+  Export adds the `arrivals` output and can write an FP32 copy.
+* `rl-loop --wide` (with `--wave2`): the generator must read 130 planes (and a 130-plane generator needs `--wide`);
+  after each segment's label check the loop runs `attach_timing` (marker field `timing`) and training gets
+  `--arrivals-weight` (`rl-loop --arrivals-weight`, 0.05). Value and flag label hygiene is unchanged.
+* `python -m hivemind.wave2 init --wide --name twin-s-clock-w2w`: generator and checkpoint = the widened it13 (made
+  first when missing), fixed baseline `-it0` = it13 itself, so the narrow and wide lineages are gated against the same
+  network.
+
+### Local smoke, 2026-11-19 (Mac CPU)
+
+`rl-loop --wave2 --wide --no-gate`, 4 + 2 games, batch 128, the wave 2b engine (`engine/build-ninja`, built 11:16 from
+the engine agent's commits 86e0029/d386893) for self-play, generator the widened it13: 4 + 2 games (all checkmates),
+821 + 364 records, both chunks to v3 with arrivals labels on every record (mean 3.6 pieces landing per record within
+5 s; P 1131, N 836, B 525, R 253, Q 186 over 821 records), 10 training steps (search arrivals loss 0.2359 -> 0.2344,
+search loss 4.174 -> 4.219 at 10 steps, nothing to read into), exported ONNX with 130 inputs and the `arrivals`
+output, checkpoint variant wide. Wall time 2 min 20 s. Not run: matches, any GPU step.
+
+### A/B and cost
+
+`cluster/wave2_iterate.sbatch` (main repo) has `WIDE=1` (a wide lineage) and `AB=1` (narrow and wide lineages,
+same settings, same seeds: rl-loop seeds segment k of iteration n with 1000 n + k). Both gate against it13 at equal
+movetime under the wave 2 rules; the headline against stock v3 rules is the arena's.
+
+No self-play rate has been measured on PACE yet, so the estimate is a formula with a guess:
+GPU-hours ~= games / R + iterations x (training + 2 matches), with R games per GPU-hour for 800-node self-play at 6
+parallel games. Guess R = 300 (a game is ~200 searches x 800 nodes; the arena's D1 rate of 150 games/GPU-hour is for
+real-time 120-180 s games, which self-play does not wait for), training ~0.3 GPU-hour per 20,000-game iteration,
+matches 2 x 400 games at 100 ms per move ~1 GPU-hour. Measure R from the first segment's log (`seg00` wall time) and
+rescale.
+
+| Run | Settings | Games | GPU-hours at R = 300 |
+|---|---|---|---|
+| Medium A/B | `AB=1 ITERS=4 GAMES_PER_ITER=10000 MATCH_GAMES=400` | 2 x 4 x 10,500 (with validation) = 84,000 | about **290** (280 self-play + 8 x 1.3) |
+| Big run | the A/B's winner, `ITERS=10 GAMES_PER_ITER=50000` | 505,000 | about **1,700** |
+
+At R = 150 both double (580 and 3,400); under 50 games per GPU-hour, halve the iteration count first (audit section 4).
