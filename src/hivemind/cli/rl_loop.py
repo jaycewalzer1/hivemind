@@ -56,8 +56,10 @@ import time
 
 from hivemind import wave2
 from hivemind.cli import selfplay, train
+from hivemind.constants import NUM_WIDE_CHANNELS
 from hivemind.data import archive
 from hivemind.distill.data import chunk_problem
+from hivemind.distill import timing
 from hivemind.distill.labels import label_report
 from hivemind.distill.exchange import PROTOCOL, HubExchange, install, open_exchange, sha256
 from hivemind.network import SELFPLAY_ARCHIVE, SELFPLAY_EXCHANGE, TWIN_ONNX_PATH, TWIN_REPOSITORY
@@ -229,7 +231,8 @@ def finished_selfplay(it):
 # Settings added for wave 2, at their upstream behaviour: what the loop uses
 # when its arguments do not name them.
 WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate": False,
-                  "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None}
+                  "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None,
+                  "wide": False, "arrivals_weight": None}
 
 
 class Loop:
@@ -370,6 +373,17 @@ class Loop:
             if labels["problems"]:
                 raise StageFailed(f"{name}: value labels unfit to train on: {'; '.join(labels['problems'][:5])}")
             marker["labels"] = {k: v for k, v in labels.items() if k != "problems"}
+        seat_rows = records / timing.SEAT_ROWS
+        if self.option("wide") and seat_rows.is_file():
+            # Wave 2b: the wide planes' timing and the arrivals labels go into
+            # the chunks (v3), so training reads them with the positions.
+            try:
+                attached = timing.attach_timing(log, seat_rows, data)
+            except ValueError as error:
+                raise StageFailed(f"{name}: seat timing does not fit the chunks: {error}")
+            self.log(f"it{self.n} {name} timing: {attached['rewritten']} of {attached['chunks']} chunks "
+                     f"to v3, {attached['labelled']} of {attached['records']} records with arrivals labels")
+            marker["timing"] = attached
         self.mark(name, marker)
         self.archive(self.n)
 
@@ -503,7 +517,9 @@ class Loop:
                  f"(replay share {fraction}, {len(old)} dirs, batch {self.args.batch_size})")
         command = train.distill_command(init, new, [self.it / "search" / "val"], old, steps, fraction,
                                         self.args.batch_size, self.n, out, self.teacher_val,
-                                        lr=self.option("lr"), trunk_lr=self.option("trunk_lr"))
+                                        lr=self.option("lr"), trunk_lr=self.option("trunk_lr"),
+                                        extra=(["--arrivals-weight", str(self.option("arrivals_weight"))]
+                                               if self.option("wide") else []))
         with log.open("w") as stream:
             if subprocess.run(command, cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
                               env={**os.environ, **train.TRAINING_ENV}).returncode:
@@ -717,6 +733,17 @@ def even_int(value):
     return parsed
 
 
+def onnx_input_planes(path):
+    """The input planes an ONNX network reads (78 narrow, 130 wide), or None."""
+    try:
+        import onnx
+
+        model = onnx.load(str(path), load_external_data=False)
+        return model.graph.input[0].type.tensor_type.shape.dim[1].dim_value or None
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--first", type=positive_int,
@@ -808,6 +835,12 @@ def main():
     parser.add_argument("--allow-stock-engine", action="store_true",
                         help="With wave 2 options, an engine whose --help lacks them plays stock v3 "
                              "games instead of stopping (for a smoke test before the wave 2 engine)")
+    parser.add_argument("--wide", action="store_true",
+                        help="Wave 2b: the generator is a wide network (twin-s-clock-wide lineage, "
+                             "`hivemind.wave2 init --wide`); seat timing and arrivals labels go into "
+                             "the chunks and training adds the arrivals loss")
+    parser.add_argument("--arrivals-weight", type=float, default=0.05,
+                        help="With --wide, the weight of the arrivals loss (default 0.05)")
     wave2.add_arguments(parser)
     args = parser.parse_args()
     try:
@@ -852,6 +885,11 @@ def main():
     if not args.generator.is_file():
         sys.exit(f"Generator not found at {args.generator}; run `hivemind fetch-network --variant onnx` "
                  f"or pass --generator.")
+    width = onnx_input_planes(args.generator)
+    if args.wide != (width == NUM_WIDE_CHANNELS):
+        sys.exit(f"{args.generator} reads {width} planes: "
+                 + ("--wide needs a wide generator (`python -m hivemind.wave2 init --wide`)" if args.wide
+                    else "a wide generator needs --wide"))
     if not args.archive_only:
         if not args.selfplay_engine.is_file():
             sys.exit(f"Self-play engine not found at {args.selfplay_engine}; build it with\n"
