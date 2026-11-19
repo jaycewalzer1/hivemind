@@ -320,6 +320,24 @@ class Board {
         }
         
         /**
+         * @brief The type of the piece @p move sends to the partner's pocket
+         * (a captured promoted piece goes as a pawn), or NO_PIECE_TYPE.
+         */
+        Stockfish::PieceType hand_piece_type(int board_num, Stockfish::Move move) const {
+            if (move == Stockfish::MOVE_NONE || is_single_board()
+                || !pos[board_num]->capture(move)) {
+                return Stockfish::NO_PIECE_TYPE;
+            }
+            const Stockfish::Color us = pos[board_num]->side_to_move();
+            const Stockfish::Square square = type_of(move) == Stockfish::EN_PASSANT
+                ? to_sq(move) - pawn_push(us) : to_sq(move);
+            if (pos[board_num]->is_promoted(square)) {
+                return Stockfish::PAWN;
+            }
+            return type_of(pos[board_num]->piece_on(square));
+        }
+
+        /**
          * @brief Counts the number of a specific piece in hand.
          * @param board_num The board index.
          * @param c The color of the piece.

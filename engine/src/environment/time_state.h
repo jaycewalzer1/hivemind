@@ -31,6 +31,9 @@ struct DurativeConfig {
     std::array<int32_t, 4> seatPaceMs{0, 0, 0, 0};
     // How long each seat on turn has already been thinking.
     std::array<int32_t, 4> seatElapsedMs{0, 0, 0, 0};
+    // Which seats on turn are sitting (in a pass) at the root. Not a UCI
+    // option: self-play knows it; the sit-off rule reads it.
+    std::array<bool, 4> seatSitting{false, false, false, false};
 };
 
 /**
@@ -134,6 +137,7 @@ public:
         Durative& d = state.durative_;
         d.active = true;
         d.atRoot = true;
+        d.atRootBefore = true;
         d.flagLoss = config.flagLoss;
         d.instantTransfer = config.instantTransfer;
         d.mateRaceByLanding = config.mateRaceByLanding;
@@ -183,6 +187,7 @@ public:
             if (team_of_seat(seat) == rootTeam) {
                 d.readyMs[seat] = d.rootMoveMs;
             } else {
+                d.sitting[seat] = config.seatSitting[seat];
                 d.readyMs[seat] = std::max<int32_t>(
                     1, d.paceMs[seat] - std::max<int32_t>(0, config.seatElapsedMs[seat]));
             }
@@ -330,7 +335,9 @@ public:
      *        nothing moves. With FlagLoss, a clock that runs out on the way
      *        ends the game (outcome()).
      */
-    void advance_action(Stockfish::Color actingTeam, bool movedA, bool movedB) {
+    void advance_action(Stockfish::Color actingTeam, bool movedA, bool movedB,
+                        Stockfish::PieceType handA = Stockfish::NO_PIECE_TYPE,
+                        Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE) {
         Durative& d = durative_;
         const Turn turn = turn_at_node();
         const bool actA = turn.acts[BOARD_A_IDX]
@@ -365,6 +372,21 @@ public:
                 return;
             }
         }
+        const bool acts[2] = {actA, actB};
+        const bool moved[2] = {movedA, movedB};
+        if (d.atRootBefore) {
+            // At the root we decide first, but the other team's seat may land
+            // before our budget runs out: remember by how much, for the
+            // landing-time mate race (mate_race_early_ms).
+            for (int board = 0; board < 2; ++board) {
+                const int seat = turn.seat[board];
+                if (!acts[board] && team_of_seat(seat) != actingTeam
+                    && d.readyMs[seat] <= dt) {
+                    d.earlyMs[seat] = dt - d.readyMs[seat];
+                }
+            }
+            d.atRootBefore = false;
+        }
         for (int seat : {seatA, seatB}) {
             d.clockMs[seat] = clamp_lead(static_cast<int64_t>(d.clockMs[seat]) - dt);
             d.readyMs[seat] = std::max(0, d.readyMs[seat] - dt);
@@ -372,8 +394,35 @@ public:
         if (turn.crossTie) {
             d.tieNext = ~d.tieNext;
         }
-        const bool acts[2] = {actA, actB};
-        const bool moved[2] = {movedA, movedB};
+        for (int board = 0; board < 2; ++board) {
+            if (!acts[board]) {
+                continue;
+            }
+            const int seat = turn.seat[board];
+            d.earlyMs[seat] = -1;
+            if (d.sitting[seat]) {
+                // A seat back from a pass decides anew: every piece that
+                // landed in its pocket meanwhile is its to drop.
+                d.pending[seat] = {};
+            }
+        }
+        const Stockfish::PieceType hand[2] = {handA, handB};
+        for (int board = 0; board < 2; ++board) {
+            if (!acts[board] || !moved[board]
+                || hand[board] == Stockfish::NO_PIECE_TYPE) {
+                continue;
+            }
+            // The captured piece lands in the partner's pocket now. Without
+            // InstantTransfer the partner may drop it only from its next
+            // decision on: the one it is in the middle of started earlier.
+            d.lastCapture = static_cast<int8_t>(actingTeam);
+            const int partner = seat_of(1 - board, ~d.side[board]);
+            const int type = static_cast<int>(hand[board]);
+            if (!d.instantTransfer && type > 0 && type < PENDING_TYPES
+                && d.pending[partner][type] < UINT8_MAX) {
+                ++d.pending[partner][type];
+            }
+        }
         for (int board = 0; board < 2; ++board) {
             if (!acts[board] || !moved[board]) {
                 continue;
@@ -385,6 +434,9 @@ public:
             const int next = seat_of(board, d.side[board]);
             d.readyMs[next] = action_time_ms(next);
             d.sitting[next] = false;
+            // Its decision starts now: everything in its pocket is usable.
+            d.pending[next] = {};
+            d.earlyMs[next] = -1;
         }
         for (int board = 0; board < 2; ++board) {
             if (!acts[board] || moved[board]) {
@@ -416,10 +468,47 @@ public:
     }
 
     /** The state after @p actingTeam's action; see advance_action(). */
-    TimeState after_action(Stockfish::Color actingTeam, bool movedA, bool movedB) const {
+    TimeState after_action(Stockfish::Color actingTeam, bool movedA, bool movedB,
+                           Stockfish::PieceType handA = Stockfish::NO_PIECE_TYPE,
+                           Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE) const {
         TimeState next = *this;
-        next.advance_action(actingTeam, movedA, movedB);
+        next.advance_action(actingTeam, movedA, movedB, handA, handB);
         return next;
+    }
+
+    /**
+     * @brief How many pieces of @p type in @p seat's pocket it may not drop
+     * yet (InstantTransfer off): they landed while its current decision was
+     * already under way. 0 for a seat back from a pass, and always 0 with
+     * InstantTransfer or outside a durative tree.
+     */
+    int pending_in_hand(int seat, Stockfish::PieceType type) const {
+        const Durative& d = durative_;
+        const int index = static_cast<int>(type);
+        if (!d.active || d.instantTransfer || d.sitting[seat]
+            || index <= 0 || index >= PENDING_TYPES) {
+            return 0;
+        }
+        return d.pending[seat][index];
+    }
+
+    /** The team whose move last captured in this tree; nullopt before any. */
+    std::optional<Stockfish::Color> last_capture_team() const {
+        if (durative_.lastCapture < 0) {
+            return std::nullopt;
+        }
+        return static_cast<Stockfish::Color>(durative_.lastCapture);
+    }
+
+    /**
+     * @brief How much earlier than the root team's root action @p seat's
+     * action would have landed (ms, 0 = the same millisecond), or -1. Set
+     * for the other team's seats by the root action and cleared once the
+     * seat acts. The tree plays our root action first; with
+     * MateRaceByLanding a mate that seat had would have landed first.
+     */
+    int32_t mate_race_early_ms(int seat) const {
+        return durative_.active ? durative_.earlyMs[seat] : -1;
     }
 
     /** How the game stands on the clock: a flag (FlagLoss) or a sit-off draw. */
@@ -503,11 +592,16 @@ public:
 private:
     static constexpr int BOARD_A_IDX = 0;
     static constexpr int BOARD_B_IDX = 1;
+    // Pocket piece types tracked for delayed transfer: PAWN (1) .. QUEEN (5).
+    static constexpr int PENDING_TYPES = 6;
 
     struct Durative {
         bool active = false;
         // The root team decides at the root on every board it is on turn.
         bool atRoot = false;
+        // Like atRoot, for advance_action's own use; cleared once the root
+        // action is charged.
+        bool atRootBefore = false;
         bool flagLoss = false;
         bool instantTransfer = true;
         bool mateRaceByLanding = false;
@@ -523,6 +617,13 @@ private:
         std::array<bool, 4> sitting{false, false, false, false};
         int32_t rootMoveMs = 1;
         int32_t passCapMs = 1;
+        // Pieces in each seat's pocket by type that landed during its
+        // current decision (InstantTransfer off).
+        std::array<std::array<uint8_t, PENDING_TYPES>, 4> pending{};
+        // Team of the last capture in this tree, -1 = none yet.
+        int8_t lastCapture = -1;
+        // See mate_race_early_ms().
+        std::array<int32_t, 4> earlyMs{-1, -1, -1, -1};
 
         bool operator==(const Durative&) const = default;
 
@@ -544,6 +645,14 @@ private:
                 | (uint64_t(outcome) << 8));
             mix((uint64_t(static_cast<uint32_t>(rootMoveMs)) << 32)
                 | static_cast<uint32_t>(passCapMs));
+            for (int seat = 0; seat < 4; ++seat) {
+                uint64_t packed = 0;
+                for (int type = 1; type < PENDING_TYPES; ++type) {
+                    packed |= uint64_t(pending[seat][type]) << (8 * type);
+                }
+                mix(packed ^ (uint64_t(static_cast<uint32_t>(earlyMs[seat])) << 48));
+            }
+            mix(static_cast<uint64_t>(static_cast<int64_t>(lastCapture)) + 0x4c43ULL);
             return h;
         }
     };

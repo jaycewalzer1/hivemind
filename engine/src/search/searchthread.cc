@@ -102,7 +102,7 @@ bool has_unavoidable_waiting_board_mate(Board& board,
         if ((waitingMateWinsRace
              || !board.is_checkmate(
                  ~teamToPlay, opponentHasTimeAdvantage))
-            && !board.is_draw()) {
+            && (time.is_durative() || !board.is_draw())) {
             for (Stockfish::Move matingMove : matingMoves) {
                 if (!board.is_legal_move(waitingBoard, matingMove)) {
                     continue;
@@ -134,6 +134,90 @@ bool has_unavoidable_waiting_board_mate(Board& board,
         *continuation = representative;
     }
     return true;
+}
+
+/**
+ * MateRaceByLanding, exact ties: the opponent of the team that captured last
+ * wins (spec v4 leaves "or draw" open; this is the choice). Returns whether
+ * @p team wins the tie; nullopt when no capture is known in the tree, and the
+ * caller keeps upstream's rule.
+ */
+std::optional<bool> landing_tie_won_by(const TimeState& time, Stockfish::Color team) {
+    const std::optional<Stockfish::Color> lastCapture = time.last_capture_team();
+    if (!lastCapture) {
+        return std::nullopt;
+    }
+    return *lastCapture != team;
+}
+
+/**
+ * MateRaceByLanding in a durative tree: whether the opponents' waiting mate
+ * (on the board where @p teamToPlay is not on turn) wins the race against a
+ * mating reply of @p teamToPlay on its one board, by which lands first.
+ * nullopt when the rule does not apply (or a tie with no capture known).
+ */
+std::optional<bool> waiting_mate_wins_by_landing(Board& board,
+                                                 Stockfish::Color teamToPlay,
+                                                 const TimeState& time) {
+    if (!time.mate_race_by_landing()) {
+        return std::nullopt;
+    }
+    const bool aOnTurn = board.side_to_move(BOARD_A) == teamToPlay;
+    const bool bOnTurn = board.side_to_move(BOARD_B) == ~teamToPlay;
+    if (aOnTurn == bOnTurn) {
+        return std::nullopt;
+    }
+    const int active = aOnTurn ? BOARD_A : BOARD_B;
+    const int waiting = 1 - active;
+    const int defender = TimeState::seat_of(active, board.side_to_move(active));
+    const int attacker = TimeState::seat_of(waiting, board.side_to_move(waiting));
+    const int32_t defenderLands = time.seat_ready_ms(defender);
+    const int32_t attackerLands = time.seat_ready_ms(attacker);
+    if (attackerLands != defenderLands) {
+        return attackerLands < defenderLands;
+    }
+    const std::optional<bool> tie = landing_tie_won_by(time, teamToPlay);
+    if (!tie) {
+        return std::nullopt;
+    }
+    return !*tie;
+}
+
+/**
+ * MateRaceByLanding: @p teamToPlay was just mated by the root team's root
+ * action, but one of its seats would have landed before that action (see
+ * TimeState::mate_race_early_ms) with a mate of its own. WIN if that mate
+ * lands first (or wins the exact tie), LOSS if the root's mate wins the tie,
+ * nullopt when no such race exists.
+ */
+std::optional<TerminalOutcome> early_mate_race(Board& board,
+                                               Stockfish::Color teamToPlay,
+                                               const TimeState& time) {
+    if (!time.mate_race_by_landing()) {
+        return std::nullopt;
+    }
+    for (int boardNum : {BOARD_A, BOARD_B}) {
+        const Stockfish::Color side = board.side_to_move(boardNum);
+        const int seat = TimeState::seat_of(boardNum, side);
+        if (TimeState::team_of_seat(seat) != teamToPlay) {
+            continue;
+        }
+        const int32_t early = time.mate_race_early_ms(seat);
+        if (early < 0) {
+            continue;
+        }
+        if (immediate_mates_on_board(board, boardNum, ~teamToPlay, true).empty()) {
+            continue;
+        }
+        if (early > 0) {
+            return TerminalOutcome::WIN;
+        }
+        const std::optional<bool> tie = landing_tie_won_by(time, teamToPlay);
+        if (tie) {
+            return *tie ? TerminalOutcome::WIN : TerminalOutcome::LOSS;
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -196,6 +280,10 @@ TerminalOutcome classify_terminal_position(Board& board,
         if (endInPly) {
             *endInPly = 1;
         }
+        if (const std::optional<TerminalOutcome> race = early_mate_race(
+                board, teamToPlay, time)) {
+            return *race;
+        }
         return TerminalOutcome::LOSS;
     }
     // Only the game's own draws end a line: a threefold repetition on
@@ -205,13 +293,18 @@ TerminalOutcome classify_terminal_position(Board& board,
     // one board leaves the other free to decide the game. It also keeps a
     // node's verdict independent of where the search started, which tree
     // reuse relies on.
-    if (board.is_draw()) {
+    // Under a durative clock a repeated position is not the same state: the
+    // clocks have moved on (spec v3 D4: repetition is not terminal in the
+    // tree under tree clocks, rule50 is off).
+    if (!time.is_durative() && board.is_draw()) {
         return TerminalOutcome::DRAW;
     }
     if (!partnerBoardAgnostic
         && (boardSearchPlies[BOARD_A] > 0 || boardSearchPlies[BOARD_B] > 0)
         && has_unavoidable_waiting_board_mate(
-            board, teamToPlay, time, teamToPlay == rootTeam,
+            board, teamToPlay, time,
+            waiting_mate_wins_by_landing(board, teamToPlay, time)
+                .value_or(teamToPlay == rootTeam),
             boardSearchPlies, waitingMate)) {
         if (endInPly) {
             // One forced reply, then the opponent's mating move. Terminal
@@ -834,6 +927,21 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
                     return !is_policy_move_representable(
                         board, boardNumber, move);
                 });
+                if (!ctx.time.instant_transfer()) {
+                    // InstantTransfer off: a piece that reached the pocket
+                    // during this seat's current decision is not droppable.
+                    const Stockfish::Color side = board.side_to_move(boardNumber);
+                    const int seat = TimeState::seat_of(boardNumber, side);
+                    std::erase_if(actions, [&](Stockfish::Move move) {
+                        if (type_of(move) != Stockfish::DROP) {
+                            return false;
+                        }
+                        const Stockfish::PieceType type = Stockfish::in_hand_piece_type(move);
+                        const int pending = ctx.time.pending_in_hand(seat, type);
+                        return pending > 0
+                            && board.count_in_hand(boardNumber, side, type) <= pending;
+                    });
+                }
             }
             actions.push_back(Stockfish::MOVE_NONE);
             captures.reserve(actions.size());
@@ -1314,8 +1422,12 @@ LeafSelection SearchThread::select_and_expand(
         TimeState next = pathTime;
         const Stockfish::Color actingTeam = node.get_team_to_play();
         if (next.is_durative()) {
+            // The pieces the action sends to the partners' pockets: delayed
+            // transfer and the last-capture tie rule read them.
             next.advance_action(actingTeam, action.moveA != Stockfish::MOVE_NONE,
-                                action.moveB != Stockfish::MOVE_NONE);
+                                action.moveB != Stockfish::MOVE_NONE,
+                                board.hand_piece_type(BOARD_A, action.moveA),
+                                board.hand_piece_type(BOARD_B, action.moveB));
             return next;
         }
         next.advance(actingTeam, board.on_turn_on_both_boards(actingTeam));

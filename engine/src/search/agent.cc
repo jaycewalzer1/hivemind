@@ -6130,6 +6130,19 @@ bool Agent::try_reuse_mate_continuation(
 JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engines, 
                                         Stockfish::Color teamSide, bool teamHasTimeAdvantage,
                                         const SearchOptions& options) {
+    if (options.clock && options.clock->mate_race_by_landing()
+        && (options.search.enableRootMateSearch || options.search.enableMateProbe
+            || options.search.certifySelectedMove)) {
+        // MateRaceByLanding: the root provers judge mate races in v3
+        // alternation (our root action first, the pessimistic race rule) and
+        // would overrule the tree's landing order, so this search leaves
+        // mates to the tree's solver.
+        SearchOptions landing = options;
+        landing.search.enableRootMateSearch = false;
+        landing.search.enableMateProbe = false;
+        landing.search.certifySelectedMove = false;
+        return run_search(board, engines, teamSide, teamHasTimeAdvantage, landing);
+    }
     std::unique_lock searchLock(searchMutex_);
     // Freed memory goes back to the OS only once no search has run for a
     // while: the trim locks the arenas these workers allocate from.

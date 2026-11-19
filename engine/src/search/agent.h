@@ -310,6 +310,7 @@ private:
 
     friend class AgentTreeReuseTestPeer;
     friend class AgentDurativeTestPeer;
+    friend class AgentDurativePart2Peer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);
