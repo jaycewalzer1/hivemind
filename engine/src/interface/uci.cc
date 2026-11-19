@@ -685,9 +685,12 @@ void UCI::setoption(std::istringstream& is) {
     } else if (name == "PassCapK") {
         durativeConfig.passCapK = std::clamp(std::stoi(value), 1, 64);
         std::cout << "info string PassCapK set to " << durativeConfig.passCapK << std::endl;
-    } else if (name == "SeatClocksMs" || name == "SeatPaceMs" || name == "SeatElapsedMs") {
+    } else if (name == "SeatClocksMs" || name == "SeatPaceMs" || name == "SeatElapsedMs"
+               || name == "SeatSitting") {
         // Four numbers "<Aw> <Ab> <Bw> <Bb>"; an empty value (or "none")
-        // clears the option back to v3's derivation.
+        // clears the option back to v3's derivation. SeatSitting is 0/1 per
+        // seat: an opponent seat on turn that is in a pass, so the sit-off
+        // rule knows it will not move (self-play sets this directly).
         std::string rest;
         std::getline(is, rest);
         std::istringstream fields(value + " " + rest);
@@ -697,11 +700,19 @@ void UCI::setoption(std::istringstream& is) {
         while (read < 4 && fields >> field) {
             seats[read++] = static_cast<int32_t>(std::clamp<long long>(
                 field, name == "SeatClocksMs" ? -TimeState::MAX_LEAD_MS : 0,
-                TimeState::MAX_LEAD_MS));
+                name == "SeatSitting" ? 1 : TimeState::MAX_LEAD_MS));
         }
         if (read != 0 && read != 4) {
             std::cout << "info string " << name
                       << " needs four values <Aw> <Ab> <Bw> <Bb>" << std::endl;
+            return;
+        }
+        if (name == "SeatSitting") {
+            for (int seat = 0; seat < 4; ++seat) {
+                durativeConfig.seatSitting[seat] = seats[seat] != 0;
+            }
+            std::cout << "info string SeatSitting set to " << seats[0] << " " << seats[1]
+                      << " " << seats[2] << " " << seats[3] << std::endl;
             return;
         }
         std::array<int32_t, 4>& target = name == "SeatClocksMs"
@@ -852,6 +863,7 @@ void UCI::send_uci_response() {
     cout << "option name SeatClocksMs type string default <empty>" << endl;
     cout << "option name SeatPaceMs type string default <empty>" << endl;
     cout << "option name SeatElapsedMs type string default <empty>" << endl;
+    cout << "option name SeatSitting type string default <empty>" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

@@ -396,7 +396,7 @@ TEST_F(UCIOpeningNoiseTest, Wave2DefaultsRootOnTheStockV3Clock) {
              {"DurativeTree", "false"}, {"SitGate", "true"}, {"FlagLoss", "false"},
              {"InstantTransfer", "true"}, {"MateRaceByLanding", "false"},
              {"PassCapK", "8"}, {"SeatClocksMs", ""}, {"SeatPaceMs", ""},
-             {"SeatElapsedMs", ""}}) {
+             {"SeatElapsedMs", ""}, {"SeatSitting", ""}}) {
         set_option(uci, name, value);
     }
     EXPECT_EQ(*UCIOpeningNoiseTestPeer::clock(uci), *clock);
@@ -431,6 +431,14 @@ TEST_F(UCIOpeningNoiseTest, Wave2OptionsBuildTheDurativeClock) {
     // A root pass is capped at 3 x 700 ms.
     TimeState after = clock->after_action(Stockfish::WHITE, false, false);
     EXPECT_EQ(after.seat_ready_ms(TimeState::SEAT_AW), 2100);
+
+    // SeatSitting reaches the root: an opponent seat on turn that sits.
+    // White is on turn on board B, so Bw is the white team's opponent there.
+    EXPECT_FALSE(clock->seat_sitting(TimeState::SEAT_BW));
+    set_option(uci, "SeatSitting", "0 0 1 0");
+    EXPECT_TRUE(UCIOpeningNoiseTestPeer::clock(uci)->seat_sitting(TimeState::SEAT_BW));
+    set_option(uci, "SeatSitting", "");
+    EXPECT_FALSE(UCIOpeningNoiseTestPeer::clock(uci)->seat_sitting(TimeState::SEAT_BW));
 
     // A wrong count is refused and keeps the previous value.
     set_option(uci, "SeatClocksMs", "1 2 3");
