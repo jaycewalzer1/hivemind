@@ -124,6 +124,20 @@ def evaluate(model, dataset, weights, batch_size=2048):
     return metrics
 
 
+HEADS = ("policy_head.", "value_head.")
+
+
+def parameter_groups(model, lr, trunk_lr=None):
+    """AdamW parameter groups: one at `lr`, or the trunk at `trunk_lr` and
+    the heads at `lr`. The LR schedule scales every group alike."""
+    if trunk_lr is None:
+        return [{"params": list(model.parameters()), "lr": lr}]
+    heads, trunk = [], []
+    for name, parameter in model.named_parameters():
+        (heads if name.startswith(HEADS) else trunk).append(parameter)
+    return [{"params": trunk, "lr": trunk_lr, "name": "trunk"}, {"params": heads, "lr": lr, "name": "heads"}]
+
+
 def concat_batches(first, second):
     """One batch from two (the raw and search streams)."""
     merged = {key: torch.cat((first[key], second[key])) for key in first if key != "policy"}
@@ -182,6 +196,10 @@ def main():
                         help="Positions per validation batch; reduce when GPU memory is limited")
     parser.add_argument("--epochs", type=float, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--trunk-lr", type=float, default=None,
+                        help="Learning rate of the trunk (stem, blocks, exchanges, attention); the "
+                             "policy and value heads keep --lr. A fine-tune keeps the trunk slow "
+                             "(default: --lr for everything)")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--window-chunks", type=int, default=4,
                         help="Chunks held on the device at once")
@@ -301,7 +319,10 @@ def main():
         for block in model.blocks:
             block.compile()
     print(f"{size}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters", flush=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(parameter_groups(model, args.lr, args.trunk_lr), lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    if args.trunk_lr is not None:
+        print(f"learning rates: trunk {args.trunk_lr}, heads {args.lr}", flush=True)
     # An epoch is one pass over the raw data, or over the search data without it.
     steps_per_epoch = max(1, positions // raw_rows if raw_rows else search_positions // search_rows)
     total_steps = args.steps if args.steps else int(args.epochs * steps_per_epoch)
@@ -336,7 +357,7 @@ def main():
                 metrics["selection_loss"] = (search_metrics["loss"] if not raw_rows else
                                              metrics["loss"] +
                                              (search_metrics["loss"] if search_rows else 0.0))
-            metrics.update(epoch=round(step / steps_per_epoch, 2), lr=schedule.get_last_lr()[0],
+            metrics.update(epoch=round(step / steps_per_epoch, 2), lr=schedule.get_last_lr()[-1],
                            seconds=round(time.time() - started))
             history.append(metrics)
             print(json.dumps({k: round(v, 5) if isinstance(v, float) else v for k, v in metrics.items()}),

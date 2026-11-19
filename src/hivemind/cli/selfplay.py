@@ -91,7 +91,13 @@ def main():
                         help="One-search-worker engine binary")
     parser.add_argument("--parallel-games", type=int, default=6)
     parser.add_argument("--dry-run", action="store_true", help="Print the command and exit")
+    parser.add_argument("--wave2", action="store_true",
+                        help="Play with the wave 2 preset (hivemind.wave2: real seat clocks, durative tree, "
+                             "no sit gate) on the simulated clock; engine options given after it override it")
     args, extra = parser.parse_known_args()
+    if args.wave2:
+        from hivemind import wave2
+        extra = [*time_model_options("clock"), *wave2.WAVE2.engine_args(), *extra]
 
     if not args.engine.is_file():
         sys.exit(f"Engine binary not found at {args.engine}; build the one-worker engine with\n"

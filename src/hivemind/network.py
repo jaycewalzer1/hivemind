@@ -39,6 +39,14 @@ ARTIFACTS = {
                      "efef8ca12634a26d55f8d34313459d36ae1469411208384d5c5f636bc43742c2"),
     "checkpoint": Artifact(TWIN_REPOSITORY, TWIN_REVISION, "twin-s-noattn.pt",
                            "89d67816acf331f9141a8ebbffe379e16642de17fe06abdd78194f87939bc05e"),
+    # twin-s-clock RL iteration 13, the card's latest promoted network at
+    # revision edaa246c, and its training checkpoint: where wave 2 starts.
+    "clock-it13": Artifact("aminwoo/bughouse-twin-s-clock",
+                           "edaa246cdb86c43bb3f18f0836501912c080e7f1", "twin-s-clock-it13.onnx",
+                           "f4ac25e32a993776f26b42d79cc5c1e48b77a16a13d1e2a2db30528f43c9af73"),
+    "clock-it13-checkpoint": Artifact("aminwoo/bughouse-twin-s-clock",
+                                      "edaa246cdb86c43bb3f18f0836501912c080e7f1", "twin-s-clock-it13.pt",
+                                      "5bb43c7f79bcc4cf0af2d2d0a88e7b60cf886312f3617c938f8e5a21ec0730bc"),
 }
 DEFAULT_NETWORK_VARIANT = "clock"
 DEFAULT_ONNX_PATH = MODEL_DIRECTORY / ARTIFACTS[DEFAULT_NETWORK_VARIANT].filename
@@ -47,7 +55,8 @@ TWIN_ONNX_PATH = MODEL_DIRECTORY / ARTIFACTS["onnx"].filename
 # The generator's training checkpoint, where the RL loop promotes each new one.
 TWIN_CHECKPOINT_PATH = PROJECT_ROOT / "artifacts" / "distill" / "twin-s-noattn" / "best.pt"
 # Variants installed somewhere other than MODEL_DIRECTORY by default.
-DESTINATIONS = {"checkpoint": TWIN_CHECKPOINT_PATH}
+DESTINATIONS = {"checkpoint": TWIN_CHECKPOINT_PATH,
+                "clock-it13-checkpoint": PROJECT_ROOT / "artifacts" / "distill" / "twin-s-clock-it13" / "best.pt"}
 
 
 def for_this_machine(model):

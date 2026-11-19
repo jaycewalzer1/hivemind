@@ -33,6 +33,13 @@ lists what went where. Training downloads the games it needs, with the teacher
 validation set, and deletes them again once it has finished. --keep-selfplay
 keeps everything on disk; --archive-only archives and exits.
 
+With --wave2 (talisman fork), self-play and matches run on four real seat
+clocks with the durative tree, flag loss and no hard sit gate (hivemind.wave2;
+docs/wave2_training.md), each segment's value labels are checked
+(hivemind.distill.labels), training continues the generator's checkpoint with
+a slow trunk (--train-from generator, --trunk-lr), and a candidate is
+promoted only when it beats the generator (--promote-above 0.5).
+
 Stop between stages with: touch RUNS/rl-loop.stop"""
 
 import argparse
@@ -47,9 +54,11 @@ import subprocess
 import sys
 import time
 
+from hivemind import wave2
 from hivemind.cli import selfplay, train
 from hivemind.data import archive
 from hivemind.distill.data import chunk_problem
+from hivemind.distill.labels import label_report
 from hivemind.distill.exchange import PROTOCOL, HubExchange, install, open_exchange, sha256
 from hivemind.network import SELFPLAY_ARCHIVE, SELFPLAY_EXCHANGE, TWIN_ONNX_PATH, TWIN_REPOSITORY
 from hivemind.paths import PROJECT_ROOT
@@ -93,15 +102,19 @@ def replay_iterations(n, window):
     return list(range(n - 1, max(1, n - window) - 1, -1))
 
 
-def engine_supports(engine, text):
-    """Whether the engine's --help mentions `text`: older builds lack options
-    the loop now passes when it can."""
+def engine_help(engine):
     try:
         result = subprocess.run([str(engine), "--help"], cwd=ENGINE_DIR, capture_output=True,
                                 text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return text in result.stdout + result.stderr
+        return ""
+    return result.stdout + result.stderr
+
+
+def engine_supports(engine, text):
+    """Whether the engine's --help mentions `text`: older builds lack options
+    the loop now passes when it can."""
+    return text in engine_help(engine)
 
 
 def checkpoint_games(progress):
@@ -213,6 +226,12 @@ def finished_selfplay(it):
     return paths
 
 
+# Settings added for wave 2, at their upstream behaviour: what the loop uses
+# when its arguments do not name them.
+WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate": False,
+                  "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None}
+
+
 class Loop:
     def __init__(self, args, generator=TWIN_ONNX_PATH, checkpoint=train.GENERATOR_CHECKPOINT,
                  teacher_val=train.TEACHER_VAL):
@@ -236,6 +255,9 @@ class Loop:
         self.resume_matches = engine_supports(args.match_engine, "games.tsv")
         self.api = None
         self.exchange = None  # set for --distributed
+
+    def option(self, name):
+        return getattr(self.args, name, WAVE2_DEFAULTS[name])
 
     def log(self, message):
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
@@ -320,6 +342,8 @@ class Loop:
                 extra += ["--tree-reuse", "true"]
         if self.checkpoint_selfplay:
             extra += ["--checkpoint-games", str(self.args.checkpoint_games), "--resume", "true"]
+        # The wave 2 rules hold for validation too: its games are this iteration's game.
+        extra += self.option("wave2_options").engine_args()
         command = selfplay.engine_command(self.args.selfplay_engine, self.generator_sp1, games, seed,
                                           data, records, self.args.parallel_games, extra)
         with log.open("a" if resuming else "w") as stream:
@@ -335,7 +359,18 @@ class Loop:
         positions = train.positions([data])
         if not positions:
             raise StageFailed(f"{name}: empty corpus")
-        self.mark(name, {"games": games, "seed": seed, "positions": positions, "generator": generator})
+        marker = {"games": games, "seed": seed, "positions": positions, "generator": generator}
+        if not self.option("wave2_options").is_stock:
+            marker["wave2"] = self.option("wave2_options").as_dict()
+        if self.option("label_check"):
+            labels = label_report(log, data)
+            self.log(f"it{self.n} {name} labels: {labels['games']} games, {labels['records']} records, "
+                     f"{labels['flag_games']} flag games, {labels['repeat_records']} repeated positions, "
+                     f"terminations {json.dumps(labels['terminations'])}")
+            if labels["problems"]:
+                raise StageFailed(f"{name}: value labels unfit to train on: {'; '.join(labels['problems'][:5])}")
+            marker["labels"] = {k: v for k, v in labels.items() if k != "problems"}
+        self.mark(name, marker)
         self.archive(self.n)
 
     def games_played(self):
@@ -435,8 +470,12 @@ class Loop:
             return
         self.check_stop()
         previous = self.runs / f"rl-it{self.n - 1}"
-        init = (previous / "arms" / "C" / "last.pt" if previous.exists()
-                else train.generator_checkpoint(self.generator, self.checkpoint))
+        # --train-from generator: the better network (the promotion rule) is
+        # where the next iteration starts, not an unpromoted candidate.
+        if previous.exists() and self.option("train_from") == "previous":
+            init = previous / "arms" / "C" / "last.pt"
+        else:
+            init = train.generator_checkpoint(self.generator, self.checkpoint)
         if not init.is_file():
             raise StageFailed(f"missing {init}")
         replays = replay_iterations(self.n, self.args.window)
@@ -458,7 +497,8 @@ class Loop:
                  f"x{self.args.new_passes}, {opos} replay positions x{self.args.replay_passes} "
                  f"(replay share {fraction}, {len(old)} dirs, batch {self.args.batch_size})")
         command = train.distill_command(init, new, [self.it / "search" / "val"], old, steps, fraction,
-                                        self.args.batch_size, self.n, out, self.teacher_val)
+                                        self.args.batch_size, self.n, out, self.teacher_val,
+                                        lr=self.option("lr"), trunk_lr=self.option("trunk_lr"))
         with log.open("w") as stream:
             if subprocess.run(command, cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
                               env={**os.environ, **train.TRAINING_ENV}).returncode:
@@ -499,7 +539,8 @@ class Loop:
                        "--positions", str(self.args.openings), "--output", str(out),
                        *(("--time-model", "clock") if clock == "clock" else ()),
                        *(("--baseline-time-model", "flag") if flag_baseline else ()),
-                       *(("--resume", "true") if self.resume_matches else ())]
+                       *(("--resume", "true") if self.resume_matches else ()),
+                       *self.option("wave2_options").engine_args()]
             with log.open("a" if self.resume_matches else "w") as stream:
                 process = subprocess.Popen(command, cwd=ENGINE_DIR, stdout=stream, stderr=subprocess.STDOUT)
                 status = None
@@ -518,6 +559,8 @@ class Loop:
                 raise StageFailed(f"match vs {name} failed (see {log})")
             break
         summary = {**match_summary(out / "summary.json", games), "movetime": movetime, "time_model": clock}
+        if not self.option("wave2_options").is_stock:
+            summary["wave2"] = self.option("wave2_options").as_dict()
         if flag_baseline:
             summary["baseline_time_model"] = "flag"
         self.log(f"it{self.n} vs {name}: {json.dumps(summary)}")
@@ -527,14 +570,16 @@ class Loop:
         if self.done("promote"):
             return
         score = json.loads((self.it / "stages" / "match_generator.done").read_text())["score"]
-        if score >= 0.5:
+        above = self.option("promote_above")
+        promoted = score >= 0.5 if above is None else score > above
+        if promoted:
             install(self.it / "models" / "C.onnx", self.generator)
             install(self.it / "models" / "C.onnx", self.generator_sp1)
             install(self.arms / "C" / "last.pt", self.checkpoint)
             self.log(f"it{self.n} promoted (score {score}): it is the generator for it{self.n + 1}")
         else:
             self.log(f"it{self.n} not promoted (score {score}): the generator stays")
-        self.mark("promote", {"promoted": score >= 0.5, "score": score})
+        self.mark("promote", {"promoted": promoted, "score": score})
 
     def upload(self):
         """Not fatal: the next iteration's upload retries whatever is missing."""
@@ -607,6 +652,10 @@ class Loop:
         if self.exchange:
             self.gather()
         self.attempt(self.train)
+        if self.option("no_gate"):
+            self.log(f"it{n}: no matches (--no-gate): the generator stays")
+            self.mark("iteration", {"gate": False})
+            return
         self.attempt(self.match, "generator", self.generator)
         self.promote()
         self.upload()
@@ -617,6 +666,13 @@ class Loop:
                 self.log(f"it{n}: the generator is now the fixed baseline {self.fixed.name}")
             else:
                 self.log(f"it{n}: no fixed-baseline match before it{anchor + 1}")
+        elif (self.fixed.is_file() and not self.done(f"match_{self.fixed_name}")
+              and sha256(self.fixed) == (self.it / "stages" / "generator").read_text().strip()
+              and self.fixed_time_model == self.args.time_model):
+            # The generator is still the fixed baseline: the same match again.
+            self.log(f"it{n}: the generator is {self.fixed.name}; its match counts for both")
+            self.mark(f"match_{self.fixed_name}", {
+                **json.loads((self.it / "stages" / "match_generator.done").read_text()), "same_as": "generator"})
         elif self.fixed.is_file():
             self.attempt(self.match, self.fixed_name, self.fixed, self.fixed_time_model)
         else:
@@ -727,7 +783,49 @@ def main():
                         help="With --distributed, leave self-play to contributors")
     parser.add_argument("--selfplay-engine", type=Path, default=selfplay.DEFAULT_ENGINE)
     parser.add_argument("--match-engine", type=Path, default=MATCH_ENGINE)
+    parser.add_argument("--lr", default=None,
+                        help="Learning rate of the heads, and of the trunk without --trunk-lr "
+                             "(default: 1e-4; 1e-4 with --wave2)")
+    parser.add_argument("--trunk-lr", default=None,
+                        help="The trunk's own learning rate, for a fine-tune (default: --lr; 5e-5 with --wave2)")
+    parser.add_argument("--train-from", choices=("previous", "generator"), default=None,
+                        help="Where each iteration's training starts: the previous iteration's weights "
+                             "whether promoted or not (upstream), or the generator's checkpoint, the "
+                             "better network by the promotion rule (default: previous; generator with --wave2)")
+    parser.add_argument("--promote-above", type=float, default=None,
+                        help="Promote when the score against the generator is above this (default: at or "
+                             "above 0.5; above 0.5 with --wave2, so a tie keeps the generator)")
+    parser.add_argument("--no-gate", action="store_true",
+                        help="Skip the matches (and promotion): a smoke test of self-play and training")
+    parser.add_argument("--label-check", choices=("on", "off"), default="on",
+                        help="Check each self-play segment's value labels against its game lines "
+                             "(hivemind.distill.labels) and fail the stage on a problem (default: on)")
+    parser.add_argument("--allow-stock-engine", action="store_true",
+                        help="With wave 2 options, an engine whose --help lacks them plays stock v3 "
+                             "games instead of stopping (for a smoke test before the wave 2 engine)")
+    wave2.add_arguments(parser)
     args = parser.parse_args()
+    try:
+        args.wave2_options = wave2.from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
+    args.label_check = args.label_check == "on"
+    if args.wave2:
+        args.lr = args.lr or "1e-4"
+        args.trunk_lr = args.trunk_lr or "5e-5"
+        args.train_from = args.train_from or "generator"
+        if args.promote_above is None:
+            args.promote_above = 0.5
+        if args.time_model == "flag":
+            args.time_model = "clock"  # the network reads lead and speed from the seat clocks
+    args.lr = args.lr or "1e-4"
+    args.train_from = args.train_from or "previous"
+    for name in ("lr", "trunk_lr"):
+        value = getattr(args, name)
+        if value is not None and not 0 < float(value) <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be in (0, 1]")
+    if not args.wave2_options.is_stock and args.distributed:
+        parser.error("--distributed does not carry the wave 2 options to contributors yet")
     if not -1 < args.resign_threshold <= 0:
         parser.error("--resign-threshold must be in (-1, 0]")
     if args.new_passes <= 0 or args.replay_passes < 0:
@@ -761,6 +859,17 @@ def main():
     args.selfplay_engine = args.selfplay_engine.resolve()
     args.match_engine = args.match_engine.resolve()
     args.runs = args.runs.resolve()
+    if not args.archive_only and not args.wave2_options.is_stock:
+        missing = sorted({*wave2.missing_engine_options(args.wave2_options, engine_help(args.selfplay_engine)),
+                          *(() if args.no_gate else wave2.missing_engine_options(
+                              args.wave2_options, engine_help(args.match_engine)))})
+        if missing:
+            if not args.allow_stock_engine:
+                sys.exit(f"The engines lack the wave 2 options {', '.join(missing)}: build the wave 2 "
+                         f"engine (docs/wave2_training.md), or pass --allow-stock-engine for a stock smoke test.")
+            print(f"wave 2 options {', '.join(missing)} missing from the engines: playing stock v3 games",
+                  flush=True)
+            args.wave2_options = wave2.STOCK
 
     loop = Loop(args, generator=args.generator, checkpoint=args.generator_checkpoint)
     skipped = unarchived = None

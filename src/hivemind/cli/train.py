@@ -55,8 +55,9 @@ TRAINING_ENV = {"OMP_NUM_THREADS": "2", "PYTORCH_ALLOC_CONF": "expandable_segmen
 
 
 def distill_command(init, data, val, replay, steps, fraction, batch_size, seed, out,
-                    teacher_val=(), extra=()):
-    """The `hivemind distill-train` command line of one RL iteration."""
+                    teacher_val=(), extra=(), lr="1e-4", trunk_lr=None):
+    """The `hivemind distill-train` command line of one RL iteration;
+    `trunk_lr` gives the trunk its own, smaller rate (a fine-tune)."""
     return [
         sys.executable, "-m", "hivemind", "distill-train",
         "--init", str(Path(init).resolve()),
@@ -67,7 +68,8 @@ def distill_command(init, data, val, replay, steps, fraction, batch_size, seed, 
         *(["--replay-data", *map(str, replay), "--replay-fraction", str(fraction)]
           if fraction > 0 else []),
         "--steps", str(steps),
-        "--lr", "1e-4",
+        "--lr", str(lr),
+        *(["--trunk-lr", str(trunk_lr)] if trunk_lr is not None else []),
         "--eval-every", str(max(1, steps // 4)),
         "--batch-size", str(batch_size),
         "--eval-batch-size", str(batch_size),
