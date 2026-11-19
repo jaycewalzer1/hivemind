@@ -400,3 +400,82 @@ def test_init_lineage_wide_starts_from_the_widened_net_and_gates_against_it13(tm
     assert paths["generator"].read_text() == "wide onnx"
     assert paths["checkpoint"].read_text() == "wide pt"
     assert paths["fixed"].read_text() == "clock-it13"
+
+
+# ---- seat timing into the chunks --------------------------------------------
+
+def _seat_rows(path, rows):
+    """A seat_clocks.tsv as the wave 2b engine writes it."""
+    from hivemind.distill.timing import POCKETS, PIECES
+
+    header = ["game", "record", "team", "time_ms", "nodes",
+              *[f"clock_{s}" for s in ("aw", "ab", "bw", "bb")],
+              *[f"elapsed_{s}" for s in ("aw", "ab", "bw", "bb")],
+              *[f"pace_{s}" for s in ("aw", "ab", "bw", "bb")], "board_elapsed_a", "board_elapsed_b",
+              *[f"{kind}_{pocket}_{piece}" for kind in ("recent", "arrivals") for pocket in POCKETS
+                for piece in PIECES]]
+    lines = ["\t".join(header)]
+    for game, record, team, clocks, board_elapsed, recent, arrivals in rows:
+        lines.append("\t".join(map(str, [game, record, team, 0, 100, *clocks, 0, 0, 0, 0, 300, 300, 300, 300,
+                                         *board_elapsed, *recent, *arrivals])))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_attach_timing_turns_chunks_into_v3_with_team_relative_clocks(tmp_path):
+    from hivemind.distill.timing import attach_timing
+
+    data = tmp_path / "data"
+    data.mkdir()
+    rng = np.random.default_rng(6)
+    values, *_ = _write_v3(data / "search_0_00000.dst", rng, n=5, version=VERSION)
+    (tmp_path / "log").write_text("selfplay game 1/2 raw 0 samples 3 events 3 termination checkmate\n"
+                                  "selfplay game 2/2 raw 0 samples 2 events 2 termination macro-ply limit\n")
+    rows = []
+    for record, team in enumerate((0, 1, 0)):
+        rows.append((1, record, team, (100_000, 90_000, 80_000, 70_000), (1500, 2500),
+                     [record] + [0] * 19, [0] * 4 + [1] + [0] * 15))
+    for record in range(2):
+        rows.append((2, record, 1, (1, 2, 3, 4), (0, 0), [0] * 20, [2] * 20))
+    rows.append(rows[-1])  # a resumed run appends a game's rows again
+    _seat_rows(tmp_path / "seat_clocks.tsv", rows)
+    summary = attach_timing(tmp_path / "log", tmp_path / "seat_clocks.tsv", data)
+    assert summary == {"chunks": 1, "rewritten": 1, "records": 5, "labelled": 3, "arrivals_total": 3.0}
+    chunk = read_chunk(data / "search_0_00000.dst")
+    np.testing.assert_array_equal(chunk["plane_values"], values)
+    # White team: ours A Aw, theirs A Ab, ours B Bb, theirs B Bw; black the other way.
+    assert chunk["seat_clocks_ms"][0].tolist() == [100_000, 90_000, 70_000, 80_000]
+    assert chunk["seat_clocks_ms"][1].tolist() == [90_000, 100_000, 80_000, 70_000]
+    assert chunk["elapsed_ms"][0].tolist() == [1500, 2500]
+    assert chunk["recent_landed"][:3, 0].tolist() == [0, 1, 2]
+    assert chunk["has_arrivals"].tolist() == [True, True, True, False, False]
+    assert chunk["arrivals"][0, 4] == 1 and chunk["arrivals"][3:].sum() == 0
+    # Idempotent: a v3 chunk is left as it is.
+    assert attach_timing(tmp_path / "log", tmp_path / "seat_clocks.tsv", data)["rewritten"] == 0
+    wide_values = read_chunk(data / "search_0_00000.dst", layout="wide")["plane_values"]
+    assert float(wide_values[0, N]) == pytest.approx(100 / 300, abs=1e-3)
+
+
+def test_attach_timing_refuses_rows_that_do_not_line_up(tmp_path):
+    from hivemind.distill.timing import attach_timing
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_v3(data / "c.dst", np.random.default_rng(7), n=3, version=VERSION)
+    (tmp_path / "log").write_text("selfplay game 1/1 raw 0 samples 3 events 3 termination flag\n")
+    _seat_rows(tmp_path / "seat_clocks.tsv", [(1, r, 0, (1, 2, 3, 4), (0, 0), [0] * 20, [0] * 20)
+                                              for r in range(2)])
+    with pytest.raises(ValueError, match="do not line up"):
+        attach_timing(tmp_path / "log", tmp_path / "seat_clocks.tsv", data)
+
+
+def test_rl_loop_reads_the_generators_input_width(tmp_path):
+    from hivemind.cli.rl_loop import onnx_input_planes
+
+    path = tmp_path / "not-onnx.onnx"
+    path.write_text("x")
+    assert onnx_input_planes(path) is None
+    from hivemind.paths import MODEL_DIRECTORY
+
+    for name, planes in (("twin-s-clock-wide.onnx", NUM_WIDE_CHANNELS), ("twin-s-clock-it13.onnx", PLANES)):
+        if (MODEL_DIRECTORY / name).is_file():
+            assert onnx_input_planes(MODEL_DIRECTORY / name) == planes
