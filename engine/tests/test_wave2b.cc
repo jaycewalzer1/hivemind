@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
+#include <tuple>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -396,6 +398,72 @@ TEST_F(Wave2bTest, ANarrowNetworkIgnoresTheExtrasBitForBit) {
     EXPECT_EQ(plain, run(garbage.data()));
     if (!real) {
         GTEST_LOG_(INFO) << "it13 not found; checked on uniform.onnx only";
+    }
+}
+
+TEST_F(Wave2bTest, TheWidenedIt13AnswersExactlyAsIt13WhateverTheExtraPlanesHold) {
+    const std::filesystem::path models =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "models";
+    // FP32 against FP32 (the published twin-s-clock.onnx keeps FP16 weights;
+    // the FP16 pair is compared below at FP16's tolerance).
+    for (const auto& [narrowName, wideName, tolerance] :
+         std::initializer_list<std::tuple<const char*, const char*, float>>{
+             {"twin-s-clock-fp32.onnx", "twin-s-clock-wide-fp32.onnx", 1e-4f},
+             {"twin-s-clock-it13.onnx", "twin-s-clock-wide.onnx", 2e-2f}}) {
+        const std::filesystem::path it13 = models / narrowName;
+        const std::filesystem::path wide = models / wideName;
+        if (!std::filesystem::exists(it13) || !std::filesystem::exists(wide)) {
+            GTEST_LOG_(INFO) << "skipped: needs engine/models/" << narrowName << " and " << wideName;
+            continue;
+        }
+        Engine narrowEngine(0, 1);
+        Engine wideEngine(0, 1);
+        ASSERT_TRUE(narrowEngine.loadNetwork(it13.string(), ""));
+        ASSERT_TRUE(wideEngine.loadNetwork(wide.string(), ""));
+        ASSERT_TRUE(wideEngine.wideInputs());
+        ASSERT_TRUE(wideEngine.hasArrivals());
+        Board board;
+        set_pockets(board);
+        std::mt19937_64 random(3);
+        float worst = 0.0f;
+        for (int trial = 0; trial < 12; ++trial) {
+            const Stockfish::Color team = trial % 2 ? BLACK : WHITE;
+            const TimeState time = wide_state(team);
+            std::vector<float> obs(NB_INPUT_VALUES());
+            board_to_planes(board, obs.data(), team, time);
+            // The contract's planes in half the trials, anything in [0, 1] in the rest.
+            std::vector<float> extras(NB_WIDE_EXTRA_VALUES);
+            if (trial % 4 < 2) {
+                wide_extra_planes(board, team, time, extras.data());
+            } else {
+                std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+                for (float& value : extras) value = unit(random);
+            }
+            auto run = [&](Engine& engine, const float* x, std::vector<float>& arrivals) {
+                std::vector<float> out(1 + 2 * NB_POLICY_VALUES() + 3 + 1);
+                float* value = out.data();
+                float* piA = value + 1;
+                float* piB = piA + NB_POLICY_VALUES();
+                float* wdl = piB + NB_POLICY_VALUES();
+                EXPECT_TRUE(engine.runInference(obs.data(), value, piA, piB, wdl, wdl + 3, 0, x,
+                                                arrivals.data()));
+                return out;
+            };
+            std::vector<float> ignored(NB_ARRIVALS_VALUES), arrivals(NB_ARRIVALS_VALUES, -1.0f);
+            const std::vector<float> a = run(narrowEngine, nullptr, ignored);
+            const std::vector<float> b = run(wideEngine, extras.data(), arrivals);
+            for (size_t i = 0; i < a.size(); ++i) {
+                worst = std::max(worst, std::abs(a[i] - b[i]));
+            }
+            for (float value : arrivals) {
+                EXPECT_EQ(value, 0.0f);  // the arrivals head's last layer is zero
+            }
+        }
+        // The networks differ only by zero weights: the outputs agree to
+        // rounding.
+        EXPECT_LT(worst, tolerance) << narrowName << " vs " << wideName;
+        GTEST_LOG_(INFO) << narrowName << " vs " << wideName
+                         << ": largest difference over value, policies, WDL, moves left " << worst;
     }
 }
 
