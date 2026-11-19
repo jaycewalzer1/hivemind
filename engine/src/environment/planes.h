@@ -2,6 +2,9 @@
 
 #include "nn/backend_compat.h"
 
+#include <array>
+#include <string>
+
 #include "environment/board.h"
 #include "environment/time_state.h"
 #include "common/utils.h"
@@ -40,6 +43,17 @@ float clock_speed_plane_value(const TimeState& time, Stockfish::Color team);
  */
 void wide_extra_planes(Board& board, Stockfish::Color team, const TimeState& time,
                        float* extras);
+
+/**
+ * @brief Parses the UCI SeatArrivalsMs value, "<pocket>:<piece>:<ms_ago>,..."
+ * (pocket Aw Ab Bw Bb, piece P N B R Q, either case; spaces ignored; empty =
+ * none) into @p landings. Landings RECENT_LANDING_WINDOW_MS old or more are
+ * dropped; past MAX_RECENT_LANDINGS the newest are kept. False on a bad
+ * item (named in @p error), leaving @p landings alone.
+ */
+bool parse_seat_arrivals(const std::string& text,
+                         std::array<SeatLanding, MAX_RECENT_LANDINGS>& landings,
+                         std::string* error = nullptr);
 
 /**
  * @brief The whole input of a widened network for one position

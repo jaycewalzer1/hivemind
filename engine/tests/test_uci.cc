@@ -43,6 +43,10 @@ public:
         uci.networkReadsClock = reads;
     }
 
+    static void set_network_wide(UCI& uci, bool wide) {
+        uci.networkWide = wide;
+    }
+
     static bool clock_model(const UCI& uci) { return uci.current_clock().has_value(); }
 
     static std::optional<TimeState> clock(const UCI& uci) { return uci.current_clock(); }
@@ -447,4 +451,45 @@ TEST_F(UCIOpeningNoiseTest, Wave2OptionsBuildTheDurativeClock) {
     set_option(uci, "SeatClocksMs", "");
     set_option(uci, "TimeLeadMs", "-40");
     EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->lead_ms(Stockfish::WHITE), -40);
+}
+
+TEST_F(UCIOpeningNoiseTest, Wave2bSeatArrivalsReachAWideDurativeClockOnly) {
+    UCI uci;
+    set_option(uci, "TimeModel", "clock");
+    set_option(uci, "Team", "white");
+    set_option(uci, "RootMoveTimeMs", "500");
+    set_option(uci, "DurativeTree", "true");
+    set_option(uci, "SitGate", "false");
+    set_option(uci, "SeatClocksMs", "30000 29000 28000 31000");
+    set_option(uci, "SeatElapsedMs", "1200 0 0 3400");
+    set_option(uci, "SeatArrivalsMs", "Bb:N:300, bb:n:1200,Aw:q:4999,Ab:P:5000");
+    // A narrow network: the wide bookkeeping stays out of the state.
+    EXPECT_FALSE(UCIOpeningNoiseTestPeer::clock(uci)->wide_timing());
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->recent_landings(TimeState::SEAT_BB,
+                                                                   Stockfish::KNIGHT), 0);
+
+    UCIOpeningNoiseTestPeer::set_network_wide(uci, true);
+    std::optional<TimeState> clock = UCIOpeningNoiseTestPeer::clock(uci);
+    ASSERT_TRUE(clock.has_value());
+    EXPECT_TRUE(clock->wide_timing());
+    EXPECT_EQ(clock->recent_landings(TimeState::SEAT_BB, Stockfish::KNIGHT), 2);
+    EXPECT_EQ(clock->recent_landings(TimeState::SEAT_AW, Stockfish::QUEEN), 1);
+    // 5 s old is out of the window.
+    EXPECT_EQ(clock->recent_landings(TimeState::SEAT_AB, Stockfish::PAWN), 0);
+    // Each board's thinking time is its on-turn seat's SeatElapsedMs (white
+    // to move on both boards: Aw on A, Bw on B).
+    EXPECT_EQ(clock->board_elapsed_ms(0), 1200);
+    EXPECT_EQ(clock->board_elapsed_ms(1), 0);
+
+    // A bad item is refused and keeps the previous value; empty clears.
+    set_option(uci, "SeatArrivalsMs", "Cw:N:10");
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->recent_landings(TimeState::SEAT_BB,
+                                                                   Stockfish::KNIGHT), 2);
+    set_option(uci, "SeatArrivalsMs", "Aw:K:10");
+    set_option(uci, "SeatArrivalsMs", "Aw:N:-1");
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->recent_landings(TimeState::SEAT_BB,
+                                                                   Stockfish::KNIGHT), 2);
+    set_option(uci, "SeatArrivalsMs", "");
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->recent_landings(TimeState::SEAT_BB,
+                                                                   Stockfish::KNIGHT), 0);
 }

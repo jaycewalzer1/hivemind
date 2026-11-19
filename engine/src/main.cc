@@ -467,12 +467,19 @@ int main(int argc, char* argv[]) {
     // dumpplanes writes the network input planes of FEN lines (float32,
     // N x 78 x 8 x 8, or N x 74 x 8 x 8 with --legacy-planes for a network
     // from before the clock planes) with the engine's own encoder:
-    // calibration data for scripts/quantize_int8.py.
+    // calibration data for scripts/quantize_int8.py. --wide-planes true
+    // writes N x 130 x 8 x 8 (wave 2b); a line may then carry three more
+    // fields, ";<Aw> <Ab> <Bw> <Bb> clocks ms;<ea> <eb> ms since the last
+    // landing on A and B;<SeatArrivalsMs value>", and the position is
+    // encoded on a wide durative clock rooted for the team (lead from the
+    // clocks, both teams at 100 ms a move). Without them: the flag as
+    // above and no timing (only the presence planes of the extras set).
     if (argc > 1 && string(argv[1]) == "dumpplanes") {
         string fenFile, outputFile;
         size_t every = 1;
         size_t limit = 0;
         bool legacyPlanes = false;
+        bool widePlanes = false;
         for (int i = 2; i + 1 < argc; i += 2) {
             const string option = argv[i];
             if (option == "--fens") fenFile = argv[i + 1];
@@ -480,6 +487,7 @@ int main(int argc, char* argv[]) {
             else if (option == "--every") every = max<size_t>(1, stoull(argv[i + 1]));
             else if (option == "--limit") limit = stoull(argv[i + 1]);
             else if (option == "--legacy-planes") legacyPlanes = parse_bool_argument(argv[i + 1]);
+            else if (option == "--wide-planes") widePlanes = parse_bool_argument(argv[i + 1]);
             else {
                 cerr << "Unknown option " << option << endl;
                 return EXIT_FAILURE;
@@ -489,11 +497,12 @@ int main(int argc, char* argv[]) {
         ofstream out(outputFile, ios::binary);
         if (!fens || !out) {
             cerr << "Usage: dumpplanes --fens <file> --output <file> [--every n] [--limit n]"
-                    " [--legacy-planes <bool>]" << endl;
+                    " [--legacy-planes <bool>] [--wide-planes <bool>]" << endl;
             return EXIT_FAILURE;
         }
         vector<float> planes(NB_INPUT_VALUES());
         vector<float> legacy(NB_LEGACY_INPUT_CHANNELS * BOARD_HEIGHT * BOARD_WIDTH);
+        vector<float> wide(NB_WIDE_INPUT_CHANNELS * BOARD_HEIGHT * BOARD_WIDTH);
         size_t index = 0;
         size_t written = 0;
         for (string line; getline(fens, line) && (limit == 0 || written < limit); ++index) {
@@ -505,15 +514,40 @@ int main(int argc, char* argv[]) {
             for (string field; getline(stream, field, ';');) {
                 fields.push_back(field);
             }
-            if (fields.size() != 4) {
+            // An empty arrivals field leaves no seventh field.
+            if (widePlanes && fields.size() == 6) {
+                fields.emplace_back();
+            }
+            if (fields.size() != 4 && !(widePlanes && fields.size() == 7)) {
                 continue;
             }
             Board board;
             board.set(fields[0] + "|" + fields[1]);
-            board_to_planes(board, planes.data(),
-                            fields[2] == "w" ? Stockfish::WHITE : Stockfish::BLACK, fields[3] == "1");
+            const Stockfish::Color team = fields[2] == "w" ? Stockfish::WHITE : Stockfish::BLACK;
             const vector<float>* written_planes = &planes;
-            if (legacyPlanes) {
+            if (widePlanes) {
+                TimeState time = TimeState::legacy(team, fields[3] == "1");
+                if (fields.size() == 7) {
+                    DurativeConfig config;
+                    config.wideInputs = true;
+                    istringstream clocks(fields[4]);
+                    for (int32_t& clock : config.seatClocksMs) clocks >> clock;
+                    istringstream elapsed(fields[5]);
+                    for (int32_t& ms : config.boardElapsedMs) elapsed >> ms;
+                    if (!parse_seat_arrivals(fields[6], config.recentLandings)) {
+                        cerr << "Bad arrivals field: " << fields[6] << endl;
+                        return EXIT_FAILURE;
+                    }
+                    time = TimeState::durative(TimeState::clocked(team, 0).with_sit_gate(false), team,
+                                               board.side_to_move(BOARD_A),
+                                               board.side_to_move(BOARD_B), config);
+                }
+                board_to_wide_planes(board, wide.data(), team, time);
+                written_planes = &wide;
+            } else {
+                board_to_planes(board, planes.data(), team, fields[3] == "1");
+            }
+            if (legacyPlanes && !widePlanes) {
                 drop_clock_planes(planes.data(), legacy.data(), 1);
                 written_planes = &legacy;
             }

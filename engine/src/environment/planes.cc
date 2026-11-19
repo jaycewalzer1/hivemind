@@ -1,5 +1,8 @@
 #include "environment/planes.h"
 #include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <string>
 #include <array>
 #include <vector>
 #include <bit>
@@ -333,6 +336,67 @@ void wide_extra_planes(Board& board, Stockfish::Color team, const TimeState& tim
             }
         }
     }
+}
+
+bool parse_seat_arrivals(const std::string& text,
+                         std::array<SeatLanding, MAX_RECENT_LANDINGS>& landings,
+                         std::string* error) {
+    std::string compact = text;
+    compact.erase(std::remove_if(compact.begin(), compact.end(),
+                                 [](unsigned char c) { return std::isspace(c); }),
+                  compact.end());
+    static const std::string seats[4] = {"aw", "ab", "bw", "bb"};
+    static const std::string pieces = "pnbrq";
+    std::vector<SeatLanding> parsed;
+    std::stringstream items(compact);
+    for (std::string item; std::getline(items, item, ',');) {
+        if (item.empty()) {
+            continue;
+        }
+        const size_t first = item.find(':');
+        const size_t second = first == std::string::npos ? first : item.find(':', first + 1);
+        int seat = -1;
+        int type = 0;
+        long long ago = -1;
+        if (second != std::string::npos) {
+            std::string pocket = item.substr(0, first);
+            std::transform(pocket.begin(), pocket.end(), pocket.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (int index = 0; index < 4; ++index) {
+                seat = pocket == seats[index] ? index : seat;
+            }
+            const std::string piece = item.substr(first + 1, second - first - 1);
+            const size_t found = piece.size() == 1
+                ? pieces.find(static_cast<char>(std::tolower(static_cast<unsigned char>(piece[0]))))
+                : std::string::npos;
+            type = found == std::string::npos ? 0 : static_cast<int>(found) + 1;
+            try {
+                size_t used = 0;
+                const std::string number = item.substr(second + 1);
+                ago = std::stoll(number, &used);
+                if (used != number.size()) ago = -1;
+            } catch (const std::exception&) {
+                ago = -1;
+            }
+        }
+        if (seat < 0 || type == 0 || ago < 0) {
+            if (error) {
+                *error = item;
+            }
+            return false;
+        }
+        if (ago < RECENT_LANDING_WINDOW_MS) {
+            parsed.push_back(SeatLanding{static_cast<int8_t>(seat), static_cast<int8_t>(type),
+                                         static_cast<int32_t>(ago)});
+        }
+    }
+    std::stable_sort(parsed.begin(), parsed.end(),
+                     [](const SeatLanding& a, const SeatLanding& b) { return a.agoMs < b.agoMs; });
+    landings = {};
+    for (size_t index = 0; index < parsed.size() && index < MAX_RECENT_LANDINGS; ++index) {
+        landings[index] = parsed[index];
+    }
+    return true;
 }
 
 void board_to_wide_planes(Board& board, float* inputPlanes, Stockfish::Color teamSide,
