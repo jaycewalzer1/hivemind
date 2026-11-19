@@ -141,13 +141,17 @@ def missing_engine_options(options, engine_help):
     return [arg for arg in options.engine_args()[::2] if arg not in engine_help]
 
 
-def init_lineage(name, models, artifacts, fetch=None):
+def init_lineage(name, models, artifacts, fetch=None, wide=False, widen=None):
     """Start a wave 2 lineage from twin-s-clock iteration 13: the generator
     (MODELS/NAME.onnx), the fixed baseline every iteration is matched against
     (MODELS/NAME-it0.onnx, rl-loop's convention) and the generator's training
     checkpoint (ARTIFACTS/NAME/best.pt). The downloads are SHA-256 checked;
     files already there are kept, so a lineage that has promoted keeps its
-    generator. Returns {role: path}."""
+    generator. Returns {role: path}.
+
+    wide=True (wave 2b): the generator and its checkpoint are it13 widened
+    (hivemind.wide, made first if missing); the fixed baseline stays it13
+    itself, so the gate is against the same network as the narrow lineage's."""
     import shutil
 
     if fetch is None:
@@ -158,7 +162,15 @@ def init_lineage(name, models, artifacts, fetch=None):
     checkpoint = fetch("clock-it13-checkpoint", artifacts / "twin-s-clock-it13")
     paths = {"generator": models / f"{name}.onnx", "fixed": models / f"{name}-it0.onnx",
              "checkpoint": artifacts / name / "best.pt"}
-    for role, source in (("generator", onnx), ("fixed", onnx), ("checkpoint", checkpoint)):
+    generator, start = onnx, checkpoint
+    if wide:
+        from hivemind import wide as wide_net
+
+        generator = models / f"{wide_net.WIDE_NAME}.onnx"
+        start = artifacts / wide_net.WIDE_NAME / f"{wide_net.WIDE_NAME}.pt"
+        if not generator.is_file() or not start.is_file():
+            (widen or wide_net.widen)(checkpoint, start.parent, models)
+    for role, source in (("generator", generator), ("fixed", onnx), ("checkpoint", start)):
         if not paths[role].is_file():
             paths[role].parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, paths[role])
@@ -178,12 +190,38 @@ def main():
     init.add_argument("--name", default="twin-s-clock-w2")
     init.add_argument("--models", type=Path, default=MODEL_DIRECTORY)
     init.add_argument("--artifacts", type=Path, default=PROJECT_ROOT / "artifacts" / "distill")
+    init.add_argument("--wide", action="store_true",
+                      help="Wave 2b: start from it13 widened (twin-s-clock-wide), fixed baseline it13")
     sub.add_parser("options", help="Print the wave 2 preset's engine options")
+    widen = sub.add_parser("widen", help="Wave 2b: widen it13 to twin-s-clock-wide (.pt, .onnx, "
+                                         "-fp32.onnx), check parity, record SHA-256s")
+    widen.add_argument("--models", type=Path, default=MODEL_DIRECTORY)
+    widen.add_argument("--artifacts", type=Path, default=PROJECT_ROOT / "artifacts" / "distill")
+    widen.add_argument("--positions", type=int, default=300)
+    widen.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.command == "options":
         print(" ".join(WAVE2.engine_args()))
         return
-    for role, value in init_lineage(args.name, args.models.resolve(), args.artifacts.resolve()).items():
+    if args.command == "widen":
+        import json
+
+        from hivemind import wide
+        from hivemind.cli.fetch_network import fetch_network
+
+        checkpoint = fetch_network("clock-it13-checkpoint", args.artifacts.resolve() / "twin-s-clock-it13")
+        it13 = fetch_network("clock-it13", args.models.resolve())
+        # The published FP32 copy is it13's FP16 file converted, as ours is.
+        it13_fp32 = it13.with_name(f"{it13.stem}-fp32{it13.suffix}")
+        if not it13_fp32.is_file():
+            wide._convert_fp32(it13, it13_fp32)
+        record = wide.widen(checkpoint, args.artifacts.resolve() / wide.WIDE_NAME, args.models.resolve(),
+                            positions=args.positions, seed=args.seed,
+                            published={"it13_fp16": (it13, "fp16"), "it13_fp32": (it13_fp32, "fp32")})
+        print(json.dumps(record, indent=1))
+        return
+    for role, value in init_lineage(args.name, args.models.resolve(), args.artifacts.resolve(),
+                                    wide=args.wide).items():
         print(f"{role} {value}")
 
 
