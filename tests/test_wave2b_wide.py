@@ -489,3 +489,44 @@ def test_the_arrivals_head_trains_at_the_heads_rate():
     head_ids = {id(p) for p in heads["params"]}
     assert all(id(p) in head_ids for p in model.arrivals_head.parameters())
     assert heads["lr"] == 1e-4 and trunk["lr"] == 5e-5
+
+
+def test_python_wide_extras_equal_the_engines(tmp_path):
+    """The 26 extra planes per block from board2planes_wide against the C++
+    encoder (`hivemind dumpplanes --wide-planes true`), on random positions,
+    half with seat timing and landings around the 5 s window. Skipped
+    without a built wave 2b engine. The board planes are not compared: a FEN
+    line carries no move history, so last-move and en passant planes differ."""
+    import subprocess
+
+    from hivemind.domain.wide_planes import SEATS, format_seat_arrivals
+    from hivemind.paths import PROJECT_ROOT
+
+    engine = PROJECT_ROOT / "engine" / "build-ninja" / "hivemind"
+    if not engine.is_file() or "--wide-planes" not in subprocess.run(
+            [str(engine), "dumpplanes"], capture_output=True, text=True).stderr:
+        pytest.skip("no wave 2b engine build")
+    rng = np.random.default_rng(42)
+    positions = wide.random_positions(60, seed=42)
+    lines, timings = [], []
+    for index, (board, team) in enumerate(positions):
+        fen_a, fen_b = board.fen()
+        line = f"{fen_a};{fen_b};{'w' if team == chess.WHITE else 'b'};0"
+        timing = wide.random_timing(rng) if index % 2 else None
+        if timing is not None:
+            timing.seat_clocks_ms = {seat: int(ms) for seat, ms in timing.seat_clocks_ms.items()}
+            timing.elapsed_ms = tuple(int(ms) for ms in timing.elapsed_ms)
+            line += (f";{' '.join(str(timing.seat_clocks_ms[s]) for s in SEATS)}"
+                     f";{timing.elapsed_ms[0]} {timing.elapsed_ms[1]};{format_seat_arrivals(timing.landings)}")
+        lines.append(line)
+        timings.append(timing)
+    (tmp_path / "fens.txt").write_text("\n".join(lines) + "\n")
+    subprocess.run([str(engine), "dumpplanes", "--fens", str(tmp_path / "fens.txt"), "--output",
+                    str(tmp_path / "planes.bin"), "--wide-planes", "true"], check=True, capture_output=True)
+    engine_planes = np.fromfile(tmp_path / "planes.bin", np.float32).reshape(-1, NUM_WIDE_CHANNELS, 8, 8)
+    assert len(engine_planes) == len(positions)
+    for (board, team), timing, theirs in zip(positions, timings, engine_planes):
+        ours = board2planes_wide(board, team, timing=timing)
+        for block in range(2):
+            extra = slice(block * W + N, (block + 1) * W)
+            np.testing.assert_allclose(ours[extra], theirs[extra], atol=1e-6)
