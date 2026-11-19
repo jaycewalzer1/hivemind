@@ -2,6 +2,7 @@
 #include "nn/embedded_files.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -670,6 +671,46 @@ void UCI::setoption(std::istringstream& is) {
     } else if (name == "MaxMoveTimeMs") {
         maxMoveTimeMs = std::clamp(std::stoi(value), 0, 3600000);
         std::cout << "info string MaxMoveTimeMs set to " << maxMoveTimeMs << std::endl;
+    } else if (name == "DurativeTree" || name == "SitGate" || name == "FlagLoss"
+               || name == "InstantTransfer" || name == "MateRaceByLanding") {
+        if (value == "true" || value == "false") {
+            const bool on = value == "true";
+            if (name == "DurativeTree") durativeTree = on;
+            else if (name == "SitGate") sitGate = on;
+            else if (name == "FlagLoss") durativeConfig.flagLoss = on;
+            else if (name == "InstantTransfer") durativeConfig.instantTransfer = on;
+            else durativeConfig.mateRaceByLanding = on;
+            std::cout << "info string " << name << " set to " << value << std::endl;
+        }
+    } else if (name == "PassCapK") {
+        durativeConfig.passCapK = std::clamp(std::stoi(value), 1, 64);
+        std::cout << "info string PassCapK set to " << durativeConfig.passCapK << std::endl;
+    } else if (name == "SeatClocksMs" || name == "SeatPaceMs" || name == "SeatElapsedMs") {
+        // Four numbers "<Aw> <Ab> <Bw> <Bb>"; an empty value (or "none")
+        // clears the option back to v3's derivation.
+        std::string rest;
+        std::getline(is, rest);
+        std::istringstream fields(value + " " + rest);
+        std::array<int32_t, 4> seats{0, 0, 0, 0};
+        int read = 0;
+        long long field = 0;
+        while (read < 4 && fields >> field) {
+            seats[read++] = static_cast<int32_t>(std::clamp<long long>(
+                field, name == "SeatClocksMs" ? -TimeState::MAX_LEAD_MS : 0,
+                TimeState::MAX_LEAD_MS));
+        }
+        if (read != 0 && read != 4) {
+            std::cout << "info string " << name
+                      << " needs four values <Aw> <Ab> <Bw> <Bb>" << std::endl;
+            return;
+        }
+        std::array<int32_t, 4>& target = name == "SeatClocksMs"
+            ? durativeConfig.seatClocksMs
+            : name == "SeatPaceMs" ? durativeConfig.seatPaceMs
+                                   : durativeConfig.seatElapsedMs;
+        target = seats;
+        std::cout << "info string " << name << " set to " << seats[0] << " "
+                  << seats[1] << " " << seats[2] << " " << seats[3] << std::endl;
     } else if (name == "Mode") {
         // Deprecated alias for TimeAdvantage, kept so existing GUI profiles keep
         // working. "sit" meant the team was up on time and could wait; "go"
@@ -692,8 +733,21 @@ std::optional<TimeState> UCI::current_clock() const {
     if (!clock_model_active()) {
         return std::nullopt;
     }
-    return TimeState::clocked(
+    const TimeState v3 = TimeState::clocked(
         teamSide, timeLeadMs, teamMoveTimeMs, opponentMoveTimeMs, rootMoveTimeMs);
+    if (sitGate && !durativeTree) {
+        return v3;
+    }
+    const TimeState gated = v3.with_sit_gate(sitGate);
+    if (!durativeTree) {
+        return gated;
+    }
+    DurativeConfig config = durativeConfig;
+    config.rootMoveTimeMs = rootMoveTimeMs;
+    // side_to_move is not const, though it only reads.
+    Board& root = const_cast<Board&>(board);
+    return TimeState::durative(gated, teamSide, root.side_to_move(BOARD_A),
+                               root.side_to_move(BOARD_B), config);
 }
 
 bool UCI::team_may_sit() const {
@@ -788,6 +842,16 @@ void UCI::send_uci_response() {
     cout << "option name RootMoveTimeMs type spin default 0 min 0 max 3600000" << endl;
     cout << "option name MaxMoveTimeMs type spin default 0 min 0 max 3600000" << endl;
     cout << "option name RequireMoveOn type combo default none var none var A var B" << endl;
+    // Wave 2 (docs/wave2_engine.md); every default is stock v3.0.3.
+    cout << "option name DurativeTree type check default false" << endl;
+    cout << "option name SitGate type check default true" << endl;
+    cout << "option name FlagLoss type check default false" << endl;
+    cout << "option name InstantTransfer type check default true" << endl;
+    cout << "option name MateRaceByLanding type check default false" << endl;
+    cout << "option name PassCapK type spin default 8 min 1 max 64" << endl;
+    cout << "option name SeatClocksMs type string default <empty>" << endl;
+    cout << "option name SeatPaceMs type string default <empty>" << endl;
+    cout << "option name SeatElapsedMs type string default <empty>" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

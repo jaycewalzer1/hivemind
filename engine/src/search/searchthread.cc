@@ -749,7 +749,13 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         }
 
         int terminalEndInPly = 0;
-        const TerminalOutcome terminalOutcome = classify_terminal_position(
+        // A durative clock can end the game by itself: a flag (FlagLoss) or a
+        // sit-off at equal clocks. It comes first: the board never got there.
+        const std::optional<int> clockResult = ctx.time.outcome_for(ctx.teamToPlay);
+        const TerminalOutcome terminalOutcome = clockResult
+            ? (*clockResult > 0 ? TerminalOutcome::WIN
+               : *clockResult < 0 ? TerminalOutcome::LOSS : TerminalOutcome::DRAW)
+            : classify_terminal_position(
             board, ctx.teamToPlay, verdictTeam.value_or(root->get_team_to_play()),
             ctx.time, boardSearchPlies, &terminalEndInPly,
             false, searchPly == 0 && !ctx.time.can_sit(ctx.teamToPlay));
@@ -757,7 +763,10 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         // classify_terminal_position() and report shortest lines, which a
         // loss three plies out would lengthen.
         TerminalOutcome treeOutcome = terminalOutcome;
+        // The frozen-board loss assumes the team must act now; under a
+        // durative clock it may only be waiting, so the tree does not use it.
         if (treeOutcome == TerminalOutcome::NONE && searchPly > 0
+            && !ctx.time.is_durative()
             && frozen_board_loss(board, ctx.teamToPlay, ctx.time)) {
             // The forced move on the frozen board, then the mate there.
             treeOutcome = TerminalOutcome::LOSS;
@@ -808,6 +817,13 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
 
         ctx.boardAOnTurn = board.side_to_move(BOARD_A) == ctx.teamToPlay;
         ctx.boardBOnTurn = board.side_to_move(BOARD_B) == ~ctx.teamToPlay;
+        if (ctx.time.is_durative()) {
+            // Only the boards whose seat lands now are this team's to act on.
+            const std::array<bool, 2> acting = ctx.time.acting_boards(ctx.teamToPlay);
+            ctx.boardAOnTurn = ctx.boardAOnTurn && acting[BOARD_A];
+            ctx.boardBOnTurn = ctx.boardBOnTurn && acting[BOARD_B];
+            ctx.forcedWait = !ctx.boardAOnTurn && !ctx.boardBOnTurn;
+        }
         auto prepare_actions = [&](int boardNumber, bool onTurn,
                                    vector<Stockfish::Move>& actions,
                                    vector<uint8_t>& captures,
@@ -833,6 +849,13 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
                         ctx.capturesA, ctx.policyIndicesA);
         prepare_actions(BOARD_B, ctx.boardBOnTurn, ctx.actionsB,
                         ctx.capturesB, ctx.policyIndicesB);
+        if (ctx.forcedWait) {
+            // The other team lands first: this node's one action is to wait
+            // (pass, pass), which keeps the tree alternating teams. The
+            // generator reads it as a sit on board A, legal by the right
+            // granted in process_batch.
+            ctx.boardAOnTurn = true;
+        }
 
         // Convert board to planes for this batch slot
         board_to_planes(board, obs + validInferenceCount * NB_INPUT_VALUES(),
@@ -908,7 +931,8 @@ void SearchThread::process_batch(
 
             // Whether the team at this leaf may sit, from the clock state its
             // path reached it with.
-            const bool leafTeamHasTimeAdvantage = ctx.time.can_sit(ctx.teamToPlay);
+            const bool leafTeamHasTimeAdvantage = ctx.forcedWait
+                || ctx.time.can_sit(ctx.teamToPlay);
             
             vector<float> priorsA;
             vector<float> priorsB;
@@ -1284,9 +1308,16 @@ LeafSelection SearchThread::select_and_expand(
     TimeState pathTime = rootTime;
     // The clock state after the current node's team plays its action, read
     // from the position before that action is made.
-    auto time_after_action = [&](Node& node) {
+    // A durative clock (DurativeTree) also needs to know which boards the
+    // action moved on: a pass there lasts until the other board's next event.
+    auto time_after_action = [&](Node& node, const JointActionCandidate& action) {
         TimeState next = pathTime;
         const Stockfish::Color actingTeam = node.get_team_to_play();
+        if (next.is_durative()) {
+            next.advance_action(actingTeam, action.moveA != Stockfish::MOVE_NONE,
+                                action.moveB != Stockfish::MOVE_NONE);
+            return next;
+        }
         next.advance(actingTeam, board.on_turn_on_both_boards(actingTeam));
         return next;
     };
@@ -1346,7 +1377,8 @@ LeafSelection SearchThread::select_and_expand(
                 &expandedChildReserved, true, hintAction);
             
             if (nextNode) {
-                const TimeState childTime = time_after_action(*currentNode);
+                const TimeState childTime = time_after_action(
+                    *currentNode, expandedAction);
                 // Make moves with the actual expanded action
                 board.make_moves(expandedAction.moveA, expandedAction.moveB);
 
@@ -1404,7 +1436,7 @@ LeafSelection SearchThread::select_and_expand(
         hasEvaluationReservation = selection.hasEvaluationReservation;
 
         JointActionCandidate action = currentNode->get_joint_action(childIdx);
-        const TimeState childTime = time_after_action(*currentNode);
+        const TimeState childTime = time_after_action(*currentNode, action);
         board.make_moves(action.moveA, action.moveB);
 
         const CanonicalChildResult canonicalResult = canonicalize_child(

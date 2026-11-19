@@ -156,6 +156,9 @@ struct LeafContext {
     TimeState time;      // Clock state at the leaf, every action on the path charged
     bool boardAOnTurn;
     bool boardBOnTurn;
+    // Durative clock: the other team's seat lands first, so this team only
+    // waits; its node gets the single action (pass, pass).
+    bool forcedWait = false;
     bool isTerminal;     // True if this is a terminal node (draw/checkmate)
     bool hasEvaluationReservation;
     float terminalValue; // Value to use for terminal nodes

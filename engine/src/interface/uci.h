@@ -42,6 +42,14 @@ private:
     // What the root action alone costs the team when it pays for it, if the
     // front end knows (0 = TeamMoveTimeMs): the budget of the move it searches.
     int rootMoveTimeMs = 0;
+    // Wave 2 options (docs/wave2_engine.md). Defaults are stock v3.0.3.
+    // DurativeTree: per-seat clocks and ready times in the tree.
+    bool durativeTree = false;
+    // SitGate: upstream's hard can_sit = lead > 0. Off, a pass is always legal.
+    bool sitGate = true;
+    // FlagLoss, InstantTransfer, MateRaceByLanding, PassCapK and the three
+    // per-seat strings; RootMoveTimeMs is filled in from rootMoveTimeMs.
+    DurativeConfig durativeConfig;
     // Ceiling for a `go movetime` search extended in a critical position;
     // 0, or anything at or below the movetime, keeps the movetime exact.
     int maxMoveTimeMs = 0;

@@ -215,7 +215,7 @@ inline void set_plane_history_board(PlaneData<T>& p, int boardIdx) {
 
 float clock_lead_plane_value(const TimeState& time, Stockfish::Color team) {
     if (!time.is_clocked()) {
-        return time.can_sit(team) ? 1.0f : -1.0f;
+        return time.lead_sit_right(team) ? 1.0f : -1.0f;
     }
     const int32_t lead = time.lead_ms(team);
     if (lead == 0) {
@@ -240,7 +240,10 @@ float clock_speed_plane_value(const TimeState& time, Stockfish::Color team) {
 template <typename T>
 void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSide,
                           const TimeState& time) {
-    const bool hasTimeAdvantage = time.can_sit(teamSide);
+    // The sit plane is upstream's sit right (lead > 0), which is what the
+    // network was trained on, also when SitGate is off and the tree lets
+    // every team pass.
+    const bool hasTimeAdvantage = time.lead_sit_right(teamSide);
     const float leadPlane = board.is_single_board()
         ? 0.0f : clock_lead_plane_value(time, teamSide);
     const float speedPlane = board.is_single_board()
