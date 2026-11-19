@@ -149,6 +149,18 @@ TEST(DurativeClock, SitGateOffMakesThePassLegalBehindOnTheClock) {
     EXPECT_TRUE(open.lead_sit_right(BLACK));
 }
 
+TEST(DurativeClock, SitGateOffNeedsTheDurativeClock) {
+    // v3's turn-taking tree has no sit-off rule: with both teams free to pass
+    // the search cycled on pass-pass lines and never answered (the arena's
+    // nodur ablation, DurativeTree false with SitGate false). Without the
+    // durative clock the gate stays.
+    const TimeState v3 = TimeState::clocked(WHITE, -5000).with_sit_gate(false);
+    EXPECT_FALSE(v3.sit_gate());
+    EXPECT_FALSE(v3.can_sit(WHITE));
+    EXPECT_TRUE(v3.can_sit(BLACK));
+    EXPECT_FALSE(TimeState::clocked(WHITE, 0).with_sit_gate(false).can_sit(WHITE));
+}
+
 TEST(DurativeClock, SeatElapsedShortensTheOpponentsFirstLanding) {
     DurativeConfig config;
     config.rootMoveTimeMs = 700;

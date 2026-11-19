@@ -751,6 +751,7 @@ std::optional<TimeState> UCI::current_clock() const {
     }
     const TimeState gated = v3.with_sit_gate(sitGate);
     if (!durativeTree) {
+        // SitGate false without DurativeTree: the gate stays (TimeState::can_sit).
         return gated;
     }
     DurativeConfig config = durativeConfig;

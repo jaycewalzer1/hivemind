@@ -203,7 +203,10 @@ public:
      * @brief This state with upstream's hard sit gate (can_sit = lead > 0)
      * switched on or off (UCI SitGate). Off, a pass is always legal and the
      * tree prices it; a durative state still applies the sit-off rule. Only
-     * a clocked state takes it: a legacy flag is a gate by definition.
+     * a clocked state takes it: a legacy flag is a gate by definition. The
+     * gate only comes off once the state is durative (can_sit): v3's
+     * turn-taking tree has no sit-off rule, so with both teams free to pass
+     * selection cycles on pass-pass lines and the search never finishes.
      */
     TimeState with_sit_gate(bool gate) const {
         TimeState next = *this;
@@ -242,10 +245,10 @@ public:
 
     /** Whether @p team may sit: wait on a board instead of moving there. */
     bool can_sit(Stockfish::Color team) const {
-        if (sitGate_) {
+        if (sitGate_ || !durative_.active) {
             return lead_ms(team) > 0;
         }
-        return !durative_.active || !sit_off_forces_move(team);
+        return !sit_off_forces_move(team);
     }
 
     /**
