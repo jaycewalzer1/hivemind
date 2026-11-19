@@ -43,7 +43,11 @@ mode the key and `operator==` are v3's.
 
 **Who acts.** `turn_at_node()` (`time_state.h:668`):
 - At the root, the root team decides on every board it is on turn, landing at its budget (`RootMoveTimeMs`, else its
-  team move time). If an opponent seat would land earlier, its ready time drops to 0 and it acts right after.
+  team move time). If an opponent seat would land earlier, its ready time drops to 0 and it acts right after. Its
+  clock runs only until its landing (not our whole budget), its flag is checked against that, and its action is dated
+  back: the seat its move hands the board to has been on turn for the rest of our budget and is charged it (a pass
+  likewise runs from the earlier time). Before review fix `d538648` the opponent seat was charged our whole budget,
+  which turned every root action of a time scramble into a false flag win.
 - Elsewhere, time advances to the earliest ready time of the two seats on turn; only that seat's team acts, on that
   board, or on both if both of its seats are ready at once. An exact tie between the two teams goes to `tieNext`,
   which starts as the root team's opponents and flips each time a tie is used.
@@ -60,13 +64,20 @@ possible optimisation (not done).
 **Charging an action.** `advance_action(team, movedA, movedB, handA, handB)` (`time_state.h:338`), called by the tree's
 `time_after_action` (`searchthread.cc:1421`) with the action actually played:
 (`handA`/`handB`: the piece type each board's move sends to the partner's pocket, `Board::hand_piece_type`.)
-1. `dt` = time to the landing. With `FlagLoss`, if either clock on turn is <= `dt`, the lower one flagged first
-   (equal across teams: draw) and the state's `outcome` is set; nothing else happens.
-2. Both clocks on turn and both ready times run by `dt`.
+1. `dt` = time to the landing. Each clock on turn runs `min(dt, its ready time)` (equal to `dt` except for the root's
+   early opponent landing). With `FlagLoss`, if a clock is <= its run, the lower such clock flagged first (equal across
+   teams: draw) and the state's `outcome` is set; nothing else happens.
+2. Both clocks on turn run, and both ready times by `dt`.
 3. A seat that moved hands its board to the opponent seat, whose ready time is its action time: the root budget for
    the root team's seats, its pace for the others.
-4. A seat that passed waits until 1 ms after the next event on the other board (that seat's ready time), or until
-   its own flag, or `PassCapK x` the root budget, whichever is first (at least 1 ms), and is marked sitting.
+4. A seat that passed waits until 1 ms after the next landing on the other board, or until its own flag, or
+   `PassCapK x` its own action time (the root budget for the root team, its pace for the other team, as the self-play
+   game caps a pass at `PassCapK x` the seat's move time), whichever is first (at least 1 ms), and is marked sitting.
+   A seat on the other board that is deciding lands at its ready time; one that sits (or passes at this node) lands
+   nothing, so it sets no wake-up. When a seat passes, a seat sitting on the other board that was waiting for it to
+   land runs on to its own cap; when a seat moves, it wakes a pass on the other board 1 ms later. This is the
+   self-play game's rule (passes wake only on landings), and it ends the 1 ms leapfrog of one team passing on both
+   boards (review fix `d538648`).
 5. The lead is re-read from the clocks: white lead = ((Aw - Bw) + (Bb - Ab)) / 2 (`sync_lead`, `time_state.h:718`),
    so the lead and speed planes (`planes.cc`) see the node's clocks.
 6. Sit-off draw: both seats on turn sitting, on different teams, with equal clocks: nothing can change and neither
@@ -240,8 +251,10 @@ test, skipped on the stock baseline too). `stock_parity.sh` after part 2: **8/8 
   their speed on mates.
 - At the root, the root team still decides first and its other seat (if on turn) is part of the root action, even
   when in a seat-clock game that seat is mid-decision; self-play plays only the deciding seat's board.
-- Two sitting seats in the tree can still leapfrog 1 ms at a time until the sit-off rule forces one (the game model
-  fixes this by waking passes only on landings).
+- (Fixed in `d538648`: two seats of one team could pass in 1 ms steps for ever; passes now wake only on landings, as
+  in the game model.)
+- The root's early opponent landing is dated back for clocks, the board's time since landing and the landing history,
+  but the root team's own action is still played first in the tree (mate races aside, `MateRaceByLanding`).
 - A wait node costs one network evaluation (part 1 note).
 - `seat_clocks.tsv` is not trimmed by `--resume` (checkpointed runs append the replayed games again).
 
