@@ -182,6 +182,8 @@ void printUsage(const char* progName) {
     cout << "    --time-model flag|clock and the selfplay clock options (drawn per opening pair)" << endl;
     cout << "    --{contender,baseline}-time-model flag|clock (flag: in a clocked game, search" << endl;
     cout << "      as if sitting whenever ahead were permanent, as a pre-clock engine does)" << endl;
+    cout << "    the selfplay wave 2 options, for both sides (--durative-tree .. --pace-ema-alpha);" << endl;
+    cout << "      with --base-mix, --movetime is also every seat's move time unless --seat-move-times" << endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -622,9 +624,14 @@ int main(int argc, char* argv[]) {
                 else if (option == "--sprt-beta") config.sprtBeta = stod(value);
                 else if (option == "--resume") config.resume = parse_bool_argument(value);
                 else if (parse_clock_option(option, value, config.clockModel, config.clock)) {}
+                else if (parse_wave2_option(option, value, config.wave2)) {}
                 else throw invalid_argument("Unknown tournament option: " + option);
             }
             config.clock.validate();
+            config.wave2.validate();
+            if (config.wave2.seat_clocks() || config.wave2.changes_search()) {
+                config.clockModel = true;
+            }
             // A side can search the flag model inside a clocked game, but a
             // flag game has no clock for a side to search on.
             if (!config.clockModel

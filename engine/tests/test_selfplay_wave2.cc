@@ -14,6 +14,7 @@
 #include "common/utils.h"
 #include "nn/engine.h"
 #include "tools/selfplay.h"
+#include "tools/tournament.h"
 
 // Wave 2 self-play plumbing end to end: the options reach a real run_selfplay
 // on the uniform test network, games are played on four seat clocks and the
@@ -169,6 +170,33 @@ TEST_F(SelfPlayWave2Test, TreeOptionsAloneKeepTheLeadOnlyGame) {
     EXPECT_NE(stdoutText.find("selfplay complete 1 games"), std::string::npos);
     EXPECT_FALSE(std::filesystem::exists(output / "seat_clocks.tsv"));
     EXPECT_TRUE(tag_values(read_file(output / "games.pgn"), "BaseMs").empty());
+}
+
+TEST_F(SelfPlayWave2Test, TournamentPlaysSeatClockPairsWithTheSameOptions) {
+    TournamentConfig config;
+    config.games = 2;
+    config.nodes = 16;
+    config.maxMacroPlies = 400;
+    config.contenderBatchSize = 1;
+    config.baselineBatchSize = 1;
+    config.seed = 9;
+    config.outputDirectory = output;
+    config.clockModel = true;
+    config.clock.moveTimeMinMs = 200;
+    config.clock.moveTimeMaxMs = 2000;
+    config.wave2 = wave2_config(1).wave2;
+    testing::internal::CaptureStdout();
+    ASSERT_EQ(run_tournament(engine.get(), engine.get(), "uniform-a", "uniform-b", config), 0);
+    const std::string stdoutText = testing::internal::GetCapturedStdout();
+    EXPECT_NE(stdoutText.find("tournament game 2/2"), std::string::npos) << stdoutText;
+    const std::string pgn = read_file(output / "games.pgn");
+    const std::set<std::string> endings{"flag", "double_flag", "sitoff_adjudicated",
+                                        "checkmate", "draw", "no legal action", "macro-ply limit"};
+    const std::vector<std::string> terminations = tag_values(pgn, "Termination");
+    ASSERT_EQ(terminations.size(), 2u);
+    for (const std::string& termination : terminations) {
+        EXPECT_TRUE(endings.contains(termination)) << termination;
+    }
 }
 
 }  // namespace

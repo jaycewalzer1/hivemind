@@ -459,6 +459,153 @@ void print_final_summary(
               << "============================================================\n";
 }
 
+/**
+ * @brief One wave 2 match game on four seat clocks (--base-mix): the
+ * tournament's twin of selfplay's play_seat_clock_game. Each decision is a
+ * search by the deciding team's side (contender or baseline) on its engine,
+ * with the seat clocks, observed paces and the other team's elapsed time;
+ * only the deciding seats' boards are played, when they land. Fills
+ * @p actions (one per landing), @p winner, @p termination and @p time (v3's
+ * clock at the final lead, for the PGN).
+ */
+void play_seat_clock_match(const TournamentConfig& config,
+                           const SeatClockGame::Start& start,
+                           Board& board,
+                           Stockfish::Color contenderTeam,
+                           Engine& contender,
+                           Engine& baseline,
+                           Agent& contenderAgent,
+                           Agent& baselineAgent,
+                           TournamentResult& result,
+                           size_t pairIndex,
+                           std::vector<std::string>& actions,
+                           int& winner,
+                           std::string& termination,
+                           TimeState& time) {
+    std::array<Stockfish::Color, 2> sides{board.side_to_move(BOARD_A),
+                                          board.side_to_move(BOARD_B)};
+    SeatClockGame game(config.wave2, start, sides);
+    // The pair's two games draw the same costs.
+    std::mt19937_64 paceRandom(tournament_seed(config.seed ^ 0x50414345ULL, pairIndex));
+    std::array<Stockfish::Move, 4> committed{};
+    size_t decisions = 0;
+    for (;;) {
+        sides = {board.side_to_move(BOARD_A), board.side_to_move(BOARD_B)};
+        const SeatClockGame::Event event = game.next(sides);
+        if (event.type == SeatClockGame::EventType::FLAG) {
+            winner = event.loser == 0 ? 1 : 0;
+            termination = "flag";
+            break;
+        }
+        if (event.type == SeatClockGame::EventType::DOUBLE_FLAG) {
+            winner = -1;
+            termination = "double_flag";
+            break;
+        }
+        if (event.type == SeatClockGame::EventType::SITOFF) {
+            winner = event.loser < 0 ? -1 : 1 - event.loser;
+            termination = "sitoff_adjudicated";
+            break;
+        }
+        const Stockfish::Color team = event.team;
+        if (event.type == SeatClockGame::EventType::LAND) {
+            for (int seat = 0; seat < 4; ++seat) {
+                if (!event.seats[seat]) {
+                    continue;
+                }
+                const int boardNumber = seat / 2;
+                JointActionCandidate landing;
+                (boardNumber == BOARD_A ? landing.moveA : landing.moveB) = committed[seat];
+                actions.push_back(action_uci(board, landing));
+                const bool capture = board.is_capture(boardNumber, committed[seat]);
+                board.push_move(boardNumber, committed[seat]);
+                game.landed(seat, capture);
+            }
+            if (board.is_checkmate(~team, true)) {
+                winner = static_cast<int>(team);
+                termination = "checkmate";
+                break;
+            }
+            if (board.is_checkmate(team, true)) {
+                winner = static_cast<int>(~team);
+                termination = "checkmate";
+                break;
+            }
+            if (board.is_draw()) {
+                winner = -1;
+                termination = "draw";
+                break;
+            }
+            continue;
+        }
+        if (decisions >= config.maxMacroPlies) {
+            break;
+        }
+        for (int seat = 0; seat < 4; ++seat) {
+            if (event.seats[seat]) {
+                game.plan_cost(seat, paceRandom);
+            }
+        }
+        const TimeState clock = game.search_clock(team, sides, event.seats);
+        const GameStatus status = adjudicate_game(board, team, clock);
+        if (status != GameStatus::ONGOING) {
+            winner = adjudicated_winner(status, team);
+            termination = adjudicated_termination(status);
+            break;
+        }
+        const bool contenderActing = team == contenderTeam;
+        Engine& actingEngine = contenderActing ? contender : baseline;
+        Agent& agent = contenderActing ? contenderAgent : baselineAgent;
+        std::vector<Engine*> engines = {&actingEngine};
+        agent.reset_search_state();
+        SearchOptions options;
+        options.targetNodes = config.nodes;
+        options.moveTimeMs = config.moveTimeMs;
+        options.search = config.searchConfigFor(contenderActing);
+        options.search.rootDirichletAlpha = config.dirichletAlpha;
+        options.search.rootDirichletEpsilon = config.dirichletEpsilon;
+        options.search.rootNoiseSeed = tournament_seed(
+            config.seed, pairIndex * config.maxMacroPlies + decisions);
+        options.clock = clock;
+        const auto searchStart = std::chrono::steady_clock::now();
+        const JointActionCandidate action = agent.run_search(
+            board, engines, team, clock.can_sit(team), options);
+        const uint64_t searchNanos = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - searchStart).count());
+        const std::vector<RootEdgeStats> edges = agent.root_edge_stats();
+        TournamentPerformance& performance = contenderActing
+            ? result.contenderPerformance : result.baselinePerformance;
+        ++performance.searches;
+        performance.nanoseconds += searchNanos;
+        performance.nodes += std::accumulate(
+            edges.begin(), edges.end(), uint64_t{0},
+            [](uint64_t sum, const RootEdgeStats& edge) { return sum + edge.visits; });
+        if (agent.search_status() != GameStatus::ONGOING) {
+            winner = adjudicated_winner(agent.search_status(), team);
+            termination = adjudicated_termination(agent.search_status());
+            break;
+        }
+        if (edges.empty()) {
+            throw std::runtime_error("Ongoing search returned no root edges");
+        }
+        ++decisions;
+        for (int seat = 0; seat < 4; ++seat) {
+            if (!event.seats[seat]) {
+                continue;
+            }
+            const Stockfish::Move move = seat / 2 == BOARD_A ? action.moveA : action.moveB;
+            if (move == Stockfish::MOVE_NONE) {
+                game.commit_pass(seat, sides);
+            } else {
+                committed[seat] = move;
+                game.commit_move(seat);
+            }
+        }
+    }
+    time = TimeState::clocked(Stockfish::WHITE, game.white_lead_ms());
+}
+
 } // namespace
 
 std::vector<TournamentStartPosition> load_tournament_positions(
@@ -810,9 +957,25 @@ int run_tournament(
         // Both games of a pair draw the same clock, so the contender plays
         // each team's side of it once.
         std::mt19937_64 clockRandom(tournament_seed(config.seed ^ 0x434c4f434bULL, pairIndex));
-        TimeState time = config.clockModel
+        // Wave 2 seat-clock games (--base-mix): four clocks, played event by
+        // event (SeatClockGame); the pair shares the start and the cost draws.
+        const bool seatGame = config.wave2.seat_clocks();
+        SeatClockGame::Start seatStart;
+        if (seatGame) {
+            seatStart = SeatClockGame::sample_start(config.wave2, config.clock, clockRandom);
+            if (!config.wave2.seatMoveTimes && config.moveTimeMs > 0) {
+                // --movetime stands in for every seat's move time.
+                seatStart.moveTimesMs.fill(config.moveTimeMs);
+            }
+        }
+        TimeState time = seatGame
+            ? TimeState::clocked(Stockfish::WHITE, seatStart.whiteLeadMs)
+            : config.clockModel
             ? sample_clock(config.clock, clockRandom)
             : TimeState::legacy(team, hasTimeAdvantage);
+        if (config.clockModel && !seatGame && !config.wave2.sitGate) {
+            time = time.with_sit_gate(false);
+        }
         const Stockfish::Color initialTeam = team;
         const TimeState initialTime = time;
         const std::string initialDualFen =
@@ -822,7 +985,14 @@ int run_tournament(
         std::string termination = "macro-ply limit";
         std::vector<std::string> actions;
 
-        for (size_t macroPly = 0; macroPly < config.maxMacroPlies; ++macroPly) {
+        if (seatGame) {
+            play_seat_clock_match(
+                config, seatStart, board, contenderTeam, *contender, *baseline,
+                contenderAgent, baselineAgent, result, pairIndex, actions, winner,
+                termination, time);
+        }
+
+        for (size_t macroPly = 0; !seatGame && macroPly < config.maxMacroPlies; ++macroPly) {
             const GameStatus status = adjudicate_game(board, team, time);
             if (status != GameStatus::ONGOING) {
                 winner = adjudicated_winner(status, team);
@@ -848,6 +1018,13 @@ int run_tournament(
             // the TimeAdvantage bit the clock gives it now.
             if (config.searchesOnClock(contenderActing)) {
                 options.clock = time;
+                if (config.wave2.durativeTree) {
+                    DurativeConfig durative = config.wave2.durative_config();
+                    durative.rootMoveTimeMs = time.next_move_time_ms(team);
+                    options.clock = TimeState::durative(
+                        time, team, board.side_to_move(BOARD_A),
+                        board.side_to_move(BOARD_B), durative);
+                }
             }
             const auto searchStart = std::chrono::steady_clock::now();
             const JointActionCandidate action = agent.run_search(
@@ -879,7 +1056,8 @@ int run_tournament(
             team = ~team;
         }
 
-        const GameStatus finalStatus = adjudicate_game(board, team, time);
+        const GameStatus finalStatus = seatGame
+            ? GameStatus::ONGOING : adjudicate_game(board, team, time);
         if (winner < 0 && finalStatus != GameStatus::ONGOING) {
             winner = adjudicated_winner(finalStatus, team);
             termination = adjudicated_termination(finalStatus);

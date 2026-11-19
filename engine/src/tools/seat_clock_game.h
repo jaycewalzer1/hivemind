@@ -204,16 +204,18 @@ public:
         return start;
     }
 
-    SeatClockGame(const Wave2GameOptions& options, const Start& start)
+    /** @p sides: who is to move on A and B at the start; both decide at 0. */
+    SeatClockGame(const Wave2GameOptions& options, const Start& start,
+                  const std::array<Stockfish::Color, 2>& sides = {Stockfish::WHITE,
+                                                                  Stockfish::WHITE})
         : options_(options), start_(start) {
         for (int seat = 0; seat < 4; ++seat) {
             clockMs_[seat] = start.clocksMs[seat];
             moveTimeMs_[seat] = std::max(1, start.moveTimesMs[seat]);
             paceMs_[seat] = moveTimeMs_[seat];
         }
-        // Both boards start with white to move: Aw and Bw decide at 0.
-        come_on_turn(TimeState::SEAT_AW);
-        come_on_turn(TimeState::SEAT_BW);
+        come_on_turn(TimeState::seat_of(0, sides[0]));
+        come_on_turn(TimeState::seat_of(1, sides[1]));
     }
 
     /**

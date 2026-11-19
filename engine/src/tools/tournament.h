@@ -10,6 +10,7 @@
 
 #include "search/search_params.h"
 #include "tools/clock_sampling.h"
+#include "tools/seat_clock_game.h"
 #include "Fairy-Stockfish/src/types.h"
 
 class Engine;
@@ -93,6 +94,9 @@ struct TournamentConfig {
     // each side of it once.
     bool clockModel = false;
     ClockSampling clock;
+    // Wave 2 (docs/wave2_training.md), both sides: the tree options of every
+    // search and, with a base mix, games on four seat clocks. Defaults: stock.
+    Wave2GameOptions wave2;
     // A side that searches on the flag model in a clocked game: before each
     // search its TimeAdvantage is whether the clock has it ahead right now,
     // and it searches as if that advantage lasted the whole game. The game is
