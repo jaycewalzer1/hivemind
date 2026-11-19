@@ -117,8 +117,12 @@ the current lead (with the gate setting kept). This covers:
 `engine/tests/stock_parity.sh` (acceptance 7, binary): builds this engine and stock v3.0.3
 (`third_party/upstream-hivemind`, built out of tree, source untouched) with one search worker, then runs `policy` and
 `go nodes N` on `engine/tests/data/stock_parity_positions.txt` (8 positions, both teams, leads -15 s..+15 s, unequal
-move times, pockets) with default options and compares every output line (wall-clock fields removed; the time-boxed
-root mate scans are off in both because their results depend on wall time).
+move times, pockets) with default options. It compares the whole output except wall-clock fields (time, nps, ms,
+percentages) and the intermediate `info depth` progress lines, which are printed when the reporting thread polls and
+so differ between two stock runs too; the last `info depth` line (nodes, score, PV of the finished search), the
+`policy` output and `bestmove` are compared exactly. The time-boxed root mate scans are off in both because their
+results depend on wall time. Result on 2026-11-19: **8/8 identical**. Build cost: two extra builds
+(`engine/build-parity`, `engine/build-parity-stock`, git-ignored), a few minutes at `JOBS=2`.
 
 Upstream's own suite stays green.
 
