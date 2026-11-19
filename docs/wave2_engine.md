@@ -22,6 +22,7 @@ and, for the binary, by `engine/tests/stock_parity.sh`.
 | `SeatClocksMs` | string `<Aw> <Ab> <Bw> <Bb>`, empty | The four real clocks. Empty: derived from `TimeLeadMs` around 2^29 ms (no flag can happen), as v3. |
 | `SeatPaceMs` | string, empty | Per-seat ms per action (EMA). Empty: `TeamMoveTimeMs` / `OpponentMoveTimeMs` per team, as v3. Given: the speed plane uses each team's mean pace. |
 | `SeatElapsedMs` | string, empty | How long each seat on turn has been thinking: an opponent seat's first landing is `pace - elapsed` (at least 1 ms). Ignored for our own seats. |
+| `SeatSitting` | string, empty | `"<Aw> <Ab> <Bw> <Bb>"` of 0/1: which opponent seats on turn are in a pass at the root (`DurativeConfig::seatSitting`), so the sit-off rule makes the lower clock move. Self-play sets it directly; an arena infers it. Ignored for our own seats. |
 
 The string options take four integers; an empty value (`setoption name SeatClocksMs value`) clears them; a count other
 than 0 or 4 is refused with an `info string` and keeps the old value. `Team`, `TimeModel`, `TimeLeadMs`,
