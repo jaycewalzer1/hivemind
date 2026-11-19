@@ -28,6 +28,7 @@ add_executable(
   test_search_reports.cc
   test_time_state.cc
   test_clock_sampling.cc
+  test_durative.cc
 )
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
 

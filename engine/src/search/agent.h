@@ -309,6 +309,7 @@ private:
     GCThread gcThread_;
 
     friend class AgentTreeReuseTestPeer;
+    friend class AgentDurativeTestPeer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);
