@@ -488,6 +488,11 @@ class Loop:
         npos, opos = train.positions(new), train.positions(old)
         if not npos:
             raise StageFailed("no new self-play positions")
+        if npos < self.args.batch_size:
+            # distill-train draws whole batches from each window of chunks and
+            # would wait forever for one.
+            raise StageFailed(f"{npos} new positions, fewer than one batch of {self.args.batch_size}: "
+                              f"play more games or lower --batch-size")
         steps, fraction = train.plan(npos, opos, self.args.new_passes, self.args.replay_passes,
                                      self.args.batch_size)
         out, log = self.arms / "C", self.arms / "C.log"

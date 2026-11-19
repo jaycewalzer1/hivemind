@@ -362,3 +362,13 @@ def test_rl_loop_refuses_an_engine_without_the_wave2_options(monkeypatch, tmp_pa
     monkeypatch.setattr("sys.argv", argv)
     with pytest.raises(SystemExit, match="lack the wave 2 options"):
         rl_loop.main()
+
+
+def test_training_refuses_less_than_one_batch(tmp_path, monkeypatch):
+    """distill-train would loop forever looking for a whole batch."""
+    loop = loop_at(tmp_path, train_from="generator", window=1, new_passes=1.5, replay_passes=0.5, batch_size=1024)
+    loop.checkpoint.write_bytes(b"generator")
+    monkeypatch.setattr(rl_loop.train, "positions", lambda dirs: 291 if dirs else 0)
+    monkeypatch.setattr(rl_loop, "train_dirs", lambda runs, n: [runs / f"d{n}"])
+    with pytest.raises(rl_loop.StageFailed, match="fewer than one batch"):
+        loop.train()
