@@ -479,3 +479,13 @@ def test_rl_loop_reads_the_generators_input_width(tmp_path):
     for name, planes in (("twin-s-clock-wide.onnx", NUM_WIDE_CHANNELS), ("twin-s-clock-it13.onnx", PLANES)):
         if (MODEL_DIRECTORY / name).is_file():
             assert onnx_input_planes(MODEL_DIRECTORY / name) == planes
+
+
+def test_the_arrivals_head_trains_at_the_heads_rate():
+    from hivemind.distill.train import parameter_groups
+
+    model = get_twin_board_model("twin-s", planes_per_board=W, arrivals=True)
+    trunk, heads = parameter_groups(model, 1e-4, 5e-5)
+    head_ids = {id(p) for p in heads["params"]}
+    assert all(id(p) in head_ids for p in model.arrivals_head.parameters())
+    assert heads["lr"] == 1e-4 and trunk["lr"] == 5e-5

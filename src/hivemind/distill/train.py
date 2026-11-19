@@ -145,7 +145,8 @@ def evaluate(model, dataset, weights, batch_size=2048):
     return metrics
 
 
-HEADS = ("policy_head.", "value_head.")
+# The arrivals head (wave 2b) starts from zero, so it trains at the heads' rate.
+HEADS = ("policy_head.", "value_head.", "arrivals_head.")
 
 
 def parameter_groups(model, lr, trunk_lr=None):
