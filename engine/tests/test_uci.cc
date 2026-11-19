@@ -377,3 +377,66 @@ TEST_F(UCIOpeningNoiseTest, ClockAwarePlayIsTheDefaultForNetworksThatReadTheCloc
     legacyNetwork.setoption(clock);
     EXPECT_TRUE(UCIOpeningNoiseTestPeer::clock_model(legacyNetwork));
 }
+
+// Wave 2 options (docs/wave2_engine.md): with every default the search roots
+// on exactly v3.0.3's clock.
+TEST_F(UCIOpeningNoiseTest, Wave2DefaultsRootOnTheStockV3Clock) {
+    UCI uci;
+    set_option(uci, "TimeModel", "clock");
+    set_option(uci, "Team", "black");
+    set_option(uci, "TimeLeadMs", "-2500");
+    set_option(uci, "TeamMoveTimeMs", "300");
+    set_option(uci, "OpponentMoveTimeMs", "200");
+    set_option(uci, "RootMoveTimeMs", "450");
+    const std::optional<TimeState> clock = UCIOpeningNoiseTestPeer::clock(uci);
+    ASSERT_TRUE(clock.has_value());
+    EXPECT_EQ(*clock, TimeState::clocked(Stockfish::BLACK, -2500, 300, 200, 450));
+    // Setting the defaults explicitly changes nothing either.
+    for (const auto& [name, value] : std::initializer_list<std::pair<std::string, std::string>>{
+             {"DurativeTree", "false"}, {"SitGate", "true"}, {"FlagLoss", "false"},
+             {"InstantTransfer", "true"}, {"MateRaceByLanding", "false"},
+             {"PassCapK", "8"}, {"SeatClocksMs", ""}, {"SeatPaceMs", ""},
+             {"SeatElapsedMs", ""}}) {
+        set_option(uci, name, value);
+    }
+    EXPECT_EQ(*UCIOpeningNoiseTestPeer::clock(uci), *clock);
+}
+
+TEST_F(UCIOpeningNoiseTest, Wave2OptionsBuildTheDurativeClock) {
+    UCI uci;
+    set_option(uci, "TimeModel", "clock");
+    set_option(uci, "Team", "white");
+    set_option(uci, "RootMoveTimeMs", "700");
+    set_option(uci, "DurativeTree", "true");
+    set_option(uci, "SitGate", "false");
+    set_option(uci, "FlagLoss", "true");
+    set_option(uci, "InstantTransfer", "false");
+    set_option(uci, "MateRaceByLanding", "true");
+    set_option(uci, "PassCapK", "3");
+    set_option(uci, "SeatClocksMs", "30000 29000 28000 31000");
+    set_option(uci, "SeatPaceMs", "100 400 9000 100");
+    set_option(uci, "SeatElapsedMs", "0 0 250 0");
+    const std::optional<TimeState> clock = UCIOpeningNoiseTestPeer::clock(uci);
+    ASSERT_TRUE(clock.has_value());
+    EXPECT_TRUE(clock->is_durative());
+    EXPECT_FALSE(clock->sit_gate());
+    EXPECT_TRUE(clock->flag_loss());
+    EXPECT_FALSE(clock->instant_transfer());
+    EXPECT_TRUE(clock->mate_race_by_landing());
+    EXPECT_EQ(clock->seat_clock_ms(TimeState::SEAT_BB), 31000);
+    // ((Aw - Bw) + (Bb - Ab)) / 2
+    EXPECT_EQ(clock->lead_ms(Stockfish::WHITE), 2000);
+    EXPECT_EQ(clock->seat_ready_ms(TimeState::SEAT_AW), 700);
+    EXPECT_EQ(clock->seat_ready_ms(TimeState::SEAT_BW), 8750);
+    // A root pass is capped at 3 x 700 ms.
+    TimeState after = clock->after_action(Stockfish::WHITE, false, false);
+    EXPECT_EQ(after.seat_ready_ms(TimeState::SEAT_AW), 2100);
+
+    // A wrong count is refused and keeps the previous value.
+    set_option(uci, "SeatClocksMs", "1 2 3");
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->seat_clock_ms(TimeState::SEAT_BB), 31000);
+    // Empty clears back to v3's derivation from TimeLeadMs.
+    set_option(uci, "SeatClocksMs", "");
+    set_option(uci, "TimeLeadMs", "-40");
+    EXPECT_EQ(UCIOpeningNoiseTestPeer::clock(uci)->lead_ms(Stockfish::WHITE), -40);
+}
