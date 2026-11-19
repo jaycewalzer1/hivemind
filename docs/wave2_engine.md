@@ -244,3 +244,127 @@ test, skipped on the stock baseline too). `stock_parity.sh` after part 2: **8/8 
   fixes this by waking passes only on landings).
 - A wait node costs one network evaluation (part 1 note).
 - `seat_clocks.tsv` is not trimmed by `--resume` (checkpointed runs append the replayed games again).
+
+## Wave 2b: wide planes and the arrivals head
+
+Twin-s-clock it13 widened by 26 constant planes per board and an arrivals head, zero-initialised so the widened
+network answers exactly as it13 whatever the new planes hold (the network side, `twin-s-clock-wide*`, is
+`src/hivemind/wide.py` and `docs/wave2_training.md`). One binary runs both: the engine picks narrow or wide from the
+ONNX input width at load (78 or 130 channels; 74, the legacy layout, still works).
+
+**Layout** (`environment/planes.h`, `wide_extra_planes`, `planes.cc:307`). Each board's block is its 39 planes, then
+26 more, the same order in both blocks, "our"/"their" from the searching team's view on that board (block B: our
+partner's seat and pocket):
+
+| Offset | Value (constant plane) | Source in the tree |
+|---|---|---|
+| +0, +1 | our seat clock: `min(t/300, 1)`, `exp(-t/10)` (t s) | the node's per-seat clock |
+| +2, +3 | same-board opponent's clock, the same | the node's per-seat clock |
+| +4, +5 | thinking time of the side on turn there: `min(e/10, 1)`, `1 - exp(-e/2)` | ms since a move last landed on that board |
+| +6..+10, +11..+15 | our / their pocket holds >= 1 of P N B R Q | the board's pockets (always set) |
+| +16..+20, +21..+25 | our / their pocket: P N B R Q that landed in the last 5 s, `min(n/2, 1)` | the node's landing history |
+
+The clock, thinking and landing planes need a **wide durative state** (`TimeState::wide_timing`,
+`time_state.h:612`): `DurativeTree` on, a wide network loaded, and real `SeatClocksMs` (clocks derived from a lead
+count as no timing). Otherwise those planes are 0 and only the presence planes are set ("no timing given"). Planes
+37/38 (lead, speed) and everything else of the narrow block are unchanged.
+
+**Tree** (`time_state.h`). `DurativeConfig` gains `wideInputs`, `boardElapsedMs[2]` and `recentLandings` (up to
+`MAX_RECENT_LANDINGS` = 12 `SeatLanding`s, seat, piece type, ms ago). With `wideInputs` the durative block carries
+per-board time since the last landing and the recent landings (`time_state.h:223`): every action ages them by its
+`dt` and drops landings 5 s old (`age_landings`, `time_state.h:825`); a move resets its board's time; a capture's
+piece is added to the partner's pocket at age 0 (`add_landing`), whatever `InstantTransfer` says (the planes record
+arrivals; delayed transfer only governs when the piece may be dropped). A pass is not a landing: its board's thinking
+time keeps running. These fields enter the node key only when `wideInputs` is on (`time_state.h:750`), so a narrow
+durative tree's states and keys are exactly wave 2's (tested). The v3 `advance()` path (provers, reuse) drops the
+durative block as before, so wide timing is 0 there.
+
+**Engine** (`nn/engine.h`). Callers still fill the 78 narrow planes per position and hand the 2 x 26 extra values
+beside them (`enqueueInferenceHalf(obs, worker, wideExtras)`, also `runInference`/`runInferenceHalf`); for a wide
+network the backend builds the 130-plane input into its staging buffer (`widen_planes`, `constants.h:67`; ONNX
+Runtime `engine_ort.cc:446`, TensorRT `engine.cc:945`), a narrow network ignores the extras, so it13's path is
+untouched. The search thread fills a `wideExtras` buffer per batch slot only when its engine is wide
+(`searchthread.cc:972`, padding rows copied too, `:999`). **Arrivals head**: an output whose name contains
+"arrival" (20 values) is bound and copied back (`HalfInferenceOutputs::arrivals`, `Engine::hasArrivals`); the search
+does not read it. The UCI `policy` command prints `Arrivals: ...` when the network has it. HVM6/HDST records keep the
+narrow 78-plane encoding.
+
+**UCI.** `SeatArrivalsMs` (string, `"<pocket>:<piece>:<ms_ago>,..."`, pocket `Aw Ab Bw Bb`, piece `P N B R Q`
+either case, spaces ignored, empty clears; `parse_seat_arrivals`, `planes.cc:341`): recent landings at the root.
+Landings 5 s old or more are dropped; past 12 the newest are kept; a bad item is refused with an `info string` and
+keeps the old value. Board thinking time at the root is the `SeatElapsedMs` of the seat on turn on each board (ours
+included, unlike the ready-time use). `networkWide` (`uci.cc:85`) sets `wideInputs` in `current_clock()`
+(`uci.cc:780`); a wide network also counts as reading the clock planes (TimeModel clock by default). With it13
+`SeatArrivalsMs` is accepted and has no effect.
+
+**Self-play and tournament.** `SeatClockGame` keeps a landing log (`landed(seat, capture, hand)`,
+`seat_clock_game.h:369`: the captured piece goes to the mover's partner, a promoted piece as a pawn) and each board's
+last landing time. `set_wide_inputs` (from the engine's width; the tournament sets it per side) makes `search_clock`
+pass `boardElapsedMs` and the last 5 s of landings into the tree. The log is kept for narrow networks too, so it13
+self-play writes the wide sample fields. `seat_clocks.tsv` gains, after `pace_bb`:
+- `board_elapsed_a`, `board_elapsed_b`: ms since the last move landed on A / B (since the start before any);
+- `recent_<pocket>_<piece>` (20): pieces that landed in the last 5 s before the record's search, `fromMs < t <= now`;
+- `arrivals_<pocket>_<piece>` (20): the arrivals label, pieces landing in `(now, now + 5000]`, written at game end
+  (a game's end cuts the window short);
+with pocket `ours_a, theirs_a, ours_b, theirs_b` from the record team's view and piece `p n b r q`
+(`pocket_landing_counts`, `seat_clock_game.h:535`). Old `seat_clocks.tsv` files lack these columns: do not append a
+wave 2b run to a wave 2 one. The network side moves them into HDST v3 chunks (`hivemind.distill.timing`).
+
+**Plane dumps.** `hivemind dumpplanes --wide-planes true` writes N x 130 x 8 x 8; a line may add
+`;<Aw> <Ab> <Bw> <Bb>;<ea> <eb>;<SeatArrivalsMs>` and is then encoded on a wide durative clock rooted for the team
+(lead from the clocks, sit plane 31 = lead > 0 from those clocks, both teams at 100 ms a move).
+
+**Arena** (main repo `arena/players/upstream.py`). The wave2 player sends `SeatArrivalsMs` every search:
+`PocketLandingTracker` diffs the pockets in the FENs against its previous search, dates each new piece by the other
+board's last landing (`last_move_ms`, else now) and keeps 5 s. It sees only our own decisions, so two captures on the
+other board between them both get the later time, and a capture cancelled by a drop of the same piece in between is
+missed. Run the wide network with `WAVE2_MODEL=.../engine/models/twin-s-clock-wide-fp32.onnx`; the default is still
+it13.
+
+### Wave 2b tests
+
+`engine/tests/test_wave2b.cc` (14 tests; `--gtest_filter='Wave2b*'`):
+- plane values on a hand-built position with pockets on both boards, for the white team and the black team (every
+  one of the 52 values checked); no timing (v3 clock, legacy flag, narrow durative state, derived clocks): only the
+  presence planes; the wide layout is each 39-plane block followed by its 26;
+- the tree: a capture lands in the partner's pocket at age 0, landings age and leave at 5 s, a move resets its
+  board's thinking time and a pass does not; landings separate wide node keys and never narrow ones (a narrow state
+  with landings in its config equals, and keys as, one without, also after an action);
+- `pocket_landing_counts` (the head's order, the half-open window) and the seat-clock game's landing log reaching a
+  wide search clock;
+- engine: `engine/tests/data/wide_probe.onnx` (130 inputs, zero heads, `arrivals` echoes 20 of the extra planes;
+  `make_wide_probe.py` writes it) shows the exact extras reach the network per batch row, and zero planes without
+  extras; a narrow network's outputs are bit-identical with or without extras (it13 when present); a durative
+  search runs on the wide probe;
+- **widened it13 = it13 through the engine**: `twin-s-clock-wide-fp32.onnx` vs `twin-s-clock-fp32.onnx` and
+  `twin-s-clock-wide.onnx` vs `twin-s-clock-it13.onnx` (skipped if missing), on contract planes and on random
+  [0, 1] extras: largest difference over value, policies, WDL and moves left **0**, arrivals exactly 0. (The
+  published `twin-s-clock.onnx`/`-it13.onnx` keeps FP16 weights; compare FP32 with FP32.)
+- self-play on the wide probe writes `seat_clocks.tsv` with all 59 columns, thinking times within the game, counts
+  non-negative (3 games: 199 rows, 381 recent and 576 arriving pieces counted).
+`engine/tests/test_uci.cc` `Wave2bSeatArrivalsReachAWideDurativeClockOnly`: parsing, the 5 s window, refusals,
+clearing, and no effect with a narrow network.
+
+Checks run 2026-11-19 (ONNX Runtime on the Mac):
+- full suite 513 tests: 512 pass, 1 skipped (upstream's perf test, as before);
+- `engine/tests/stock_parity.sh`: 8/8 identical to the stock v3.0.3 binary at defaults;
+- C++ `dumpplanes --wide-planes` vs Python `board2planes_wide` (`hivemind.domain.wide_planes`) on 300 random
+  positions with random pockets (231 with timing and landings): the 52 extra values identical (max difference 0)
+  and the board planes 0..36 identical except the sit plane 31 on timed lines, which the C++ dump takes from the
+  clocks' lead and the Python call from its flag (the script was a scratch check, not committed);
+- UCI: the same wave 2 options and `SeatArrivalsMs` on it13-fp32 and the widened fp32 give the same Value, WDL and
+  bestmove at 800 nodes; the widened net prints `Arrivals:` all 0;
+- arena: 1 pair at 10 s, rules v3, wave2 on the widened fp32 vs upstream-it13: 2 games, 0 errors.
+
+### Open after 2b
+
+- TensorRT: the widening, the arrivals binding and its copy are written for `engine.cc` but not compiled or run on
+  this Mac; build on PACE before relying on it (`cluster/build.sh`). The TensorRT parser accepts an "arrivals"
+  output only with exactly 20 values per position.
+- A trained wide network has not been searched with yet; with zero weights the new planes cannot change a search
+  (except that wide node keys split transpositions differing only in landing history or thinking time).
+- The arena's landing times are inferred at our decisions only (see Arena above); the arena's Observation has no
+  capture log.
+- Thinking time is per board, not per seat: a seat that comes back from a pass keeps the board's time since the last
+  landing, as the contract defines `e`.
+- The root mate provers and tree reuse still run on the v3 clock, where wide timing is 0.
