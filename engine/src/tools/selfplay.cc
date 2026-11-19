@@ -35,6 +35,7 @@
 #include "common/utils.h"
 #include "tools/distill_data.h"
 #include "tools/selfplay_policy.h"
+#include "tools/seat_clock_game.h"
 
 namespace {
 
@@ -604,6 +605,80 @@ std::string current_date() {
     return date.str();
 }
 
+// Wave 2 seat-clock games (--base-mix): the clocks a game started and ended
+// on, and per searched record the clocks the search saw.
+struct SeatClockRow {
+    size_t sample = 0;
+    int team = 0;
+    int64_t timeMs = 0;
+    uint32_t nodes = 0;
+    std::array<int32_t, 4> clocks{};
+    std::array<int32_t, 4> elapsed{};
+    std::array<int32_t, 4> paces{};
+};
+
+struct SeatClockSummary {
+    SeatClockGame::Start start;
+    std::array<int32_t, 4> finalClocks{};
+    int32_t finalWhiteLeadMs = 0;
+    int64_t gameMs = 0;
+    int flagSeat = -1;
+    std::vector<SeatClockRow> rows;
+};
+
+const char* seat_name(int seat) {
+    static const char* const names[4] = {"Aw", "Ab", "Bw", "Bb"};
+    return names[seat];
+}
+
+template <typename Values>
+std::string four(const Values& values) {
+    std::ostringstream text;
+    for (size_t seat = 0; seat < 4; ++seat) {
+        text << (seat ? " " : "") << values[seat];
+    }
+    return text.str();
+}
+
+void write_seat_tags(std::ostream& stream, const SeatClockSummary& seats) {
+    stream << "[BaseMs \"" << seats.start.baseMs << "\"]\n"
+           << "[StartClocksMs \"" << four(seats.start.clocksMs) << "\"]\n"
+           << "[SeatMoveTimesMs \"" << four(seats.start.moveTimesMs) << "\"]\n"
+           << "[FinalClocksMs \"" << four(seats.finalClocks) << "\"]\n"
+           << "[GameMs \"" << seats.gameMs << "\"]\n";
+}
+
+/**
+ * One line per searched record of a seat-clock game, in record order (HVM6
+ * and HDST have no room for them): game, record index in the game, team,
+ * game time, nodes, then the four seat clocks, the elapsed thinking of the
+ * seats on turn (0 for the others) and the observed paces, Aw Ab Bw Bb.
+ */
+void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
+                     const SeatClockSummary& seats) {
+    const bool fresh = !std::filesystem::exists(path);
+    std::ofstream stream(path, std::ios::app);
+    if (!stream) {
+        throw std::runtime_error("Unable to append " + path.string());
+    }
+    if (fresh) {
+        stream << "game\trecord\tteam\ttime_ms\tnodes"
+                  "\tclock_aw\tclock_ab\tclock_bw\tclock_bb"
+                  "\telapsed_aw\telapsed_ab\telapsed_bw\telapsed_bb"
+                  "\tpace_aw\tpace_ab\tpace_bw\tpace_bb\n";
+    }
+    for (const SeatClockRow& row : seats.rows) {
+        stream << gameNumber + 1 << '\t' << row.sample << '\t' << row.team << '\t'
+               << row.timeMs << '\t' << row.nodes;
+        for (const auto* values : {&row.clocks, &row.elapsed, &row.paces}) {
+            for (int32_t value : *values) {
+                stream << '\t' << value;
+            }
+        }
+        stream << '\n';
+    }
+}
+
 void append_pgn(
     const std::filesystem::path& path,
     size_t round,
@@ -615,7 +690,8 @@ void append_pgn(
     float initialClockSeconds,
     const std::string& termination,
     const TimeState& initialTime,
-    const TimeState& finalTime) {
+    const TimeState& finalTime,
+    const SeatClockSummary* seats = nullptr) {
     std::ofstream stream(path, std::ios::app);
     if (!stream) {
         throw std::runtime_error("Unable to append " + path.string());
@@ -643,6 +719,9 @@ void append_pgn(
                << "[BlackTeamMoveTimeMs \"" << initialTime.move_time_ms(Stockfish::BLACK) << "\"]\n";
     } else {
         stream << "[TimeAdvantage \"" << (startingTeam == 0 ? "Hivemind-B" : "Hivemind-A") << "\"]\n";
+    }
+    if (seats) {
+        write_seat_tags(stream, *seats);
     }
     stream << "[RawPolicyMacroPlies \"" << rawPolicyMacroPlies << "\"]\n"
            << "[RawPolicyEvents \"" << rawPolicyEvents << "\"]\n"
@@ -743,7 +822,8 @@ void append_pgn_move(
     std::array<int, 2>& moveNumbers,
     size_t eventIndex,
     float initialClockSeconds,
-    std::vector<PgnMove>& pgnMoves) {
+    std::vector<PgnMove>& pgnMoves,
+    float remainingSeconds = -1.0f) {
     if (move == Stockfish::MOVE_NONE) {
         return;
     }
@@ -754,12 +834,289 @@ void append_pgn_move(
     PgnMove pgnMove;
     pgnMove.token = std::to_string(moveNumbers[boardNumber]) + boardLetter;
     pgnMove.san = board.san_move(boardNumber, move);
-    pgnMove.remainingSeconds = std::max(
-        0.0f, initialClockSeconds - 0.1f * static_cast<float>(eventIndex + 1));
+    // Seat-clock games give the mover's real clock; otherwise a placeholder.
+    pgnMove.remainingSeconds = remainingSeconds >= 0.0f
+        ? remainingSeconds
+        : std::max(0.0f, initialClockSeconds - 0.1f * static_cast<float>(eventIndex + 1));
     pgnMoves.push_back(std::move(pgnMove));
     if (!whiteToMove) {
         moveNumbers[boardNumber]++;
     }
+}
+
+/// What one seat-clock game produced (see play_seat_clock_game).
+struct SeatClockGameResult {
+    std::vector<TrainingSample> samples;
+    std::vector<distill::Record> distillRecords;
+    std::vector<PgnMove> pgnMoves;
+    int winner = -1;
+    std::string termination = "macro-ply limit";
+    size_t rawPolicyMacroPlies = 0;
+    size_t rawPolicyEvents = 0;
+    int wouldResignTeam = -1;
+    SeatClockSummary seats;
+};
+
+/**
+ * @brief A wave 2 self-play game on four real seat clocks (--base-mix).
+ *
+ * SeatClockGame drives it: each decision is one search by the deciding
+ * seat's team (one record), rooted at that moment with the seat clocks,
+ * observed paces, the other team's elapsed thinking and the wave 2 tree
+ * options; only the deciding seats' boards of the chosen action are played,
+ * when they land. A flag (FlagLoss), a double flag, a sit-off, a mate or a
+ * draw on landing ends the game; config.maxMacroPlies caps the decisions.
+ * Tree reuse is not used: durative trees do not transpose across searches.
+ */
+SeatClockGameResult play_seat_clock_game(
+    const SelfPlayConfig& config,
+    const std::vector<Engine*>& threadEngines,
+    Agent (&agents)[2],
+    RawPolicyEvaluator& rawPolicyEvaluator,
+    std::vector<__half>& distillPlanes,
+    bool writeDistill,
+    uint64_t runId,
+    size_t gameIndex,
+    std::mt19937_64& randomEngine) {
+    SeatClockGameResult result;
+    Engine& rawPolicyEngine = *threadEngines.front();
+    Board board;
+    SeatClockGame game(config.wave2,
+                       SeatClockGame::sample_start(config.wave2, config.clock, randomEngine));
+    result.seats.start = game.start();
+    std::array<Stockfish::Move, 4> committed{};
+    std::array<int, 2> moveNumbers = {1, 1};
+    const size_t initializationLength = sample_initialization_length(config, randomEngine);
+    bool rawInitializationActive = initializationLength > 0;
+    const bool canResign = config.resignThreshold < 0.0f
+        && (config.resignDisableFraction <= 0.0
+            || std::uniform_real_distribution<double>(0.0, 1.0)(randomEngine) >= config.resignDisableFraction);
+    const bool checksResign = !canResign && config.resignThreshold < 0.0f;
+    std::array<size_t, 2> consecutiveResignPlies = {0, 0};
+    size_t decisions = 0;
+    for (Agent& teamAgent : agents) {
+        teamAgent.reset_search_state();
+    }
+
+    auto sides_now = [&board]() {
+        return std::array<Stockfish::Color, 2>{
+            board.side_to_move(BOARD_A), board.side_to_move(BOARD_B)};
+    };
+    for (;;) {
+        const std::array<Stockfish::Color, 2> sides = sides_now();
+        const SeatClockGame::Event event = game.next(sides);
+        if (event.type == SeatClockGame::EventType::FLAG) {
+            result.winner = event.loser == 0 ? 1 : 0;
+            result.termination = "flag";
+            for (int seat = 0; seat < 4; ++seat) {
+                result.seats.flagSeat = event.seats[seat] ? seat : result.seats.flagSeat;
+            }
+            break;
+        }
+        if (event.type == SeatClockGame::EventType::DOUBLE_FLAG) {
+            result.winner = -1;
+            result.termination = "double_flag";
+            break;
+        }
+        if (event.type == SeatClockGame::EventType::SITOFF) {
+            result.winner = event.loser < 0 ? -1 : 1 - event.loser;
+            result.termination = "sitoff_adjudicated";
+            break;
+        }
+        const Stockfish::Color team = event.team;
+        if (event.type == SeatClockGame::EventType::LAND) {
+            for (int seat = 0; seat < 4; ++seat) {
+                if (!event.seats[seat]) {
+                    continue;
+                }
+                const int boardNumber = seat / 2;
+                const Stockfish::Move move = committed[seat];
+                if (!board.is_legal_move(boardNumber, move)) {
+                    throw std::runtime_error("A committed seat-clock move is no longer legal");
+                }
+                append_pgn_move(board, boardNumber, move, moveNumbers, result.pgnMoves.size(),
+                                config.initialClockSeconds, result.pgnMoves,
+                                static_cast<float>(game.clock_ms(seat)) / 1000.0f);
+                const bool capture = board.is_capture(boardNumber, move);
+                board.push_move(boardNumber, move);
+                game.landed(seat, capture);
+            }
+            if (rawInitializationActive) {
+                result.rawPolicyEvents = result.pgnMoves.size();
+            }
+            // A mate ends the game when it lands, whichever board.
+            if (board.is_checkmate(~team, true)) {
+                result.winner = static_cast<int>(team);
+                result.termination = "checkmate";
+                break;
+            }
+            if (board.is_checkmate(team, true)) {
+                result.winner = static_cast<int>(~team);
+                result.termination = "checkmate";
+                break;
+            }
+            if (board.is_draw()) {
+                result.termination = "draw";
+                break;
+            }
+            continue;
+        }
+
+        // A decision: the seats in event.seats start thinking now.
+        if (decisions >= config.maxMacroPlies) {
+            break;
+        }
+        for (int seat = 0; seat < 4; ++seat) {
+            if (event.seats[seat]) {
+                game.plan_cost(seat, randomEngine);
+            }
+        }
+        const TimeState clock = game.search_clock(team, sides, event.seats);
+        const bool hasTimeAdvantage = clock.can_sit(team);
+        JointActionCandidate action;
+        bool searched = false;
+        if (rawInitializationActive && decisions < initializationLength) {
+            const JointActionCandidate rawAction = sample_raw_policy_action(
+                rawPolicyEngine, rawPolicyEvaluator, board, team, clock,
+                sample_raw_policy_temperature(config, randomEngine), randomEngine);
+            if (!action_leads_to_terminal(board, rawAction, team, clock)) {
+                action = rawAction;
+                ++result.rawPolicyMacroPlies;
+            } else {
+                rawInitializationActive = false;
+            }
+        } else {
+            rawInitializationActive = false;
+        }
+        if (!rawInitializationActive) {
+            const GameStatus status = adjudicate_game(board, team, clock);
+            if (status != GameStatus::ONGOING) {
+                result.winner = adjudicated_winner(status, team);
+                result.termination = adjudicated_termination(status);
+                break;
+            }
+            TrainingSample sample;
+            sample.gameId = gameIndex;
+            sample.macroPly = static_cast<uint16_t>(std::min<size_t>(
+                decisions, std::numeric_limits<uint16_t>::max()));
+            sample.team = team == Stockfish::WHITE ? 0 : 1;
+            sample.hasTimeAdvantage = hasTimeAdvantage ? 1 : 0;
+            if (config.writeTrainingChunks) {
+                sample.planes = encode_planes(board, team, clock);
+            }
+            const size_t teamIndex = team == Stockfish::WHITE ? 0 : 1;
+            Agent& agent = agents[teamIndex];
+            agent.reset_search_state();
+            SearchOptions searchOptions;
+            searchOptions.targetNodes = randomized_node_budget(config, randomEngine);
+            searchOptions.retainForReuse = false;
+            searchOptions.search.enableMateProbe = config.fairyStockfishMateNodes > 0;
+            searchOptions.mateProbeNodes = config.fairyStockfishMateNodes;
+            searchOptions.completeMateProbe = config.fairyStockfishMateNodes > 0;
+            searchOptions.search.enableGumbelRootSearch = false;
+            if (!config.rootScans) {
+                searchOptions.search.enableRootMateSearch = false;
+                searchOptions.search.certifySelectedMove = false;
+            }
+            searchOptions.search.rootDirichletAlpha = config.dirichletAlpha;
+            searchOptions.search.rootDirichletEpsilon = config.dirichletEpsilon;
+            searchOptions.search.rootNoiseSeed = selfplay_seed(
+                runId, gameIndex * config.maxMacroPlies + decisions);
+            searchOptions.clock = clock;
+            const JointActionCandidate choice = agent.run_search(
+                board, threadEngines, team, hasTimeAdvantage, searchOptions);
+            if (agent.search_status() != GameStatus::ONGOING) {
+                result.winner = adjudicated_winner(agent.search_status(), team);
+                result.termination = adjudicated_termination(agent.search_status());
+                break;
+            }
+            std::vector<RootEdgeStats> edges = agent.root_edge_stats();
+            if (edges.empty()) {
+                throw std::runtime_error("Ongoing search returned no root edges");
+            }
+            const uint64_t actualVisits = std::accumulate(
+                edges.begin(), edges.end(), uint64_t{0},
+                [](uint64_t total, const RootEdgeStats& edge) {
+                    return total + static_cast<uint64_t>(std::max(0, edge.visits));
+                });
+            sample.nodes = static_cast<uint32_t>(std::min<uint64_t>(
+                actualVisits, std::numeric_limits<uint32_t>::max()));
+            edges = selfplay_policy_edges(edges, agent.root_type(), choice, agent.certified_choice());
+            const float rootQ = agent.root_q();
+            sample.rootQ = rootQ;
+            if (config.writeTrainingChunks) {
+                sample.policyA = marginal_policy(board, BOARD_A, edges);
+                sample.policyB = marginal_policy(board, BOARD_B, edges);
+                sample.jointPolicy = joint_policy(board, edges);
+            }
+            if (writeDistill) {
+                distill::Record record;
+                board_to_planes(board, distillPlanes.data(), team, clock);
+                distill::pack_planes(distillPlanes.data(), record);
+                record.value = rootQ;
+                record.ply = sample.macroPly;
+                record.policy[0] = distill_search_policy(
+                    board, BOARD_A, board.side_to_move(BOARD_A) == team, edges);
+                record.policy[1] = distill_search_policy(
+                    board, BOARD_B, board.side_to_move(BOARD_B) == ~team, edges);
+                result.distillRecords.push_back(std::move(record));
+            }
+            SeatClockRow row;
+            row.sample = result.samples.size();
+            row.team = sample.team;
+            row.timeMs = game.now_ms();
+            row.nodes = sample.nodes;
+            row.clocks = game.clocks_ms();
+            row.paces = game.paces_ms();
+            for (int board_ = 0; board_ < 2; ++board_) {
+                const int seat = TimeState::seat_of(board_, sides[board_]);
+                row.elapsed[seat] = game.elapsed_ms(seat);
+            }
+            result.seats.rows.push_back(row);
+            result.samples.push_back(std::move(sample));
+
+            if (checksResign && result.wouldResignTeam < 0) {
+                consecutiveResignPlies[teamIndex] = rootQ <= config.resignThreshold
+                    ? consecutiveResignPlies[teamIndex] + 1 : 0;
+                if (consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
+                    result.wouldResignTeam = static_cast<int>(teamIndex);
+                }
+            }
+            if (canResign) {
+                if (rootQ <= config.resignThreshold) {
+                    if (++consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
+                        result.winner = 1 - static_cast<int>(teamIndex);
+                        result.termination = "resignation";
+                        break;
+                    }
+                } else {
+                    consecutiveResignPlies[teamIndex] = 0;
+                }
+            }
+            action = select_action(edges, mcts_temperature(config, decisions), randomEngine);
+            searched = true;
+        }
+        (void)searched;
+        ++decisions;
+        // Only the seats deciding now act; the team's other seat (if on
+        // turn) is still on a decision of its own.
+        for (int seat = 0; seat < 4; ++seat) {
+            if (!event.seats[seat]) {
+                continue;
+            }
+            const Stockfish::Move move = seat / 2 == BOARD_A ? action.moveA : action.moveB;
+            if (move == Stockfish::MOVE_NONE) {
+                game.commit_pass(seat, sides);
+            } else {
+                committed[seat] = move;
+                game.commit_move(seat);
+            }
+        }
+    }
+    result.seats.finalClocks = game.clocks_ms();
+    result.seats.finalWhiteLeadMs = game.white_lead_ms();
+    result.seats.gameMs = game.now_ms();
+    return result;
 }
 
 } // namespace
@@ -807,6 +1164,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     const std::filesystem::path checkpointDirectory = config.outputDirectory / "checkpoint";
     const std::filesystem::path progressPath = checkpointDirectory / "progress";
     const std::filesystem::path pgnPath = config.outputDirectory / "games.pgn";
+    // Seat-clock games: the clocks behind every record (see write_seat_rows).
+    const std::filesystem::path seatRowsPath = config.outputDirectory / "seat_clocks.tsv";
     const std::string distillPrefix = "search_" + std::to_string(runId);
     std::optional<SelfPlayProgress> resumed;
     if (config.resume && std::filesystem::exists(progressPath)) {
@@ -903,6 +1262,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         // In a game exempt from resigning, the team the rule would have
         // resigned for (-1: none): what the resignation threshold is checked by.
         int wouldResignTeam;
+        // Seat-clock games (--base-mix) only.
+        std::optional<SeatClockSummary> seats;
     };
     std::map<size_t, FinishedGame> finishedGames;
     size_t nextOutput = firstGame;
@@ -952,7 +1313,10 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             pgnPath, gameNumber + 1, game.pgnMoves, game.winner, game.startingTeam,
             game.rawPolicyMacroPlies, game.rawPolicyEvents,
             config.initialClockSeconds, game.termination,
-            game.initialTime, game.finalTime);
+            game.initialTime, game.finalTime, game.seats ? &*game.seats : nullptr);
+        if (game.seats) {
+            write_seat_rows(seatRowsPath, gameNumber, *game.seats);
+        }
         if (checkpointing) {
             const size_t done = gameNumber + 1;
             if (distillWriter && distillWriter->full()) {
@@ -979,7 +1343,15 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                   << " samples " << sampleCount
                   << " events " << game.pgnMoves.size()
                   << " termination " << game.termination;
-        if (game.initialTime.is_clocked()) {
+        if (game.seats) {
+            const SeatClockSummary& seats = *game.seats;
+            std::cout << " lead " << seats.start.whiteLeadMs << "->"
+                      << seats.finalWhiteLeadMs << " ms";
+            if (seats.flagSeat >= 0) {
+                std::cout << " flag-seat " << seat_name(seats.flagSeat);
+            }
+            std::cout << " clocks " << four(seats.finalClocks);
+        } else if (game.initialTime.is_clocked()) {
             std::cout << " lead " << game.initialTime.lead_ms(Stockfish::WHITE)
                       << "->" << game.finalTime.lead_ms(Stockfish::WHITE) << " ms";
         }
@@ -1028,6 +1400,10 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             TimeState time = config.clockModel
                 ? sample_clock(config.clock, randomEngine)
                 : TimeState::legacy(team, false);
+            if (config.clockModel && !config.wave2.sitGate) {
+                // SitGate off: a pass is always legal, in the game and the tree.
+                time = time.with_sit_gate(false);
+            }
             const TimeState initialTime = time;
             int winner = -1;
             std::string termination = "macro-ply limit";
@@ -1047,7 +1423,24 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             const bool checksResign = !canResign && config.resignThreshold < 0.0f;
             int wouldResignTeam = -1;
 
-            for (size_t macroPly = 0; macroPly < config.maxMacroPlies; ++macroPly) {
+            std::optional<SeatClockSummary> seats;
+            if (config.wave2.seat_clocks()) {
+                SeatClockGameResult played = play_seat_clock_game(
+                    config, threadEngines, agents, rawPolicyEvaluator, distillPlanes,
+                    distillWriter != nullptr, runId, gameIndex, randomEngine);
+                samples = std::move(played.samples);
+                distillRecords = std::move(played.distillRecords);
+                pgnMoves = std::move(played.pgnMoves);
+                winner = played.winner;
+                termination = std::move(played.termination);
+                rawPolicyMacroPlies = played.rawPolicyMacroPlies;
+                rawPolicyEvents = played.rawPolicyEvents;
+                wouldResignTeam = played.wouldResignTeam;
+                searches.fetch_add(samples.size(), std::memory_order_relaxed);
+                seats = std::move(played.seats);
+            }
+
+            for (size_t macroPly = 0; !seats && macroPly < config.maxMacroPlies; ++macroPly) {
                 const bool hasTimeAdvantage = time.can_sit(team);
                 const GameStatus status = adjudicate_game(board, team, time);
                 if (status != GameStatus::ONGOING) {
@@ -1129,6 +1522,15 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 searchOptions.search.rootNoiseSeed = selfplay_seed(runId, gameIndex * config.maxMacroPlies + macroPly);
                 if (config.clockModel) {
                     searchOptions.clock = time;
+                    if (config.wave2.durativeTree) {
+                        // The durative tree on the lead-only clock (no
+                        // --base-mix): seat clocks derived from the lead.
+                        DurativeConfig durative = config.wave2.durative_config();
+                        durative.rootMoveTimeMs = time.next_move_time_ms(team);
+                        searchOptions.clock = TimeState::durative(
+                            time, team, board.side_to_move(BOARD_A),
+                            board.side_to_move(BOARD_B), durative);
+                    }
                 }
                 const JointActionCandidate choice = agent.run_search(
                     board, threadEngines, team, hasTimeAdvantage, searchOptions);
@@ -1226,7 +1628,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 team = ~team;
             }
 
-            const GameStatus finalStatus = adjudicate_game(board, team, time);
+            const GameStatus finalStatus = seats
+                ? GameStatus::ONGOING : adjudicate_game(board, team, time);
             if (winner < 0 && finalStatus != GameStatus::ONGOING) {
                 winner = adjudicated_winner(finalStatus, team);
                 termination = adjudicated_termination(finalStatus);
@@ -1249,7 +1652,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             finishedGames.emplace(gameIndex, FinishedGame{
                 std::move(samples), std::move(distillRecords), std::move(pgnMoves), winner,
                 startingTeam, rawPolicyMacroPlies, rawPolicyEvents, std::move(termination),
-                initialTime, time, wouldResignTeam});
+                initialTime, time, wouldResignTeam, std::move(seats)});
             for (auto next = finishedGames.find(nextOutput); next != finishedGames.end();
                  next = finishedGames.find(nextOutput)) {
                 writeGame(next->first, next->second);

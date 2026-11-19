@@ -143,6 +143,13 @@ void printUsage(const char* progName) {
     cout << "    --time-model flag|clock (clock: each game draws a lead and team move times)" << endl;
     cout << "    --level-start-fraction <x> --start-lead-min-ms <ms> --start-lead-max-ms <ms>" << endl;
     cout << "    --move-time-min-ms <ms> --move-time-max-ms <ms> (log-uniform; defaults 0.5, 100-10000, 100-3000)" << endl;
+    cout << "    Wave 2 (docs/wave2_training.md; each implies --time-model clock):" << endl;
+    cout << "    --durative-tree <bool> --sit-gate <bool> --flag-loss <bool> --instant-transfer <bool>" << endl;
+    cout << "    --mate-race-by-landing <bool> --pass-cap-k <1..64> (UCI options of every search)" << endl;
+    cout << "    --base-mix <ms:w,...> (games on four seat clocks, base drawn per game; the lead" << endl;
+    cout << "      options then give time odds) --seat-move-times <bool> (a move time per seat)" << endl;
+    cout << "    --min-move-ms <ms> --lag-max-ms <ms> --pace-jitter <x> --sitoff-ms <ms>" << endl;
+    cout << "      --pace-ema-alpha <x> (seat-clock games; defaults 100, 150, 0.25, 5000, 0.3)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;
@@ -344,9 +351,18 @@ int main(int argc, char* argv[]) {
                 else if (option == "--dirichlet-epsilon") config.dirichletEpsilon = stof(value);
                 else if (option == "--batch-size") config.batchSize = stoi(value);
                 else if (parse_clock_option(option, value, config.clockModel, config.clock)) {}
+                else if (parse_wave2_option(option, value, config.wave2)) {}
                 else throw invalid_argument("Unknown selfplay option: " + option);
             }
             config.clock.validate();
+            config.wave2.validate();
+            if (config.wave2.seat_clocks() || config.wave2.changes_search()) {
+                // Every wave 2 option is a clock-model option.
+                config.clockModel = true;
+            }
+            if (config.wave2.seat_clocks() && config.treeReuse) {
+                throw invalid_argument("--tree-reuse does not apply to seat-clock games (--base-mix)");
+            }
         } catch (const exception& error) {
             cerr << "Invalid selfplay arguments: " << error.what() << endl;
             return EXIT_FAILURE;

@@ -7,6 +7,7 @@
 
 #include "search/search_params.h"
 #include "tools/clock_sampling.h"
+#include "tools/seat_clock_game.h"
 
 class Engine;
 
@@ -60,6 +61,9 @@ struct SelfPlayConfig {
     // Off, one team may sit for the whole game (the TimeAdvantage flag).
     bool clockModel = false;
     ClockSampling clock;
+    // Wave 2 (docs/wave2_training.md): the tree options of every search and,
+    // with a base mix, games on four real seat clocks. Defaults: stock v3.
+    Wave2GameOptions wave2;
     std::filesystem::path distillOutputDirectory;
     size_t distillChunkPositions = 250'000;
 };
