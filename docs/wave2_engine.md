@@ -14,7 +14,7 @@ and, for the binary, by `engine/tests/stock_parity.sh`.
 | Option | Type, default | Meaning |
 |---|---|---|
 | `DurativeTree` | check, false | Per-seat clocks and ready times in the tree (below). |
-| `SitGate` | check, true | Upstream's hard `can_sit = lead > 0`. Off: a pass is always legal, priced by the tree (durative trees keep the sit-off rule). Applies to v3 clocked states too. |
+| `SitGate` | check, true | Upstream's hard `can_sit = lead > 0`. Off: a pass is always legal, priced by the tree (durative trees keep the sit-off rule). Takes effect only with `DurativeTree`: a v3 clocked state keeps the gate (`TimeState::can_sit`), because v3's turn-taking tree has no sit-off rule and with both teams free to pass the search cycled and never answered. |
 | `FlagLoss` | check, false | Durative only: a seat whose clock runs out is a terminal loss for its team; two teams out at the same millisecond = draw (arena RULES.md). |
 | `InstantTransfer` | check, true | Durative only. Off: a captured piece is in the partner's pocket from the capture's landing but droppable only from the partner's next decision (below). |
 | `MateRaceByLanding` | check, false | Durative only. Mate races go to the earlier landing; exact ties to the opponent of the last capturer (below). The root mate provers are off under it. |
