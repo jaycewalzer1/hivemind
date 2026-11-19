@@ -126,10 +126,16 @@ labels and training, not the rules:
 uv run python -m hivemind.wave2 init
 uv run hivemind rl-loop --wave2 --allow-stock-engine --no-gate --no-upload --keep-selfplay --last 1 \
     --runs /tmp/w2-smoke --games 4 --segment-games 4 --val-games 2 --parallel-games 2 --checkpoint-games 0 \
-    --batch-size 1024 --pause-for "" \
+    --batch-size 256 --pause-for "" \
     --generator engine/models/twin-s-clock-w2.onnx --generator-checkpoint artifacts/distill/twin-s-clock-w2/best.pt \
     --selfplay-engine <engine> --match-engine <engine>
 ```
 
-With the wave 2 engine built, drop `--allow-stock-engine`. Batch 1024 over a few hundred positions is one training
-step. `distill-train` runs on the CPU there (no CUDA); it uses `OMP_NUM_THREADS=2`.
+With the wave 2 engine built, drop `--allow-stock-engine`. The batch must not exceed the new positions (a few hundred
+from 4 games): `distill-train` only draws whole batches and would wait forever, so the loop refuses that case.
+`distill-train` runs on the CPU there (no CUDA, `OMP_NUM_THREADS=2`).
+
+Run 2026-11-19 on this Mac (stock v3.0.3 binary `third_party/upstream-hivemind/engine/build-ninja/hivemind`, Core ML,
+it13 as generator): 4 + 2 games in 20 s, label check clean (348 + 86 records, 6 checkmates, no flags as no seat
+clocks), 3 training steps from it13 (trunk 5e-5, heads 1e-4) in 40 s with search validation loss 3.6366 -> 3.6339,
+ONNX exported. Exit 0. Not run: matches (`--no-gate`), any wave 2 option (the engine had none yet).
