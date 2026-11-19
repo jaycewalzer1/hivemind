@@ -20,6 +20,16 @@ TIME_ADVANTAGE_CHANNEL = 31
 NUM_CLOCK_CHANNELS_PER_BOARD = 2
 NUM_CLOCKED_CHANNELS_PER_BOARD = NUM_BUGHOUSE_CHANNELS_PER_BOARD + NUM_CLOCK_CHANNELS_PER_BOARD
 NUM_CLOCKED_CHANNELS = 2 * NUM_CLOCKED_CHANNELS_PER_BOARD
+# Wave 2b (talisman fork): the wide layout appends 26 constant planes to each
+# board's clocked block (seat clocks, thinking time, pocket presence, recent
+# landings; hivemind.domain.wide_planes has the order), so a board block is 65.
+NUM_WIDE_EXTRA_CHANNELS_PER_BOARD = 26
+NUM_WIDE_CHANNELS_PER_BOARD = NUM_CLOCKED_CHANNELS_PER_BOARD + NUM_WIDE_EXTRA_CHANNELS_PER_BOARD
+NUM_WIDE_CHANNELS = 2 * NUM_WIDE_CHANNELS_PER_BOARD
+# The arrivals head: 4 pockets (ours A, theirs A, ours B, theirs B) x P, N, B,
+# R, Q, the pieces landing there within the next ARRIVALS_WINDOW_MS.
+NUM_ARRIVALS = 20
+ARRIVALS_WINDOW_MS = 5000
 NUM_POSITIONS_PER_CHUNK = 512
 
 POLICY_LABELS = [

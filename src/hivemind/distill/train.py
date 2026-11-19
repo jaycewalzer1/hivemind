@@ -33,15 +33,32 @@ from hivemind.architectures.twin_board import (
     load_twin_board_checkpoint,
 )
 from hivemind.distill.data import DistillDataset, chunk_paths, chunk_positions, head_chunk, read_chunk
+from hivemind.constants import NUM_WIDE_CHANNELS_PER_BOARD
 from hivemind.paths import PROJECT_ROOT
 
 
-TERMS = ("policy_a", "policy_b", "wdl", "value", "moves_left")
+TERMS = ("policy_a", "policy_b", "wdl", "value", "moves_left", "arrivals")
+# Wave 2b arrivals loss: per piece type P, N, B, R, Q, the same in all four
+# pockets; a lost queen in a partner's pocket matters most.
+ARRIVALS_TYPE_WEIGHTS = (1.0, 2.0, 2.0, 2.0, 4.0)
+
+
+def arrivals_loss(predicted, target):
+    """Per-row weighted mean squared error over the 20 arrival counts."""
+    weights = predicted.new_tensor(ARRIVALS_TYPE_WEIGHTS).repeat(4)
+    return ((predicted.float() - target) ** 2 * weights).sum(1) / weights.sum()
+
+
+def layout(model):
+    """The plane layout a model reads (hivemind.distill.data.read_chunk)."""
+    return "wide" if getattr(model, "arrivals_head", None) is not None \
+        or model.planes_per_board == NUM_WIDE_CHANNELS_PER_BOARD else "narrow"
 
 
 def _loss_rows(model, batch):
     """Loss numerators and target masks before normalization."""
-    value, (policy_a, policy_b), _, wdl_logits, plys = model(batch["planes"])
+    outputs = model(batch["planes"])
+    value, (policy_a, policy_b), _, wdl_logits, plys = outputs[:5]
     per_row = {}
     for name, logits, (target, legal, mask) in (("policy_a", policy_a, batch["policy"][0]),
                                                 ("policy_b", policy_b, batch["policy"][1])):
@@ -54,6 +71,8 @@ def _loss_rows(model, batch):
     # A resigned game has a result but no length: MOVES_LEFT_UNKNOWN (< 0).
     has_moves_left = has_wdl * (batch["moves_left"] >= 0).float()
     per_row["moves_left"] = ((plys.float().squeeze(1) - batch["moves_left"]) ** 2, has_moves_left)
+    if len(outputs) > 5 and "arrivals" in batch:
+        per_row["arrivals"] = (arrivals_loss(outputs[5], batch["arrivals"]), batch["has_arrivals"].float())
     return per_row, (value, policy_a, policy_b)
 
 
@@ -75,7 +94,7 @@ def losses(model, batch, weights):
     for name, (loss, valid) in per_row.items():
         for source, mask in _source_masks(batch, weights):
             active = valid * mask
-            weight = weights[source][name] if source is not None else weights[name]
+            weight = (weights[source] if source is not None else weights).get(name, 0.0)
             total = total + weight * (loss * active).sum() / active.sum().clamp_min(1)
         terms[name] = (loss * valid).sum() / valid.sum().clamp_min(1)
     return total, terms, outputs
@@ -113,9 +132,11 @@ def evaluate(model, dataset, weights, batch_size=2048):
     total = 0.0
     for name in TERMS:
         keys = [key for key in sums if key[1] == name]
+        if not keys:
+            continue
         metrics[name] = sum(sums[key] for key in keys) / max(1, sum(counts[key] for key in keys))
         for source, term in keys:
-            weight = weights[source][term] if source is not None else weights[term]
+            weight = (weights[source] if source is not None else weights).get(term, 0.0)
             total += weight * sums[(source, term)] / max(1, counts[(source, term)])
     metrics["loss"] = total
     metrics["value_mae"] = value_error / count
@@ -205,6 +226,11 @@ def main():
                         help="Chunks held on the device at once")
     parser.add_argument("--eval-every", type=int, default=2000, help="Steps between validations")
     parser.add_argument("--moves-left-weight", type=float, default=0.1)
+    parser.add_argument("--arrivals-weight", type=float, default=0.05,
+                        help="Weight of the wave 2b arrivals loss (wide networks, rows with a label)")
+    parser.add_argument("--wide", action="store_true",
+                        help="Wave 2b: widen the --init network to the wide planes and add the arrivals "
+                             "head (zero-initialised; a wide checkpoint stays wide without this)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip torch.compile of the residual blocks (about 1.5x slower)")
@@ -218,12 +244,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.out.mkdir(parents=True, exist_ok=True)
     raw_weights = {"policy_a": 1.0, "policy_b": 1.0, "wdl": 1.0, "value": 1.0,
-                   "moves_left": args.moves_left_weight}
+                   "moves_left": args.moves_left_weight, "arrivals": args.arrivals_weight}
     search_moves_left = (args.moves_left_weight if args.search_moves_left_weight is None
                          else args.search_moves_left_weight)
     search_weights = {"policy_a": args.search_policy_weight, "policy_b": args.search_policy_weight,
                       "wdl": args.search_wdl_weight, "value": args.search_value_weight,
-                      "moves_left": search_moves_left}
+                      "moves_left": search_moves_left, "arrivals": args.arrivals_weight}
     weights = {"raw": raw_weights, "search": search_weights}
 
     pool = chunk_paths(args.data)
@@ -253,13 +279,31 @@ def main():
         raise SystemExit("--replay-fraction must leave part of the search share for --search-data")
     search_rows -= replay_rows
 
+    variant = {"mid_attention": args.mid_attention, "value_diff": args.value_diff,
+               "blocks": args.blocks, "channels": args.channels, "attention_dim": args.attention_dim,
+               "attention_style": args.attention_style, "block": args.block, "se_every": args.se_every}
+    size = args.size
+    if args.init:
+        # A network from before the clock planes starts reading them with
+        # zero weights, computing exactly what it did until training moves them.
+        model, size, variant = load_twin_board_checkpoint(args.init, wide=True if args.wide else None)
+        print(f"starting from {args.init} ({size}, {variant})", flush=True)
+    else:
+        if args.wide:
+            variant.update(planes_per_board=NUM_WIDE_CHANNELS_PER_BOARD, arrivals=True)
+        model = get_twin_board_model(size, **variant)
+    planes_layout = layout(model)
+
+    def read(path):
+        return read_chunk(path, layout=planes_layout)
+
     def batches(paths, window, rows, source):
         """Endless batches of `rows` positions; every position once per pass."""
         while True:
             order = rotation.permutation(len(paths))
             for start in range(0, len(order), window):
                 data = None  # free the previous window before loading the next
-                data = DistillDataset([read_chunk(paths[i]) for i in order[start:start + window]], device,
+                data = DistillDataset([read(paths[i]) for i in order[start:start + window]], device,
                                       source=source)
                 shuffled = torch.randperm(len(data), device=device)
                 for first in range(0, len(data) - rows + 1, rows):
@@ -280,14 +324,14 @@ def main():
             batch = concat_batches(batch, part)
         return batch
 
-    val = (DistillDataset([read_chunk(p) for p in chunk_paths(args.val)], device)
+    val = (DistillDataset([read(p) for p in chunk_paths(args.val)], device)
            if args.val else None)
     # A fixed slice of the training data, scored like the validation set: the
     # gap between the two says whether more data would help.
-    train_probe = (DistillDataset([head_chunk(read_chunk((pool or search_pool)[0]), args.train_probe)], device,
+    train_probe = (DistillDataset([head_chunk(read((pool or search_pool)[0]), args.train_probe)], device,
                                   source=0 if pool else 1)
                    if args.train_probe else None)
-    search_val = (DistillDataset([read_chunk(p) for p in chunk_paths(args.search_val)], device, source=1)
+    search_val = (DistillDataset([read(p) for p in chunk_paths(args.search_val)], device, source=1)
                   if args.search_val else None)
     print(f"train {len(pool)} chunks ({positions} positions, window {window}), "
           f"val {len(val) if val is not None else 0}", flush=True)
@@ -300,17 +344,6 @@ def main():
               f"({sum(chunk_positions(path) for path in replay_pool)} positions), "
               f"{replay_rows}/{args.batch_size} of each batch", flush=True)
 
-    variant = {"mid_attention": args.mid_attention, "value_diff": args.value_diff,
-               "blocks": args.blocks, "channels": args.channels, "attention_dim": args.attention_dim,
-               "attention_style": args.attention_style, "block": args.block, "se_every": args.se_every}
-    size = args.size
-    if args.init:
-        # A network from before the clock planes starts reading them with
-        # zero weights, computing exactly what it did until training moves them.
-        model, size, variant = load_twin_board_checkpoint(args.init)
-        print(f"starting from {args.init} ({size}, {variant})", flush=True)
-    else:
-        model = get_twin_board_model(size, **variant)
     model = model.to(device)
     if device.type == "cuda" and not args.no_compile:
         # In place, so state_dict keys are unchanged. The whole model does not
@@ -375,10 +408,15 @@ def main():
 
 
 OUTPUT_NAMES = ("value", "pi_a", "pi_b", "auxiliary_out", "wdl_out", "moves_left")
+# Wave 2b: wide networks add this output last; the engine matches outputs by
+# name and does not read it.
+ARRIVALS_OUTPUT = "arrivals"
 
 
-def export(out, size, checkpoint_name="best.pt"):
-    """ONNX export with the teacher's inputs and outputs (value, pi_a, pi_b, wdl_out, moves_left)."""
+def export(out, size, checkpoint_name="best.pt", path=None, fp32_path=None):
+    """ONNX export with the teacher's inputs and outputs (value, pi_a, pi_b,
+    wdl_out, moves_left, and arrivals for a wide network); FP16 weights with
+    FP32 inputs and outputs, plus an all-FP32 copy at `fp32_path` if given."""
     import onnx
     from onnxruntime.transformers.float16 import convert_float_to_float16
     from onnxsim import simplify
@@ -387,15 +425,23 @@ def export(out, size, checkpoint_name="best.pt"):
 
     model, size, _ = load_twin_board_checkpoint(out / checkpoint_name)
     model.eval()
-    path = out / f"distill-{size}-v3.0.onnx"
+    names = OUTPUT_NAMES + ((ARRIVALS_OUTPUT,) if model.arrivals_head is not None else ())
+    path = Path(path) if path else out / f"distill-{size}-v3.0.onnx"
     torch.onnx.export(model, (torch.ones(1, 2 * model.planes_per_board, 8, 8),), str(path),
-                      input_names=["data"], output_names=list(OUTPUT_NAMES),
-                      dynamic_axes={name: {0: "batch"} for name in ("data", *OUTPUT_NAMES)},
+                      input_names=["data"], output_names=list(names),
+                      dynamic_axes={name: {0: "batch"} for name in ("data", *names)},
                       dynamo=False, export_params=True, opset_version=18,
                       do_constant_folding=True, keep_initializers_as_inputs=False)
     simplified, check = simplify(onnx.load(str(path)))
     if not check:
         raise RuntimeError("Simplified ONNX model could not be validated")
+    if fp32_path is not None:
+        fp32 = onnx.load_from_string(simplified.SerializeToString())
+        kept = [output for output in fp32.graph.output if output.name != "auxiliary_out"]
+        del fp32.graph.output[:]
+        fp32.graph.output.extend(kept)
+        onnx.checker.check_model(fp32)
+        onnx.save(fp32, str(fp32_path))
     fp16 = convert_float_to_float16(simplified, keep_io_types=True)
     topologically_sort_graph(fp16)
     onnx.checker.check_model(fp16)

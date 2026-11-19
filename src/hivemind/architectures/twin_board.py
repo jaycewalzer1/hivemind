@@ -28,9 +28,11 @@ from hivemind.architectures.builder_util import (
     _ValueHead,
 )
 from hivemind.constants import (
+    NUM_ARRIVALS,
     NUM_BUGHOUSE_CHANNELS_PER_BOARD,
     NUM_CLOCK_CHANNELS_PER_BOARD,
     NUM_CLOCKED_CHANNELS_PER_BOARD,
+    NUM_WIDE_CHANNELS_PER_BOARD,
 )
 
 
@@ -135,6 +137,30 @@ class _BoardAttentionLite(Module):
         return x + self.to_channels(update)
 
 
+class _ArrivalsHead(Module):
+    """Wave 2b: the pieces landing in each pocket within the next 5 s.
+
+    Each board's pooled features with the other board's give that board's
+    (ours P..Q, theirs P..Q) through the same weights, so swapping the boards
+    swaps the two halves of the 20 outputs. The last layer starts at zero:
+    the head says 0 and changes nothing else until it trains."""
+
+    def __init__(self, channels, hidden=64):
+        super().__init__()
+        self.body = Sequential(
+            nn.Linear(2 * channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, NUM_ARRIVALS // 2),
+        )
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, x, batch_size):
+        pooled = x.mean(dim=(2, 3))
+        per_board = self.body(torch.cat((pooled, _swap_boards(pooled, batch_size)), dim=1))
+        return torch.cat((per_board[:batch_size], per_board[batch_size:]), dim=1)
+
+
 class _DenseResidualBlock(Module):
     """Two dense 3x3 convolutions and a residual (two fused kernels in TensorRT,
     against three for the depthwise bottleneck)."""
@@ -172,7 +198,10 @@ class TwinBoardNet(Module):
         dense convolutions; channels_operating is unused)
     :param attention_style: "full" (LayerNorms and MLP) or "lite"
     :param planes_per_board: input planes of each board's block: 39 with the
-        clock planes, 37 for a network from before them
+        clock planes, 37 for a network from before them, 65 for wave 2b's wide
+        layout (hivemind.domain.wide_planes)
+    :param arrivals: add wave 2b's arrivals head; forward then returns it as
+        a sixth output
     """
 
     def __init__(self, channels=192, channels_operating=384, kernels=(3,) * 10,
@@ -180,7 +209,7 @@ class TwinBoardNet(Module):
                  attention_heads=4, channels_policy_head=73, channels_value_head=16,
                  value_fc_size=256, se_every=4, mid_attention=False, value_diff=False,
                  block="bottleneck", attention_style="full",
-                 planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD):
+                 planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False):
         super().__init__()
         planes = self.planes_per_board = planes_per_board
         self.stem = _Stem(channels=channels, nb_input_channels=planes)
@@ -216,6 +245,7 @@ class TwinBoardNet(Module):
             8, 8, 2 * channels if value_diff else channels, channels_value_head, value_fc_size,
             "relu", False, planes,
             use_wdl=True, use_plys_to_end=True)
+        self.arrivals_head = _ArrivalsHead(channels) if arrivals else None
         # The exporter reads these.
         self.joint_policy_rank = 0
 
@@ -242,6 +272,9 @@ class TwinBoardNet(Module):
             value_input = torch.cat((value_input, (board_a_features - board_b_features).abs()), dim=1)
         value, wdl, plys = self.value_head(value_input)
         auxiliary = torch.cat((wdl, plys), dim=1)
+        if self.arrivals_head is not None:
+            arrivals = self.arrivals_head(out, batch_size)
+            return value, (policy_a, policy_b), auxiliary, wdl, plys, arrivals
         return value, (policy_a, policy_b), auxiliary, wdl, plys
 
 
@@ -256,7 +289,7 @@ TWIN_BOARD_SIZES = {
 def get_twin_board_model(size="twin-m", mid_attention=False, value_diff=False,
                          block="bottleneck", attention_style="full", se_every=4,
                          channels=None, blocks=None, attention_dim=None,
-                         planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD):
+                         planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False):
     """A named size, optionally overriding its shape (channels, blocks,
     attention_dim) and design options. Dense blocks use 3x3 kernels only."""
     base_channels, operating, base_blocks, base_attention = TWIN_BOARD_SIZES[size]
@@ -272,7 +305,7 @@ def get_twin_board_model(size="twin-m", mid_attention=False, value_diff=False,
                         attention_heads=max(1, attention // 32) if attention else 1,
                         mid_attention=mid_attention, value_diff=value_diff, se_every=se_every,
                         block=block, attention_style=attention_style,
-                        planes_per_board=planes_per_board)
+                        planes_per_board=planes_per_board, arrivals=arrivals)
 
 
 STEM_WEIGHT = "stem.body.0.weight"
@@ -292,14 +325,45 @@ def widen_to_clock_planes(state_dict):
     return {**state_dict, STEM_WEIGHT: torch.cat((weight, padding), dim=1)}
 
 
-def load_twin_board_checkpoint(checkpoint, map_location="cpu"):
+def widen_to_wide_planes(state_dict):
+    """Wave 2b: a clocked (or older) state dict for the wide layout. Each
+    board's 26 new planes get zero stem weights, appended after the clock
+    planes, so the network computes exactly what it did whatever they hold.
+    A wide state dict is returned as it is."""
+    state_dict = widen_to_clock_planes(state_dict) \
+        if state_dict[STEM_WEIGHT].shape[1] != NUM_WIDE_CHANNELS_PER_BOARD else state_dict
+    weight = state_dict[STEM_WEIGHT]
+    if weight.shape[1] == NUM_WIDE_CHANNELS_PER_BOARD:
+        return state_dict
+    padding = weight.new_zeros(weight.shape[0], NUM_WIDE_CHANNELS_PER_BOARD - weight.shape[1],
+                               *weight.shape[2:])
+    return {**state_dict, STEM_WEIGHT: torch.cat((weight, padding), dim=1)}
+
+
+def load_twin_board_checkpoint(checkpoint, map_location="cpu", wide=None):
     """The network in a training checkpoint (a path or a loaded dict), widened
     to the clock planes when it predates them, with its size and variant. The
-    returned variant records the widened input, so saving it keeps the shape."""
+    returned variant records the widened input, so saving it keeps the shape.
+
+    A checkpoint whose variant is wide (65 planes per board, wave 2b) stays
+    wide; `wide=True` widens a narrow one and adds the arrivals head (its last
+    layer zero, so every output it had is unchanged)."""
     if not isinstance(checkpoint, dict):
         checkpoint = torch.load(checkpoint, map_location=map_location)
     size = checkpoint["size"]
-    variant = {**checkpoint.get("variant", {}), "planes_per_board": NUM_CLOCKED_CHANNELS_PER_BOARD}
+    stored = checkpoint.get("variant", {})
+    if wide is None:
+        wide = stored.get("planes_per_board") == NUM_WIDE_CHANNELS_PER_BOARD
+    if wide:
+        variant = {**stored, "planes_per_board": NUM_WIDE_CHANNELS_PER_BOARD, "arrivals": True}
+        state = widen_to_wide_planes(checkpoint["model"])
+    else:
+        variant = {**stored, "planes_per_board": NUM_CLOCKED_CHANNELS_PER_BOARD}
+        state = widen_to_clock_planes(checkpoint["model"])
     model = get_twin_board_model(size, **variant)
-    model.load_state_dict(widen_to_clock_planes(checkpoint["model"]))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Only a freshly added arrivals head may be missing.
+    if unexpected or any(not key.startswith("arrivals_head.") for key in missing):
+        raise RuntimeError(f"checkpoint does not fit {size} {variant}: missing {missing}, "
+                           f"unexpected {unexpected}")
     return model, size, variant
