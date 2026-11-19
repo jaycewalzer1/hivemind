@@ -518,8 +518,9 @@ void play_seat_clock_match(const TournamentConfig& config,
                 (boardNumber == BOARD_A ? landing.moveA : landing.moveB) = committed[seat];
                 actions.push_back(action_uci(board, landing));
                 const bool capture = board.is_capture(boardNumber, committed[seat]);
+                const Stockfish::PieceType hand = board.hand_piece_type(boardNumber, committed[seat]);
                 board.push_move(boardNumber, committed[seat]);
-                game.landed(seat, capture);
+                game.landed(seat, capture, hand);
             }
             if (board.is_checkmate(~team, true)) {
                 winner = static_cast<int>(team);
@@ -546,6 +547,9 @@ void play_seat_clock_match(const TournamentConfig& config,
                 game.plan_cost(seat, paceRandom);
             }
         }
+        // Wave 2b: each side's searches carry the wide timing when its own
+        // network reads it.
+        game.set_wide_inputs((team == contenderTeam ? contender : baseline).wideInputs());
         const TimeState clock = game.search_clock(team, sides, event.seats);
         const GameStatus status = adjudicate_game(board, team, clock);
         if (status != GameStatus::ONGOING) {

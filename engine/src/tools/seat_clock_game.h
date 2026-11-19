@@ -166,6 +166,13 @@ public:
         int loser = -1;
     };
 
+    /// Wave 2b: a piece that landed in a seat's pocket (the partner captured it).
+    struct Landing {
+        int64_t timeMs = 0;
+        int seat = 0;
+        Stockfish::PieceType type = Stockfish::NO_PIECE_TYPE;
+    };
+
     struct Start {
         int32_t baseMs = 0;
         int32_t whiteLeadMs = 0;
@@ -341,9 +348,12 @@ public:
 
     /**
      * @p seat's committed move has been made on the board (@p capture: it
-     * captured). Its opponent on that board comes on turn and decides now.
+     * captured; @p hand: the piece type that goes to the partner's pocket,
+     * Board::hand_piece_type, for the wave 2b landing log). Its opponent on
+     * that board comes on turn and decides now.
      */
-    void landed(int seat, bool capture) {
+    void landed(int seat, bool capture,
+                Stockfish::PieceType hand = Stockfish::NO_PIECE_TYPE) {
         const double observed = static_cast<double>(nowMs_ - lastDecisionMs_[seat]);
         paceMs_[seat] = options_.paceEmaAlpha * observed
             + (1.0 - options_.paceEmaAlpha) * paceMs_[seat];
@@ -353,6 +363,11 @@ public:
             lastCapture_ = static_cast<int>(TimeState::team_of_seat(seat));
         }
         const int board = seat / 2;
+        lastLandMs_[board] = nowMs_;
+        if (hand != Stockfish::NO_PIECE_TYPE) {
+            const int partner = TimeState::seat_of(1 - board, ~static_cast<Stockfish::Color>(seat & 1));
+            landings_.push_back(Landing{nowMs_, partner, hand});
+        }
         come_on_turn(TimeState::seat_of(board, ~static_cast<Stockfish::Color>(seat & 1)));
         // A pass on the other board ends 1 ms after this event.
         for (int waiting : {TimeState::seat_of(1 - board, Stockfish::WHITE),
@@ -406,8 +421,36 @@ public:
                 config.seatSitting[seat] = sitting_[seat];
             }
         }
+        if (wideInputs_) {
+            // Wave 2b: a wide network also reads each board's thinking time
+            // and the pockets' recent landings.
+            config.wideInputs = true;
+            for (int board = 0; board < 2; ++board) {
+                config.boardElapsedMs[board] = board_elapsed_ms(board);
+            }
+            int slot = 0;
+            for (auto it = landings_.rbegin(); it != landings_.rend() && slot < MAX_RECENT_LANDINGS; ++it) {
+                const int64_t ago = nowMs_ - it->timeMs;
+                if (ago >= RECENT_LANDING_WINDOW_MS) {
+                    break;
+                }
+                config.recentLandings[slot++] = SeatLanding{
+                    static_cast<int8_t>(it->seat), static_cast<int8_t>(it->type),
+                    static_cast<int32_t>(ago)};
+            }
+        }
         return TimeState::durative(base, team, sides[0], sides[1], config);
     }
+
+    /** Wave 2b: searches carry the wide-plane timing (a wide network). */
+    void set_wide_inputs(bool wide) { wideInputs_ = wide; }
+    /** ms since the last move landed on @p board (since the start before any). */
+    int32_t board_elapsed_ms(int board) const {
+        return static_cast<int32_t>(std::min<int64_t>(nowMs_ - lastLandMs_[board],
+                                                      TimeState::MAX_LEAD_MS));
+    }
+    /** Every pocket landing so far, in time order. */
+    const std::vector<Landing>& landings() const { return landings_; }
 
     int64_t now_ms() const { return nowMs_; }
     int32_t clock_ms(int seat) const { return clockMs_[seat]; }
@@ -478,4 +521,33 @@ private:
     std::array<int64_t, 4> sittingSince_{-1, -1, -1, -1};
     Stockfish::Color tieNext_ = Stockfish::WHITE;
     int lastCapture_ = -1;
+    bool wideInputs_ = false;
+    std::array<int64_t, 2> lastLandMs_{0, 0};
+    std::vector<Landing> landings_;
 };
+
+/**
+ * @brief Wave 2b: counts of pieces landing in each pocket, in the arrivals
+ * head's order from @p team's view: ours on A, theirs on A, ours on B,
+ * theirs on B, each P N B R Q. A landing at time t counts when
+ * fromMs < t <= toMs.
+ */
+inline std::array<int, 20> pocket_landing_counts(const std::vector<SeatClockGame::Landing>& landings,
+                                                 Stockfish::Color team, int64_t fromMs,
+                                                 int64_t toMs) {
+    const int pockets[4] = {TimeState::seat_of(0, team), TimeState::seat_of(0, ~team),
+                            TimeState::seat_of(1, ~team), TimeState::seat_of(1, team)};
+    std::array<int, 20> counts{};
+    for (const SeatClockGame::Landing& landing : landings) {
+        const int type = static_cast<int>(landing.type);
+        if (landing.timeMs <= fromMs || landing.timeMs > toMs || type < 1 || type > 5) {
+            continue;
+        }
+        for (int pocket = 0; pocket < 4; ++pocket) {
+            if (pockets[pocket] == landing.seat) {
+                ++counts[pocket * 5 + type - 1];
+            }
+        }
+    }
+    return counts;
+}

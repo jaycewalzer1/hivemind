@@ -265,6 +265,7 @@ public:
     explicit RawPolicyEvaluator(size_t batchSize)
         : batchSize_(batchSize),
           observations_(batchSize * NB_INPUT_VALUES()),
+          wideExtras_(batchSize * NB_WIDE_EXTRA_VALUES),
           values_(batchSize),
           policyA_(batchSize * NB_POLICY_VALUES()),
           policyB_(batchSize * NB_POLICY_VALUES()),
@@ -281,9 +282,17 @@ public:
             std::copy(planes.begin(), planes.end(),
                       observations_.begin() + static_cast<std::ptrdiff_t>(batch * planes.size()));
         }
+        if (engine.wideInputs()) {
+            std::array<float, NB_WIDE_EXTRA_VALUES> extras{};
+            wide_extra_planes(board, team, time, extras.data());
+            for (size_t batch = 0; batch < batchSize_; ++batch) {
+                std::copy(extras.begin(), extras.end(),
+                          wideExtras_.begin() + static_cast<std::ptrdiff_t>(batch * extras.size()));
+            }
+        }
         if (!engine.runInference(
                 observations_.data(), values_.data(), policyA_.data(), policyB_.data(),
-                wdl_.data(), movesLeft_.data())) {
+                wdl_.data(), movesLeft_.data(), 0, wideExtras_.data())) {
             throw std::runtime_error("Raw-policy inference failed");
         }
     }
@@ -295,6 +304,7 @@ public:
 private:
     size_t batchSize_;
     std::vector<float> observations_;
+    std::vector<float> wideExtras_;
     std::vector<float> values_;
     std::vector<float> policyA_;
     std::vector<float> policyB_;
@@ -615,6 +625,12 @@ struct SeatClockRow {
     std::array<int32_t, 4> clocks{};
     std::array<int32_t, 4> elapsed{};
     std::array<int32_t, 4> paces{};
+    // Wave 2b: ms since the last landing on A and B; pieces landed in the
+    // last 5 s and (written at game end) in the next 5 s, both in the
+    // arrivals head's order from the record team's view (pocket_landing_counts).
+    std::array<int32_t, 2> boardElapsed{};
+    std::array<int, 20> recent{};
+    std::array<int, 20> arrivals{};
 };
 
 struct SeatClockSummary {
@@ -652,7 +668,10 @@ void write_seat_tags(std::ostream& stream, const SeatClockSummary& seats) {
  * One line per searched record of a seat-clock game, in record order (HVM6
  * and HDST have no room for them): game, record index in the game, team,
  * game time, nodes, then the four seat clocks, the elapsed thinking of the
- * seats on turn (0 for the others) and the observed paces, Aw Ab Bw Bb.
+ * seats on turn (0 for the others) and the observed paces, Aw Ab Bw Bb;
+ * then (wave 2b) ms since the last landing on A and B, and 20 recent and 20
+ * arrivals counts, pockets ours A, theirs A, ours B, theirs B from the
+ * record team's view, each P N B R Q (SeatClockRow).
  */
 void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
                      const SeatClockSummary& seats) {
@@ -665,7 +684,16 @@ void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
         stream << "game\trecord\tteam\ttime_ms\tnodes"
                   "\tclock_aw\tclock_ab\tclock_bw\tclock_bb"
                   "\telapsed_aw\telapsed_ab\telapsed_bw\telapsed_bb"
-                  "\tpace_aw\tpace_ab\tpace_bw\tpace_bb\n";
+                  "\tpace_aw\tpace_ab\tpace_bw\tpace_bb"
+                  "\tboard_elapsed_a\tboard_elapsed_b";
+        for (const char* kind : {"recent", "arrivals"}) {
+            for (const char* pocket : {"ours_a", "theirs_a", "ours_b", "theirs_b"}) {
+                for (const char* piece : {"p", "n", "b", "r", "q"}) {
+                    stream << '\t' << kind << '_' << pocket << '_' << piece;
+                }
+            }
+        }
+        stream << '\n';
     }
     for (const SeatClockRow& row : seats.rows) {
         stream << gameNumber + 1 << '\t' << row.sample << '\t' << row.team << '\t'
@@ -673,6 +701,12 @@ void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
         for (const auto* values : {&row.clocks, &row.elapsed, &row.paces}) {
             for (int32_t value : *values) {
                 stream << '\t' << value;
+            }
+        }
+        stream << '\t' << row.boardElapsed[0] << '\t' << row.boardElapsed[1];
+        for (const auto* counts : {&row.recent, &row.arrivals}) {
+            for (int count : *counts) {
+                stream << '\t' << count;
             }
         }
         stream << '\n';
@@ -884,6 +918,7 @@ SeatClockGameResult play_seat_clock_game(
     SeatClockGame game(config.wave2,
                        SeatClockGame::sample_start(config.wave2, config.clock, randomEngine));
     result.seats.start = game.start();
+    game.set_wide_inputs(rawPolicyEngine.wideInputs());
     std::array<Stockfish::Move, 4> committed{};
     std::array<int, 2> moveNumbers = {1, 1};
     const size_t initializationLength = sample_initialization_length(config, randomEngine);
@@ -938,8 +973,9 @@ SeatClockGameResult play_seat_clock_game(
                                 config.initialClockSeconds, result.pgnMoves,
                                 static_cast<float>(game.clock_ms(seat)) / 1000.0f);
                 const bool capture = board.is_capture(boardNumber, move);
+                const Stockfish::PieceType hand = board.hand_piece_type(boardNumber, move);
                 board.push_move(boardNumber, move);
-                game.landed(seat, capture);
+                game.landed(seat, capture, hand);
             }
             if (rawInitializationActive) {
                 result.rawPolicyEvents = result.pgnMoves.size();
@@ -1071,7 +1107,11 @@ SeatClockGameResult play_seat_clock_game(
             for (int board_ = 0; board_ < 2; ++board_) {
                 const int seat = TimeState::seat_of(board_, sides[board_]);
                 row.elapsed[seat] = game.elapsed_ms(seat);
+                row.boardElapsed[board_] = game.board_elapsed_ms(board_);
             }
+            row.recent = pocket_landing_counts(game.landings(), team,
+                                               game.now_ms() - RECENT_LANDING_WINDOW_MS,
+                                               game.now_ms());
             result.seats.rows.push_back(row);
             result.samples.push_back(std::move(sample));
 
@@ -1112,6 +1152,13 @@ SeatClockGameResult play_seat_clock_game(
                 game.commit_move(seat);
             }
         }
+    }
+    // Wave 2b arrivals labels: what landed in each pocket in the 5 s after
+    // each record's search started (the game's end cuts the window short).
+    for (SeatClockRow& row : result.seats.rows) {
+        row.arrivals = pocket_landing_counts(
+            game.landings(), row.team == 0 ? Stockfish::WHITE : Stockfish::BLACK,
+            row.timeMs, row.timeMs + RECENT_LANDING_WINDOW_MS);
     }
     result.seats.finalClocks = game.clocks_ms();
     result.seats.finalWhiteLeadMs = game.white_lead_ms();
