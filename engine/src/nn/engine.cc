@@ -323,6 +323,7 @@ Engine::ExecutionState::~ExecutionState() {
     if (deviceMovesLeftBuffer) cudaFree(deviceMovesLeftBuffer);
     if (deviceJointFactorsABuffer) cudaFree(deviceJointFactorsABuffer);
     if (deviceJointFactorsBBuffer) cudaFree(deviceJointFactorsBBuffer);
+    if (deviceArrivalsBuffer) cudaFree(deviceArrivalsBuffer);
     if (hostObsHalf) cudaFreeHost(hostObsHalf);
     if (hostLegacyObsHalf) cudaFreeHost(hostLegacyObsHalf);
     if (hostValueHalf) cudaFreeHost(hostValueHalf);
@@ -332,8 +333,10 @@ Engine::ExecutionState::~ExecutionState() {
     if (hostMovesLeftHalf) cudaFreeHost(hostMovesLeftHalf);
     if (hostJointFactorsAHalf) cudaFreeHost(hostJointFactorsAHalf);
     if (hostJointFactorsBHalf) cudaFreeHost(hostJointFactorsBHalf);
+    if (hostArrivalsHalf) cudaFreeHost(hostArrivalsHalf);
     for (void* spare : {spareValueHalf, sparePolicyAHalf, sparePolicyBHalf, spareWdlHalf,
-                        spareMovesLeftHalf, spareJointFactorsAHalf, spareJointFactorsBHalf}) {
+                        spareMovesLeftHalf, spareJointFactorsAHalf, spareJointFactorsBHalf,
+                        spareArrivalsHalf}) {
         if (spare) cudaFreeHost(spare);
     }
     if (stream) cudaStreamDestroy(stream);
@@ -575,10 +578,12 @@ bool Engine::buildEngineFromONNX(const std::string& onnxFile) {
     const nvinfer1::Dims networkInput = network->getInput(0)->getDimensions();
     const int modelChannels = networkInput.nbDims == 4 && networkInput.d[1] > 0
         ? static_cast<int>(networkInput.d[1]) : NB_INPUT_CHANNELS;
-    if (modelChannels != NB_INPUT_CHANNELS && modelChannels != NB_LEGACY_INPUT_CHANNELS) {
+    if (modelChannels != NB_INPUT_CHANNELS && modelChannels != NB_LEGACY_INPUT_CHANNELS
+        && modelChannels != NB_WIDE_INPUT_CHANNELS) {
         std::cerr << "Network takes " << modelChannels << " input planes; expected "
                   << NB_INPUT_CHANNELS << " (or " << NB_LEGACY_INPUT_CHANNELS
-                  << " for a network from before the clock planes)" << std::endl;
+                  << " for a network from before the clock planes, "
+                  << NB_WIDE_INPUT_CHANNELS << " for a wave 2b wide one)" << std::endl;
         return false;
     }
     nvinfer1::Dims dims{};
@@ -635,6 +640,7 @@ bool Engine::initializeResources() {
     m_movesLeftName.clear();
     m_jointFactorsAName.clear();
     m_jointFactorsBName.clear();
+    m_arrivalsName.clear();
     m_jointFactorRank = 0;
 
     auto normalizedName = [](std::string name) {
@@ -677,6 +683,10 @@ bool Engine::initializeResources() {
             } else if ((lowerName == "moves_left" || lowerName == "plys_to_end_out") &&
                        outputElements == 1) {
                 m_movesLeftName = tensorName;
+            } else if (lowerName.find("arrival") != std::string::npos &&
+                       outputElements == NB_ARRIVALS_VALUES) {
+                // Wave 2b arrivals head: copied back, not used by the search.
+                m_arrivalsName = tensorName;
             } else if (lowerName == "joint_factors_a" &&
                        outputElements % (NB_POLICY_VALUES() + 1) == 0) {
                 m_jointFactorsAName = tensorName;
@@ -712,13 +722,19 @@ bool Engine::initializeResources() {
         ? static_cast<int>(inputDims.d[1]) : NB_INPUT_CHANNELS;
     if (inputDims.nbDims != 4 ||
         (m_inputChannels != NB_INPUT_CHANNELS
-         && m_inputChannels != NB_LEGACY_INPUT_CHANNELS) ||
+         && m_inputChannels != NB_LEGACY_INPUT_CHANNELS
+         && m_inputChannels != NB_WIDE_INPUT_CHANNELS) ||
         (inputDims.d[2] > 0 && inputDims.d[2] != BOARD_HEIGHT) ||
         (inputDims.d[3] > 0 && inputDims.d[3] != BOARD_WIDTH)) {
         std::cerr << "Unexpected TensorRT input shape" << std::endl;
         return false;
     }
 
+    if (m_inputChannels == NB_WIDE_INPUT_CHANNELS) {
+        std::cout << "Network takes the " << NB_WIDE_INPUT_CHANNELS
+                  << " wave 2b input planes; the extra planes are added before inference"
+                  << std::endl;
+    }
     if (m_inputChannels == NB_LEGACY_INPUT_CHANNELS) {
         std::cout << "Network takes the " << NB_LEGACY_INPUT_CHANNELS
                   << " input planes from before the clock planes; they are "
@@ -743,6 +759,7 @@ bool Engine::initializeResources() {
     size_t movesLeftSize = m_batchSize * sizeof(__half);
     size_t jointFactorsSize = m_batchSize * m_jointFactorRank
         * (NB_POLICY_VALUES() + 1) * sizeof(__half);
+    size_t arrivalsSize = m_batchSize * NB_ARRIVALS_VALUES * sizeof(__half);
 
     m_executionStates.reserve(SearchParams::NUM_SEARCH_THREADS);
     for (int workerIndex = 0; workerIndex < SearchParams::NUM_SEARCH_THREADS; ++workerIndex) {
@@ -759,6 +776,12 @@ bool Engine::initializeResources() {
              !checkCuda(cudaMallocHost(&state->hostJointFactorsBHalf, jointFactorsSize), "cudaMallocHost(joint factors B)") ||
              !checkCuda(cudaMallocHost(&state->spareJointFactorsAHalf, jointFactorsSize), "cudaMallocHost(spare joint factors A)") ||
              !checkCuda(cudaMallocHost(&state->spareJointFactorsBHalf, jointFactorsSize), "cudaMallocHost(spare joint factors B)"))) {
+            return false;
+        }
+        if (!m_arrivalsName.empty() &&
+            (!checkCuda(cudaMalloc(&state->deviceArrivalsBuffer, arrivalsSize), "cudaMalloc(arrivals)") ||
+             !checkCuda(cudaMallocHost(&state->hostArrivalsHalf, arrivalsSize), "cudaMallocHost(arrivals)") ||
+             !checkCuda(cudaMallocHost(&state->spareArrivalsHalf, arrivalsSize), "cudaMallocHost(spare arrivals)"))) {
             return false;
         }
         state->context.reset(m_engine->createExecutionContext());
@@ -807,6 +830,11 @@ bool Engine::initializeResources() {
             std::cerr << "Failed to bind joint policy factor outputs" << std::endl;
             return false;
         }
+        if (!m_arrivalsName.empty() &&
+            !state->context->setTensorAddress(m_arrivalsName.c_str(), state->deviceArrivalsBuffer)) {
+            std::cerr << "Failed to bind the arrivals output" << std::endl;
+            return false;
+        }
 
         // TensorRT graph capture mutates execution-context state and its
         // documented capture recipe uses global mode.  Doing this lazily in
@@ -841,7 +869,8 @@ bool Engine::initializeResources() {
 }
 
 bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
-                          float* wdl, float* movesLeft, size_t workerIndex) {
+                          float* wdl, float* movesLeft, size_t workerIndex,
+                          const float* wideExtras, float* arrivals) {
     if (!obs || !value || !piA || !piB || !wdl || !movesLeft ||
         workerIndex >= m_executionStates.size()) {
         return false;
@@ -858,7 +887,7 @@ bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
     HalfInferenceOutputs outputs;
     if (!runInferenceHalfImpl(
             static_cast<const __half*>(state.hostObsHalf), outputs,
-            workerIndex, true)) {
+            workerIndex, true, wideExtras)) {
         return false;
     }
 
@@ -867,21 +896,26 @@ bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
     halvesToFloats(outputs.policyB, piB, policyElements);
     halvesToFloats(outputs.wdl, wdl, wdlElements);
     halvesToFloats(outputs.movesLeft, movesLeft, movesLeftElements);
+    if (arrivals && outputs.arrivals && hasArrivals()) {
+        halvesToFloats(outputs.arrivals, arrivals, m_batchSize * NB_ARRIVALS_VALUES);
+    }
 
     return true;
 }
 
 bool Engine::runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,
-                              size_t workerIndex) {
-    return runInferenceHalfImpl(obs, outputs, workerIndex, true);
+                              size_t workerIndex, const float* wideExtras) {
+    return runInferenceHalfImpl(obs, outputs, workerIndex, true, wideExtras);
 }
 
-bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex) {
-    return enqueueInferenceHalfImpl(obs, workerIndex, true);
+bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex,
+                                  const float* wideExtras) {
+    return enqueueInferenceHalfImpl(obs, workerIndex, true, wideExtras);
 }
 
 bool Engine::enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
-                                      bool copyAuxiliaryOutputs) {
+                                      bool copyAuxiliaryOutputs,
+                                      const float* wideExtras) {
     if (!obs || workerIndex >= m_executionStates.size() ||
         !checkCuda(cudaSetDevice(m_deviceId), "cudaSetDevice")) {
         return false;
@@ -907,7 +941,11 @@ bool Engine::enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
     // buffer is this worker's own and is not touched again until the
     // inference it feeds has been synchronized.
     const __half* input = obs;
-    if (m_inputChannels != NB_INPUT_CHANNELS) {
+    if (m_inputChannels == NB_WIDE_INPUT_CHANNELS) {
+        widen_planes(obs, wideExtras, static_cast<__half*>(state.hostLegacyObsHalf),
+                     static_cast<size_t>(m_batchSize), __float2half_rn);
+        input = static_cast<const __half*>(state.hostLegacyObsHalf);
+    } else if (m_inputChannels != NB_INPUT_CHANNELS) {
         drop_clock_planes(obs, static_cast<__half*>(state.hostLegacyObsHalf),
                           static_cast<size_t>(m_batchSize));
         input = static_cast<const __half*>(state.hostLegacyObsHalf);
@@ -943,6 +981,15 @@ bool Engine::enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
                     "cudaMemcpyAsync(WDL)") ||
          !checkCuda(cudaMemcpyAsync(state.hostMovesLeftHalf, state.deviceMovesLeftBuffer, movesLeftSize, cudaMemcpyDeviceToHost, state.stream),
                     "cudaMemcpyAsync(moves left)"))) {
+        cudaStreamSynchronize(state.stream);
+        state.inferencePending = false;
+        return false;
+    }
+    if (!m_arrivalsName.empty() &&
+        !checkCuda(cudaMemcpyAsync(state.hostArrivalsHalf, state.deviceArrivalsBuffer,
+                                   m_batchSize * NB_ARRIVALS_VALUES * sizeof(__half),
+                                   cudaMemcpyDeviceToHost, state.stream),
+                   "cudaMemcpyAsync(arrivals)")) {
         cudaStreamSynchronize(state.stream);
         state.inferencePending = false;
         return false;
@@ -988,6 +1035,7 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsA = static_cast<const __half*>(state.hostJointFactorsAHalf);
     outputs.jointFactorsB = static_cast<const __half*>(state.hostJointFactorsBHalf);
     outputs.jointFactorRank = m_jointFactorRank;
+    outputs.arrivals = static_cast<const __half*>(state.hostArrivalsHalf);
     // The caller reads these until its next synchronize; the next enqueue
     // writes the other set.
     std::swap(state.hostValueHalf, state.spareValueHalf);
@@ -997,13 +1045,15 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     std::swap(state.hostMovesLeftHalf, state.spareMovesLeftHalf);
     std::swap(state.hostJointFactorsAHalf, state.spareJointFactorsAHalf);
     std::swap(state.hostJointFactorsBHalf, state.spareJointFactorsBHalf);
+    std::swap(state.hostArrivalsHalf, state.spareArrivalsHalf);
 
     return true;
 }
 
 bool Engine::runInferenceHalfImpl(const __half* obs, HalfInferenceOutputs& outputs,
-                                  size_t workerIndex, bool copyAuxiliaryOutputs) {
+                                  size_t workerIndex, bool copyAuxiliaryOutputs,
+                                  const float* wideExtras) {
     outputs = {};
-    return enqueueInferenceHalfImpl(obs, workerIndex, copyAuxiliaryOutputs)
+    return enqueueInferenceHalfImpl(obs, workerIndex, copyAuxiliaryOutputs, wideExtras)
         && synchronizeInferenceHalf(outputs, workerIndex);
 }

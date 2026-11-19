@@ -10,6 +10,24 @@
 #include "Fairy-Stockfish/src/types.h"
 
 /**
+ * @brief Wave 2b: one piece that landed in a seat's pocket (a capture by the
+ * partner), @p agoMs before the node. Seat -1 = an empty slot.
+ */
+struct SeatLanding {
+    int8_t seat = -1;
+    // Stockfish::PieceType, PAWN (1) .. QUEEN (5).
+    int8_t type = 0;
+    int32_t agoMs = 0;
+
+    bool operator==(const SeatLanding&) const = default;
+};
+
+/// Landings older than this leave the recent-landing planes (and the arrivals head's horizon).
+constexpr int32_t RECENT_LANDING_WINDOW_MS = 5000;
+/// How many recent landings a durative node keeps; the oldest go first.
+constexpr int MAX_RECENT_LANDINGS = 12;
+
+/**
  * @brief Wave 2 options for a clocked TimeState (UCI DurativeTree, FlagLoss,
  * InstantTransfer, MateRaceByLanding, PassCapK, SeatClocksMs, SeatPaceMs,
  * SeatElapsedMs, RootMoveTimeMs). Seats are indexed Aw, Ab, Bw, Bb.
@@ -34,6 +52,16 @@ struct DurativeConfig {
     // Which seats on turn are sitting (in a pass) at the root. Not a UCI
     // option: self-play knows it; the sit-off rule reads it.
     std::array<bool, 4> seatSitting{false, false, false, false};
+    // Wave 2b. The loaded network reads the wide planes: the tree then tracks
+    // per board the time since the last landing and recent pocket landings
+    // (and keys nodes on them). Off, nothing of this enters the state.
+    bool wideInputs = false;
+    // ms since the last move landed on each board; -1 = the SeatElapsedMs of
+    // the seat on turn there.
+    std::array<int32_t, 2> boardElapsedMs{-1, -1};
+    // Pieces that landed in pockets in the last RECENT_LANDING_WINDOW_MS
+    // (UCI SeatArrivalsMs); unused slots have seat -1.
+    std::array<SeatLanding, MAX_RECENT_LANDINGS> recentLandings{};
 };
 
 /**
@@ -191,6 +219,28 @@ public:
                 d.readyMs[seat] = std::max<int32_t>(
                     1, d.paceMs[seat] - std::max<int32_t>(0, config.seatElapsedMs[seat]));
             }
+        }
+        if (config.wideInputs) {
+            d.wide = true;
+            d.timing = clocksGiven;
+            for (int board = 0; board < 2; ++board) {
+                const int seat = seat_of(board, d.side[board]);
+                d.sinceLandMs[board] = std::max<int32_t>(0, config.boardElapsedMs[board] >= 0
+                    ? config.boardElapsedMs[board] : config.seatElapsedMs[seat]);
+            }
+            int slot = 0;
+            for (const SeatLanding& landing : config.recentLandings) {
+                if (landing.seat >= 0 && landing.seat < 4 && landing.type >= 1
+                    && landing.type < PENDING_TYPES && landing.agoMs >= 0
+                    && landing.agoMs < RECENT_LANDING_WINDOW_MS && slot < MAX_RECENT_LANDINGS) {
+                    d.landings[slot++] = landing;
+                }
+            }
+            // Oldest first, as the tree keeps them.
+            std::stable_sort(d.landings.begin(), d.landings.begin() + slot,
+                             [](const SeatLanding& a, const SeatLanding& b) {
+                                 return a.agoMs > b.agoMs;
+                             });
         }
         state.sync_lead();
         return state;
@@ -397,6 +447,9 @@ public:
         if (turn.crossTie) {
             d.tieNext = ~d.tieNext;
         }
+        if (d.wide) {
+            age_landings(dt);
+        }
         for (int board = 0; board < 2; ++board) {
             if (!acts[board]) {
                 continue;
@@ -424,6 +477,16 @@ public:
             if (!d.instantTransfer && type > 0 && type < PENDING_TYPES
                 && d.pending[partner][type] < UINT8_MAX) {
                 ++d.pending[partner][type];
+            }
+            if (d.wide && type > 0 && type < PENDING_TYPES) {
+                add_landing(partner, type);
+            }
+        }
+        if (d.wide) {
+            for (int board = 0; board < 2; ++board) {
+                if (acts[board] && moved[board]) {
+                    d.sinceLandMs[board] = 0;
+                }
             }
         }
         for (int board = 0; board < 2; ++board) {
@@ -540,6 +603,27 @@ public:
     bool flag_loss() const { return durative_.flagLoss; }
     bool instant_transfer() const { return !durative_.active || durative_.instantTransfer; }
     bool mate_race_by_landing() const { return durative_.active && durative_.mateRaceByLanding; }
+    /**
+     * @brief Whether this node carries the wave 2b timing the wide planes
+     * read: a durative tree built for a wide network (DurativeConfig::
+     * wideInputs) on real seat clocks. Otherwise the clock, thinking-time
+     * and recent-landing planes are 0.
+     */
+    bool wide_timing() const { return durative_.active && durative_.wide && durative_.timing; }
+    /** ms since the last move landed on @p board (wide durative states). */
+    int32_t board_elapsed_ms(int board) const { return durative_.sinceLandMs[board]; }
+    /** How many pieces of @p type landed in @p seat's pocket in the last 5 s. */
+    int recent_landings(int seat, Stockfish::PieceType type) const {
+        int count = 0;
+        for (const SeatLanding& landing : durative_.landings) {
+            count += landing.seat == seat && landing.type == static_cast<int>(type) ? 1 : 0;
+        }
+        return count;
+    }
+    const std::array<SeatLanding, MAX_RECENT_LANDINGS>& landings() const {
+        return durative_.landings;
+    }
+
     /** What one action of @p seat costs in this tree. */
     int32_t action_time_ms(int seat) const {
         return team_of_seat(seat) == durative_.rootTeam
@@ -627,6 +711,13 @@ private:
         int8_t lastCapture = -1;
         // See mate_race_early_ms().
         std::array<int32_t, 4> earlyMs{-1, -1, -1, -1};
+        // Wave 2b, only with DurativeConfig::wideInputs (else all default):
+        // whether the clocks were given (not derived from a lead), ms since
+        // the last landing per board, recent pocket landings.
+        bool wide = false;
+        bool timing = false;
+        std::array<int32_t, 2> sinceLandMs{0, 0};
+        std::array<SeatLanding, MAX_RECENT_LANDINGS> landings{};
 
         bool operator==(const Durative&) const = default;
 
@@ -656,6 +747,18 @@ private:
                 mix(packed ^ (uint64_t(static_cast<uint32_t>(earlyMs[seat])) << 48));
             }
             mix(static_cast<uint64_t>(static_cast<int64_t>(lastCapture)) + 0x4c43ULL);
+            if (wide) {
+                // Only a wide network's input depends on these; a narrow
+                // tree keeps its keys exactly as before.
+                mix(0x57494445ULL | (uint64_t(timing) << 40));
+                mix((uint64_t(static_cast<uint32_t>(sinceLandMs[0])) << 32)
+                    | static_cast<uint32_t>(sinceLandMs[1]));
+                for (const SeatLanding& landing : landings) {
+                    mix((uint64_t(static_cast<uint8_t>(landing.seat)) << 40)
+                        | (uint64_t(static_cast<uint8_t>(landing.type)) << 32)
+                        | static_cast<uint32_t>(landing.agoMs));
+                }
+            }
             return h;
         }
     };
@@ -715,6 +818,41 @@ private:
             }
         }
         return false;
+    }
+
+    // Wave 2b: time passes for the landing history and the boards' thinking
+    // time; landings older than the window drop out.
+    void age_landings(int32_t dt) {
+        Durative& d = durative_;
+        for (int board = 0; board < 2; ++board) {
+            d.sinceLandMs[board] = clamp_lead(static_cast<int64_t>(d.sinceLandMs[board]) + dt);
+        }
+        std::array<SeatLanding, MAX_RECENT_LANDINGS> kept{};
+        int slot = 0;
+        for (const SeatLanding& landing : d.landings) {
+            const int64_t ago = static_cast<int64_t>(landing.agoMs) + dt;
+            if (landing.seat >= 0 && ago < RECENT_LANDING_WINDOW_MS) {
+                kept[slot] = landing;
+                kept[slot].agoMs = static_cast<int32_t>(ago);
+                ++slot;
+            }
+        }
+        d.landings = kept;
+    }
+
+    // A piece lands in @p seat's pocket now. Slots stay newest last; when
+    // all are taken the oldest leaves.
+    void add_landing(int seat, int type) {
+        Durative& d = durative_;
+        int slot = 0;
+        while (slot < MAX_RECENT_LANDINGS && d.landings[slot].seat >= 0) {
+            ++slot;
+        }
+        if (slot == MAX_RECENT_LANDINGS) {
+            std::rotate(d.landings.begin(), d.landings.begin() + 1, d.landings.end());
+            slot = MAX_RECENT_LANDINGS - 1;
+        }
+        d.landings[slot] = SeatLanding{static_cast<int8_t>(seat), static_cast<int8_t>(type), 0};
     }
 
     // The lead, as v3 defines it, read off the four clocks.

@@ -2,6 +2,7 @@
 #include "nn/embedded_files.h"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -79,7 +80,9 @@ bool UCI::reload_engines() {
     }
 
     networkReadsClock = !engines.empty()
-        && engines.front()->inputChannels() == NB_INPUT_CHANNELS;
+        && (engines.front()->inputChannels() == NB_INPUT_CHANNELS
+            || engines.front()->wideInputs());
+    networkWide = !engines.empty() && engines.front()->wideInputs();
 
     // Create the single-threaded Agent
     agent = std::make_unique<Agent>();
@@ -722,6 +725,69 @@ void UCI::setoption(std::istringstream& is) {
         target = seats;
         std::cout << "info string " << name << " set to " << seats[0] << " "
                   << seats[1] << " " << seats[2] << " " << seats[3] << std::endl;
+    } else if (name == "SeatArrivalsMs") {
+        // Wave 2b: pieces that landed in pockets lately,
+        // "<pocket>:<piece>:<ms_ago>,..." with pocket Aw/Ab/Bw/Bb and piece
+        // P/N/B/R/Q. Empty clears. Landings 5 s old or more are dropped; past
+        // MAX_RECENT_LANDINGS the newest are kept.
+        std::string rest;
+        std::getline(is, rest);
+        std::string text = value + rest;
+        text.erase(std::remove_if(text.begin(), text.end(),
+                                  [](unsigned char c) { return std::isspace(c); }),
+                   text.end());
+        std::vector<SeatLanding> parsed;
+        std::stringstream items(text);
+        for (std::string item; std::getline(items, item, ',');) {
+            if (item.empty()) {
+                continue;
+            }
+            const size_t first = item.find(':');
+            const size_t second = first == std::string::npos ? first : item.find(':', first + 1);
+            static const std::string seats[4] = {"aw", "ab", "bw", "bb"};
+            static const std::string pieces = "pnbrq";
+            int seat = -1;
+            int type = 0;
+            long long ago = -1;
+            if (second != std::string::npos) {
+                std::string pocket = item.substr(0, first);
+                std::transform(pocket.begin(), pocket.end(), pocket.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                for (int index = 0; index < 4; ++index) {
+                    seat = pocket == seats[index] ? index : seat;
+                }
+                const std::string piece = item.substr(first + 1, second - first - 1);
+                const size_t found = piece.size() == 1
+                    ? pieces.find(static_cast<char>(std::tolower(static_cast<unsigned char>(piece[0]))))
+                    : std::string::npos;
+                type = found == std::string::npos ? 0 : static_cast<int>(found) + 1;
+                try {
+                    size_t used = 0;
+                    const std::string number = item.substr(second + 1);
+                    ago = std::stoll(number, &used);
+                    if (used != number.size()) ago = -1;
+                } catch (const std::exception&) {
+                    ago = -1;
+                }
+            }
+            if (seat < 0 || type == 0 || ago < 0) {
+                std::cout << "info string SeatArrivalsMs needs <pocket>:<piece>:<ms_ago>,... "
+                             "(pocket Aw Ab Bw Bb, piece P N B R Q); got " << item << std::endl;
+                return;
+            }
+            if (ago < RECENT_LANDING_WINDOW_MS) {
+                parsed.push_back(SeatLanding{static_cast<int8_t>(seat), static_cast<int8_t>(type),
+                                             static_cast<int32_t>(ago)});
+            }
+        }
+        std::stable_sort(parsed.begin(), parsed.end(),
+                         [](const SeatLanding& a, const SeatLanding& b) { return a.agoMs < b.agoMs; });
+        durativeConfig.recentLandings = {};
+        for (size_t index = 0; index < parsed.size() && index < MAX_RECENT_LANDINGS; ++index) {
+            durativeConfig.recentLandings[index] = parsed[index];
+        }
+        std::cout << "info string SeatArrivalsMs set to "
+                  << std::min<size_t>(parsed.size(), MAX_RECENT_LANDINGS) << " landings" << std::endl;
     } else if (name == "Mode") {
         // Deprecated alias for TimeAdvantage, kept so existing GUI profiles keep
         // working. "sit" meant the team was up on time and could wait; "go"
@@ -756,6 +822,7 @@ std::optional<TimeState> UCI::current_clock() const {
     }
     DurativeConfig config = durativeConfig;
     config.rootMoveTimeMs = rootMoveTimeMs;
+    config.wideInputs = networkWide;
     // side_to_move is not const, though it only reads.
     Board& root = const_cast<Board&>(board);
     return TimeState::durative(gated, teamSide, root.side_to_move(BOARD_A),
@@ -865,6 +932,7 @@ void UCI::send_uci_response() {
     cout << "option name SeatPaceMs type string default <empty>" << endl;
     cout << "option name SeatElapsedMs type string default <empty>" << endl;
     cout << "option name SeatSitting type string default <empty>" << endl;
+    cout << "option name SeatArrivalsMs type string default <empty>" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;
@@ -917,12 +985,19 @@ void UCI::policy() {
 
     // Convert board to planes
     const std::optional<TimeState> clock = current_clock();
-    board_to_planes(board, obs, teamSide,
-                    clock ? *clock : TimeState::legacy(teamSide, teamHasTimeAdvantage));
+    const TimeState planeTime = clock ? *clock : TimeState::legacy(teamSide, teamHasTimeAdvantage);
+    board_to_planes(board, obs, teamSide, planeTime);
+    // Wave 2b: a wide network's extra planes, the same for every batch row.
+    Engine* engine = engines[0].get();
+    std::vector<float> wideExtras(loadedBatchSize * NB_WIDE_EXTRA_VALUES, 0.0f);
+    if (engine->wideInputs()) {
+        wide_extra_planes(board, teamSide, planeTime, wideExtras.data());
+    }
 
     // Run inference
-    Engine* engine = engines[0].get();
-    if (!engine->runInference(obs, value, piA, piB, wdl, movesLeft)) {
+    std::vector<float> arrivals(loadedBatchSize * NB_ARRIVALS_VALUES, 0.0f);
+    if (!engine->runInference(obs, value, piA, piB, wdl, movesLeft, 0, wideExtras.data(),
+                              arrivals.data())) {
         cerr << "Inference failed" << endl;
         delete[] obs;
         delete[] value;
@@ -942,6 +1017,15 @@ void UCI::policy() {
         cout << "WDL: " << winExp / wdlTotal << " " << drawExp / wdlTotal
             << " " << lossExp / wdlTotal << endl;
         cout << "Predicted plies to end: " << movesLeft[0] * 100.0f << endl;
+    if (engine->hasArrivals()) {
+        // Wave 2b: expected pieces landing in the next 5 s, pockets ours A,
+        // theirs A, ours B, theirs B, each P N B R Q.
+        cout << "Arrivals:";
+        for (int index = 0; index < NB_ARRIVALS_VALUES; ++index) {
+            cout << " " << arrivals[index];
+        }
+        cout << endl;
+    }
     cout << endl;
 
     // Board A policy

@@ -66,6 +66,9 @@ public:
         const __half* jointFactorsA = nullptr;
         const __half* jointFactorsB = nullptr;
         size_t jointFactorRank = 0;
+        // Wave 2b arrivals head (NB_ARRIVALS_VALUES per position), when the
+        // network has it. Read and handed out; the search does not use it.
+        const __half* arrivals = nullptr;
     };
 
     explicit Engine(int deviceId, int batchSize = SearchParams::BATCH_SIZE);
@@ -82,16 +85,23 @@ public:
      * are allocated via hm::alloc_pinned.
      */
     bool runInference(float* obs, float* value, float* piA, float* piB,
-                      float* wdl, float* movesLeft, size_t workerIndex = 0);
+                      float* wdl, float* movesLeft, size_t workerIndex = 0,
+                      const float* wideExtras = nullptr, float* arrivals = nullptr);
 
     bool runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,
-                          size_t workerIndex = 0);
+                          size_t workerIndex = 0, const float* wideExtras = nullptr);
 
     // Each worker may have one request in flight. The pinned input must remain
     // unchanged until synchronizeInferenceHalf returns. The outputs it hands
     // out stay valid until that worker's next synchronize, so a caller may
     // enqueue the next request before it has read them.
-    bool enqueueInferenceHalf(const __half* obs, size_t workerIndex = 0);
+    //
+    // @p wideExtras: NB_WIDE_EXTRA_VALUES floats per batch position
+    // (wide_extra_planes), read during this call only. A wide network
+    // (wideInputs()) gets them as its extra planes; a narrow one ignores
+    // them. Null for a wide network: the extra planes are 0.
+    bool enqueueInferenceHalf(const __half* obs, size_t workerIndex = 0,
+                              const float* wideExtras = nullptr);
     bool synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
                                   size_t workerIndex = 0);
 
@@ -107,6 +117,11 @@ public:
      * drops the clock planes before running a legacy network.
      */
     int inputChannels() const { return m_inputChannels; }
+
+    /// Whether the loaded network is a wave 2b widened one (NB_WIDE_INPUT_CHANNELS).
+    bool wideInputs() const { return m_inputChannels == NB_WIDE_INPUT_CHANNELS; }
+    /// Whether the loaded network has the wave 2b arrivals head.
+    bool hasArrivals() const { return !m_arrivalsName.empty(); }
 
     /// Human-readable backend name, e.g. "TensorRT" or "ONNX Runtime".
     static const char* backendName();
@@ -131,8 +146,12 @@ private:
         void* deviceJointFactorsABuffer = nullptr;
         void* deviceJointFactorsBBuffer = nullptr;
         void* hostObsHalf = nullptr;
-        // A legacy network's input, the clock planes dropped (null otherwise).
+        // A legacy network's input, the clock planes dropped, or a wide
+        // network's, the extra planes added (null otherwise).
         void* hostLegacyObsHalf = nullptr;
+        void* deviceArrivalsBuffer = nullptr;
+        void* hostArrivalsHalf = nullptr;
+        void* spareArrivalsHalf = nullptr;
         void* hostValueHalf = nullptr;
         void* hostPolicyAHalf = nullptr;
         void* hostPolicyBHalf = nullptr;
@@ -180,6 +199,7 @@ private:
     std::string m_movesLeftName;
     std::string m_jointFactorsAName;
     std::string m_jointFactorsBName;
+    std::string m_arrivalsName;
     size_t m_jointFactorRank = 0;
 
 #if defined(HIVEMIND_BACKEND_TENSORRT)
@@ -189,8 +209,10 @@ private:
     bool saveEngineToFile(const std::string& engineFile);
     bool initializeResources();
     bool enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
-                                  bool copyAuxiliaryOutputs);
+                                  bool copyAuxiliaryOutputs,
+                                  const float* wideExtras = nullptr);
     bool runInferenceHalfImpl(const __half* obs, HalfInferenceOutputs& outputs,
-                              size_t workerIndex, bool copyAuxiliaryOutputs);
+                              size_t workerIndex, bool copyAuxiliaryOutputs,
+                              const float* wideExtras = nullptr);
 #endif
 };

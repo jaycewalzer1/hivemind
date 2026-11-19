@@ -25,6 +25,32 @@ float clock_lead_plane_value(const TimeState& time, Stockfish::Color team);
 float clock_speed_plane_value(const TimeState& time, Stockfish::Color team);
 
 /**
+ * @brief Wave 2b: the 2 x 26 constant planes a widened network reads after
+ * each board's block (NB_WIDE_EXTRA_VALUES floats, board A's first). Per
+ * board, "our" and "their" from @p team's view on that board:
+ *   +0 our seat clock min(t/300 s, 1), +1 exp(-t/10 s),
+ *   +2 same-board opponent's clock min(t/300 s, 1), +3 exp(-t/10 s),
+ *   +4 thinking time of the side on turn there min(e/10 s, 1), +5 1-exp(-e/2 s),
+ *   +6..+10 our pocket holds >= 1 of P N B R Q, +11..+15 their pocket,
+ *   +16..+20 our pocket's P N B R Q that landed in the last 5 s, min(n/2, 1),
+ *   +21..+25 their pocket's.
+ * Clocks, thinking time and landings come from a wide durative state
+ * (TimeState::wide_timing); without one those planes are 0. The presence
+ * planes are always set.
+ */
+void wide_extra_planes(Board& board, Stockfish::Color team, const TimeState& time,
+                       float* extras);
+
+/**
+ * @brief The whole input of a widened network for one position
+ * (NB_WIDE_INPUT_CHANNELS planes): board_to_planes widened with
+ * wide_extra_planes. For tests and plane dumps; the search hands the two
+ * parts to the engine separately.
+ */
+void board_to_wide_planes(Board& board, float* inputPlanes, Stockfish::Color teamSide,
+                          const TimeState& time);
+
+/**
  * @brief Converts a bughouse board state into neural network input planes.
  *
  * Each board's block holds 37 position planes (the sit right among them)

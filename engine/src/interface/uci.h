@@ -33,6 +33,9 @@ private:
     bool clockModel = true;
     bool timeModelSet = false;
     bool networkReadsClock = false;
+    // Wave 2b: the loaded network reads the wide planes (Engine::wideInputs);
+    // durative searches then track thinking time and pocket landings.
+    bool networkWide = false;
     // Our team's lead over its diagonal opponents; negative when behind.
     int timeLeadMs = 0;
     // How long each team takes for one action, which is what a team on turn

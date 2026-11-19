@@ -193,6 +193,8 @@ class SearchThread {
 private: 
     struct SearchBatch {
         __half* observations = nullptr;
+        // Wave 2b: the extra planes' values per slot, for a wide network.
+        vector<float> wideExtras;
         vector<LeafContext> contexts;
         int validInferenceCount = 0;
         int sameBatchCollisions = 0;
@@ -226,6 +228,9 @@ private:
     
     // Current batch size (initialized on first run_iteration call)
     int currentBatchSize = 0;
+    // Whether this thread's engine runs a wave 2b wide network: collect_batch
+    // then fills each batch's wideExtras.
+    bool wideInputs = false;
     size_t inferenceWorkerIndex = 0;
     
     // Allocate/reallocate buffers for given batch size

@@ -43,6 +43,45 @@ void drop_clock_planes(const T* planes, T* legacyPlanes, size_t batch) {
     }
 }
 
+// Wave 2b: a widened network reads 26 more constant planes after each board's
+// block (seat clocks, thinking time, pocket presence, recent landings; see
+// environment/planes.h). Callers still fill NB_INPUT_CHANNELS planes per
+// position and hand the 2 x 26 extra values beside them; the engine builds
+// the wide input only for a network that takes it.
+constexpr int NB_WIDE_EXTRA_CHANNELS_PER_BOARD = 26;
+constexpr int NB_WIDE_EXTRA_VALUES = 2 * NB_WIDE_EXTRA_CHANNELS_PER_BOARD;
+constexpr int NB_WIDE_INPUT_CHANNELS_PER_BOARD =
+    NB_INPUT_CHANNELS_PER_BOARD + NB_WIDE_EXTRA_CHANNELS_PER_BOARD;
+constexpr int NB_WIDE_INPUT_CHANNELS = 2 * NB_WIDE_INPUT_CHANNELS_PER_BOARD;
+// The arrivals head: 4 pockets (ours A, theirs A, ours B, theirs B) x P N B R Q.
+constexpr int NB_ARRIVALS_VALUES = 20;
+
+/**
+ * @brief Builds @p batch positions of a widened network's input: each board's
+ * NB_INPUT_CHANNELS_PER_BOARD planes from @p planes, then its
+ * NB_WIDE_EXTRA_CHANNELS_PER_BOARD constant planes from @p extras
+ * (NB_WIDE_EXTRA_VALUES per position, board A's first). Null @p extras: the
+ * extra planes are 0.
+ */
+template <typename T, typename Convert>
+void widen_planes(const T* planes, const float* extras, T* widePlanes, size_t batch,
+                  Convert convert) {
+    constexpr size_t square = 64;
+    constexpr size_t block = NB_INPUT_CHANNELS_PER_BOARD * square;
+    constexpr size_t wideBlock = NB_WIDE_INPUT_CHANNELS_PER_BOARD * square;
+    for (size_t position = 0; position < 2 * batch; ++position) {
+        const T* source = planes + position * block;
+        T* target = widePlanes + position * wideBlock;
+        std::copy(source, source + block, target);
+        target += block;
+        for (int channel = 0; channel < NB_WIDE_EXTRA_CHANNELS_PER_BOARD; ++channel) {
+            const float value = extras
+                ? extras[position * NB_WIDE_EXTRA_CHANNELS_PER_BOARD + channel] : 0.0f;
+            std::fill_n(target + channel * square, square, convert(value));
+        }
+    }
+}
+
 constexpr size_t NB_POLICY_VALUES() {
     return static_cast<size_t>(NB_POLICY_CHANNELS * BOARD_HEIGHT * BOARD_WIDTH);
 }

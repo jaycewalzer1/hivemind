@@ -551,6 +551,7 @@ void SearchThread::ensureBufferSize(int batchSize) {
                 std::string("observation buffer allocation failed: ") + hm::alloc_error());
         }
         batch.contexts.reserve(batchSize);
+        batch.wideExtras.assign(static_cast<size_t>(batchSize) * NB_WIDE_EXTRA_VALUES, 0.0f);
     }
     currentBatchSize = batchSize;
 }
@@ -968,6 +969,11 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         // Convert board to planes for this batch slot
         board_to_planes(board, obs + validInferenceCount * NB_INPUT_VALUES(),
                         ctx.teamToPlay, ctx.time);
+        if (wideInputs) {
+            wide_extra_planes(board, ctx.teamToPlay, ctx.time,
+                              batch.wideExtras.data()
+                                  + static_cast<size_t>(validInferenceCount) * NB_WIDE_EXTRA_VALUES);
+        }
         validInferenceCount++;
         
         batchContexts.push_back(std::move(ctx));
@@ -990,6 +996,13 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             std::copy_n(
                 paddingSource, NB_INPUT_VALUES(),
                 obs + static_cast<size_t>(batchIndex) * NB_INPUT_VALUES());
+            if (wideInputs) {
+                std::copy_n(
+                    batch.wideExtras.data()
+                        + static_cast<size_t>(validInferenceCount - 1) * NB_WIDE_EXTRA_VALUES,
+                    NB_WIDE_EXTRA_VALUES,
+                    batch.wideExtras.data() + static_cast<size_t>(batchIndex) * NB_WIDE_EXTRA_VALUES);
+            }
         }
     }
 }
@@ -1195,6 +1208,7 @@ void SearchThread::run_iteration(Board& board, Engine* engine,
                                  const TimeState& rootTime,
                                  const std::atomic<bool>* keepRunning) {
     ensureBufferSize(engine->getBatchSize());
+    wideInputs = engine->wideInputs();
 
     if (pendingBatchIndex < 0) {
         SearchBatch& initialBatch = batches[0];
@@ -1208,7 +1222,8 @@ void SearchThread::run_iteration(Board& board, Engine* engine,
             return;
         }
         if (!engine->enqueueInferenceHalf(
-                initialBatch.observations, inferenceWorkerIndex)) {
+                initialBatch.observations, inferenceWorkerIndex,
+                initialBatch.wideExtras.data())) {
             abort_batch(initialBatch);
             throw std::runtime_error("Batch inference submission failed");
         }
@@ -1243,7 +1258,8 @@ void SearchThread::run_iteration(Board& board, Engine* engine,
         // engine double-buffers its host outputs, so this enqueue does not
         // overwrite the outputs process_batch is about to read.
         if (!engine->enqueueInferenceHalf(
-                lookaheadBatch.observations, inferenceWorkerIndex)) {
+                lookaheadBatch.observations, inferenceWorkerIndex,
+                lookaheadBatch.wideExtras.data())) {
             process_batch(completedBatch, inferenceOutputs);
             abort_batch(lookaheadBatch);
             throw std::runtime_error("Batch inference submission failed");
@@ -1274,7 +1290,8 @@ void SearchThread::run_iteration(Board& board, Engine* engine,
         return;
     }
     if (!engine->enqueueInferenceHalf(
-            lookaheadBatch.observations, inferenceWorkerIndex)) {
+            lookaheadBatch.observations, inferenceWorkerIndex,
+            lookaheadBatch.wideExtras.data())) {
         abort_batch(lookaheadBatch);
         throw std::runtime_error("Batch inference submission failed");
     }

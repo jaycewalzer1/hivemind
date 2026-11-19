@@ -1,5 +1,7 @@
 #include "environment/planes.h"
 #include <algorithm>
+#include <array>
+#include <vector>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -297,6 +299,49 @@ void board_to_planes_impl(Board& board, T* inputPlanes, Stockfish::Color teamSid
     // The clock is the team's, so both boards carry the same two values.
     planeData.set_plane_to_value(leadPlane);
     planeData.set_plane_to_value(speedPlane);
+}
+
+void wide_extra_planes(Board& board, Stockfish::Color team, const TimeState& time,
+                       float* extras) {
+    std::fill_n(extras, NB_WIDE_EXTRA_VALUES, 0.0f);
+    constexpr Stockfish::PieceType pocketTypes[5] = {
+        Stockfish::PAWN, Stockfish::KNIGHT, Stockfish::BISHOP, Stockfish::ROOK, Stockfish::QUEEN};
+    const bool timing = time.wide_timing() && !board.is_single_board();
+    for (int boardIdx = 0; boardIdx < 2; ++boardIdx) {
+        float* out = extras + boardIdx * NB_WIDE_EXTRA_CHANNELS_PER_BOARD;
+        // Our colour on this board: the team's on A, the other on B.
+        const Stockfish::Color ours = boardIdx == 0 ? team : ~team;
+        const int ourSeat = TimeState::seat_of(boardIdx, ours);
+        const int theirSeat = TimeState::seat_of(boardIdx, ~ours);
+        if (timing) {
+            const int seats[2] = {ourSeat, theirSeat};
+            for (int which = 0; which < 2; ++which) {
+                const double t = std::max(0, time.seat_clock_ms(seats[which])) / 1000.0;
+                out[2 * which] = static_cast<float>(std::min(t / 300.0, 1.0));
+                out[2 * which + 1] = static_cast<float>(std::exp(-t / 10.0));
+            }
+            const double e = std::max(0, time.board_elapsed_ms(boardIdx)) / 1000.0;
+            out[4] = static_cast<float>(std::min(e / 10.0, 1.0));
+            out[5] = static_cast<float>(1.0 - std::exp(-e / 2.0));
+        }
+        for (int type = 0; type < 5; ++type) {
+            out[6 + type] = board.count_in_hand(boardIdx, ours, pocketTypes[type]) > 0 ? 1.0f : 0.0f;
+            out[11 + type] = board.count_in_hand(boardIdx, ~ours, pocketTypes[type]) > 0 ? 1.0f : 0.0f;
+            if (timing) {
+                out[16 + type] = std::min(time.recent_landings(ourSeat, pocketTypes[type]) / 2.0f, 1.0f);
+                out[21 + type] = std::min(time.recent_landings(theirSeat, pocketTypes[type]) / 2.0f, 1.0f);
+            }
+        }
+    }
+}
+
+void board_to_wide_planes(Board& board, float* inputPlanes, Stockfish::Color teamSide,
+                          const TimeState& time) {
+    std::vector<float> narrow(NB_INPUT_VALUES());
+    std::array<float, NB_WIDE_EXTRA_VALUES> extras{};
+    board_to_planes(board, narrow.data(), teamSide, time);
+    wide_extra_planes(board, teamSide, time, extras.data());
+    widen_planes(narrow.data(), extras.data(), inputPlanes, 1, [](float v) { return v; });
 }
 
 void board_to_planes(Board& board, float* inputPlanes, Stockfish::Color teamSide,

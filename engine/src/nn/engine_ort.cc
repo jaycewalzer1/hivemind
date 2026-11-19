@@ -155,7 +155,8 @@ struct Engine::OrtState {
     struct Worker {
         std::vector<__half> inputHalf;
         std::vector<float> inputFloat;
-        // A legacy network's planes, the clock planes dropped.
+        // A legacy network's planes, the clock planes dropped, or a wide
+        // network's, the extra planes added.
         std::vector<__half> legacyInputHalf;
         // Two sets of outputs: synchronizeInferenceHalf() hands out the set
         // the finished request filled and the next request fills the other,
@@ -192,6 +193,7 @@ struct Engine::OrtState {
     int movesLeftIdx = -1;
     int jointFactorsAIdx = -1;
     int jointFactorsBIdx = -1;
+    int arrivalsIdx = -1;
 };
 
 const char* Engine::backendName() { return "ONNX Runtime"; }
@@ -295,11 +297,13 @@ bool Engine::loadNetwork(const std::string& onnxFile,
         m_inputChannels = inputShape.size() == 4 && inputShape[1] > 0
             ? static_cast<int>(inputShape[1]) : NB_INPUT_CHANNELS;
         if (m_inputChannels != NB_INPUT_CHANNELS
-            && m_inputChannels != NB_LEGACY_INPUT_CHANNELS) {
+            && m_inputChannels != NB_LEGACY_INPUT_CHANNELS
+            && m_inputChannels != NB_WIDE_INPUT_CHANNELS) {
             std::cerr << "Network takes " << m_inputChannels
                       << " input planes; expected " << NB_INPUT_CHANNELS
                       << " (or " << NB_LEGACY_INPUT_CHANNELS
-                      << " for a network from before the clock planes)" << std::endl;
+                      << " for a network from before the clock planes, "
+                      << NB_WIDE_INPUT_CHANNELS << " for a wave 2b wide one)" << std::endl;
             return false;
         }
         if (state.usesFp16 && !onCoreML) {
@@ -334,7 +338,10 @@ bool Engine::loadNetwork(const std::string& onnxFile,
             const std::string norm = lowered(state.outputNameStorage[i]);
             const int idx = static_cast<int>(i);
             // Order matters: "jointfactors_a" also contains "_a".
-            if (matches(norm, {"jointfactor", "joint_factor"})) {
+            if (matches(norm, {"arrival"})) {
+                state.arrivalsIdx = idx;
+                m_arrivalsName = state.outputNameStorage[i];
+            } else if (matches(norm, {"jointfactor", "joint_factor"})) {
                 if (matches(norm, {"_a", "a_"}) || norm.back() == 'a') {
                     state.jointFactorsAIdx = idx;
                     m_jointFactorsAName = state.outputNameStorage[i];
@@ -419,7 +426,8 @@ bool Engine::loadNetwork(const std::string& onnxFile,
     }
 }
 
-bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex) {
+bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex,
+                                  const float* wideExtras) {
     if (!obs || !m_ort || m_ort->sessions.empty() ||
         workerIndex >= m_ort->workers.size()) {
         return false;
@@ -432,8 +440,13 @@ bool Engine::enqueueInferenceHalf(const __half* obs, size_t workerIndex) {
 
     // Copy rather than alias the caller's buffer: the search reuses its
     // double-buffered observation slabs as soon as it has enqueued. A legacy
-    // network gets the planes without the clock planes.
-    if (m_inputChannels != NB_INPUT_CHANNELS) {
+    // network gets the planes without the clock planes, a wide one with
+    // the wave 2b planes added.
+    if (m_inputChannels == NB_WIDE_INPUT_CHANNELS) {
+        widen_planes(obs, wideExtras, worker.legacyInputHalf.data(),
+                     static_cast<size_t>(m_batchSize), __float2half_rn);
+        obs = worker.legacyInputHalf.data();
+    } else if (m_inputChannels != NB_INPUT_CHANNELS) {
         drop_clock_planes(obs, worker.legacyInputHalf.data(),
                           static_cast<size_t>(m_batchSize));
         obs = worker.legacyInputHalf.data();
@@ -531,24 +544,26 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsA = at(state.jointFactorsAIdx);
     outputs.jointFactorsB = at(state.jointFactorsBIdx);
     outputs.jointFactorRank = outputs.jointFactorsA ? m_jointFactorRank : 0;
+    outputs.arrivals = at(state.arrivalsIdx);
     return outputs.value && outputs.policyA && outputs.policyB;
 }
 
 bool Engine::runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,
-                              size_t workerIndex) {
-    if (!enqueueInferenceHalf(obs, workerIndex)) return false;
+                              size_t workerIndex, const float* wideExtras) {
+    if (!enqueueInferenceHalf(obs, workerIndex, wideExtras)) return false;
     return synchronizeInferenceHalf(outputs, workerIndex);
 }
 
 bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
-                          float* wdl, float* movesLeft, size_t workerIndex) {
+                          float* wdl, float* movesLeft, size_t workerIndex,
+                          const float* wideExtras, float* arrivals) {
     const size_t inputElements =
         static_cast<size_t>(m_batchSize) * NB_INPUT_VALUES();
     std::vector<__half> halfInput(inputElements);
     std::transform(obs, obs + inputElements, halfInput.begin(), __float2half_rn);
 
     HalfInferenceOutputs outputs;
-    if (!runInferenceHalf(halfInput.data(), outputs, workerIndex)) return false;
+    if (!runInferenceHalf(halfInput.data(), outputs, workerIndex, wideExtras)) return false;
 
     const size_t batch = static_cast<size_t>(m_batchSize);
     auto copy = [](const __half* src, float* dst, size_t count) {
@@ -561,5 +576,6 @@ bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
     copy(outputs.policyB, piB, batch * NB_POLICY_VALUES());
     copy(outputs.wdl, wdl, batch * 3);
     copy(outputs.movesLeft, movesLeft, batch);
+    copy(outputs.arrivals, arrivals, batch * NB_ARRIVALS_VALUES);
     return true;
 }
