@@ -1,0 +1,9 @@
+# team	TimeLeadMs	TeamMoveTimeMs	OpponentMoveTimeMs	RootMoveTimeMs	dual FEN (board A|board B)
+white	0	100	100	0	rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1|rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1
+white	2500	400	250	600	rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1|rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[] b KQkq - 0 1
+white	-2500	400	250	600	rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1|rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR[] b KQkq - 0 1
+black	700	300	300	300	rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR[] w KQkq - 0 2|rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R[] b KQkq - 1 1
+black	-15000	900	120	900	r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[Pp] b KQkq - 4 4|rnb1kbnr/ppp2ppp/8/3qp3/8/2N5/PPPP1PPP/R1BQKBNR[Nn] b KQkq - 0 4
+white	15000	120	900	120	r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R[Pp] w KQkq - 4 4|rnb1kbnr/ppp2ppp/8/3qp3/8/2N5/PPPP1PPP/R1BQKBNR[Nn] b KQkq - 0 4
+white	1	100	100	0	r3k2r/ppp2ppp/2n5/3qp3/3P4/2N5/PPP2PPP/R2QK2R[BNpp] w KQkq - 0 10|4k3/8/8/8/8/8/4PPPP/4K3[QRbn] b - - 0 30
+black	0	100	100	0	6k1/5ppp/8/8/8/8/5PPP/6K1[Q] w - - 0 40|r1b1k2r/pppp1ppp/8/8/8/8/PPPP1PPP/R1B1K2R[] w KQkq - 0 20
