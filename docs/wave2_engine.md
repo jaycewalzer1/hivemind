@@ -112,6 +112,10 @@ lands, then drop), but a seat that was already thinking when the piece arrived c
 capture and a drop of the same piece in one joint action never happened anyway: drops come from the pre-action
 pocket. `collect_batch` removes drops of held pieces from the seat's actions (`searchthread.cc:930`); the pending
 counts are in the node key. The network still sees the whole pocket (its inputs do not change in wave 2).
+At the root, an opponent seat on turn (not sitting) starts with the `SeatArrivalsMs` landings into its pocket that are
+younger than its `SeatElapsedMs` pending: they arrived mid-decision (review fix `d538648`; before it the root seeded
+nothing). Self-play sends its landing log to the tree for this with narrow networks too (`SeatClockGame::search_clock`);
+`recentLandings` only reach the wide planes when the network is wide.
 Not done: `Board::is_checkmate` still counts held pieces as possible blockers.
 
 **Mate races by landing (`MateRaceByLanding`).** Inside the durative tree, landings are already in time order, so a
@@ -304,7 +308,8 @@ narrow 78-plane encoding.
 
 **UCI.** `SeatArrivalsMs` (string, `"<pocket>:<piece>:<ms_ago>,..."`, pocket `Aw Ab Bw Bb`, piece `P N B R Q`
 either case, spaces ignored, empty clears; `parse_seat_arrivals`, `planes.cc:341`): recent landings at the root.
-Landings 5 s old or more are dropped; past 12 the newest are kept; a bad item is refused with an `info string` and
+Landings 5 s old or more are dropped; past 12 the newest are kept (the `seat_clocks.tsv` `recent` counts that
+training reads keep the same newest 12, review fix `79d21fa`; the arrivals labels count every landing); a bad item is refused with an `info string` and
 keeps the old value. Board thinking time at the root is the `SeatElapsedMs` of the seat on turn on each board (ours
 included, unlike the ready-time use). `networkWide` (`uci.cc:85`) sets `wideInputs` in `current_clock()`
 (`uci.cc:780`); a wide network also counts as reading the clock planes (TimeModel clock by default). With it13
