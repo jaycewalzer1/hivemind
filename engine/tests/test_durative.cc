@@ -64,29 +64,33 @@ TEST(DurativeClock, RootTeamDecidesAtTheRootThenEarliestReadySeatActs) {
     EXPECT_EQ(time.acting_boards(WHITE), (std::array<bool, 2>{true, false}));
     EXPECT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{false, false}));
     // Bw (black team) would land at 300, before our 1000 ms budget; at the
-    // root we decide anyway, and our clock and theirs both run 1000 ms.
+    // root we decide anyway. Our clock runs the whole 1000 ms, Bw's only
+    // until it lands (300): it is not charged for time it is off turn.
     time.advance_action(WHITE, true, false);
     EXPECT_FALSE(time.at_root());
     EXPECT_EQ(time.seat_clock_ms(AW), 59000);
-    EXPECT_EQ(time.seat_clock_ms(BW), 59000);
+    EXPECT_EQ(time.seat_clock_ms(BW), 59700);
     EXPECT_EQ(time.side_on(0), BLACK);
     // Now Ab (black team, pace 400) is on turn on A and Bw (ready 0) on B.
     EXPECT_EQ(time.seat_ready_ms(AB), 400);
     EXPECT_EQ(time.seat_ready_ms(BW), 0);
     EXPECT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{false, true}));
     EXPECT_FALSE(time.team_acts(WHITE));
-    // Black's B seat moves; Bb (white team, our budget 1000) comes on turn.
+    // Black's B seat moves. Its move landed 700 ms ago, so Bb (white team,
+    // our budget 1000) has been on turn that long: 300 ms to go.
     time.advance_action(BLACK, false, true);
-    EXPECT_EQ(time.seat_ready_ms(BB), 1000);
-    // A: Ab lands at 400, before Bb's 1000.
-    EXPECT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{true, false}));
-    time.advance_action(BLACK, true, false);
-    // Ab and Bb only came on turn after the root move: 400 ms each.
-    EXPECT_EQ(time.seat_clock_ms(AB), 60000 - 400);
-    EXPECT_EQ(time.seat_clock_ms(BB), 60000 - 400);
-    EXPECT_EQ(time.seat_ready_ms(BB), 600);
-    // White team on both boards now: Aw at our budget 1000, Bb at 600.
+    EXPECT_EQ(time.seat_clock_ms(BB), 60000 - 700);
+    EXPECT_EQ(time.seat_ready_ms(BB), 300);
+    // B: Bb lands at 300, before Ab's 400.
     EXPECT_EQ(time.acting_boards(WHITE), (std::array<bool, 2>{false, true}));
+    EXPECT_FALSE(time.team_acts(BLACK));
+    time.advance_action(WHITE, false, true);
+    // Ab came on turn with the root move: 300 ms so far.
+    EXPECT_EQ(time.seat_clock_ms(AB), 60000 - 300);
+    EXPECT_EQ(time.seat_clock_ms(BB), 60000 - 1000);
+    EXPECT_EQ(time.seat_ready_ms(AB), 100);
+    EXPECT_EQ(time.seat_ready_ms(BW), 300);
+    EXPECT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{true, false}));
 }
 
 TEST(DurativeClock, ExactTiesAlternateStartingWithTheRootTeamsOpponents) {
@@ -133,6 +137,92 @@ TEST(DurativeClock, PassLastsUntilJustAfterTheOtherBoardsNextEventCapped) {
                                         {100, 100, 3000, 100});
     nearFlag.advance_action(WHITE, false, false);
     EXPECT_EQ(nearFlag.seat_ready_ms(AW), 300);
+}
+
+TEST(DurativeClock, AtTheRootAnEarlierOpponentLandingIsNotAFlag) {
+    // Root white with a 500 ms budget; Bw (black team) has 300 ms and lands
+    // after 100. It lands with 200 ms to spare: no flag, and its clock is
+    // charged its 100 ms on turn, not our whole budget.
+    TimeState scramble = durative_state(WHITE, {60000, 60000, 300, 60000}, 500,
+                                        {100, 100, 100, 100});
+    scramble.advance_action(WHITE, true, false);
+    EXPECT_EQ(scramble.outcome(), TimeState::Outcome::NONE);
+    EXPECT_EQ(scramble.seat_clock_ms(BW), 200);
+    EXPECT_EQ(scramble.seat_clock_ms(AW), 59500);
+    // Its move landed 400 ms before this node: Bb has been on turn since.
+    scramble.advance_action(BLACK, false, true);
+    EXPECT_EQ(scramble.seat_clock_ms(BB), 59600);
+    EXPECT_EQ(scramble.seat_ready_ms(BB), 100);
+
+    // A clock that runs out before the seat lands still flags at the root.
+    TimeState flagged = durative_state(WHITE, {60000, 60000, 300, 60000}, 500,
+                                       {100, 100, 400, 100});
+    flagged.advance_action(WHITE, true, false);
+    EXPECT_EQ(flagged.outcome(), TimeState::Outcome::WHITE_TEAM_WINS);
+
+    // Without FlagLoss the same 5000 ms clock reads 4900, not 4500.
+    TimeState plain = durative_state(WHITE, {60000, 60000, 5000, 60000}, 500,
+                                     {100, 100, 100, 100}, false);
+    plain.advance_action(WHITE, true, false);
+    EXPECT_EQ(plain.seat_clock_ms(BW), 4900);
+}
+
+TEST(DurativeClock, OneTeamOnBothBoardsCannotLeapfrogInMillisecondPasses) {
+    // White's root move lands on both boards; black is then on turn on both
+    // (Ab at 100, Bw at 300) and keeps passing.
+    TimeState time = durative_state(WHITE, {60000, 60000, 60000, 60000}, 100,
+                                     {100, 100, 300, 100}, true, false,
+                                     WHITE, BLACK);
+    time.advance_action(WHITE, true, true);
+    ASSERT_EQ(time.side_on(0), BLACK);
+    ASSERT_EQ(time.side_on(1), WHITE);
+    // Ab passes at 100: it waits for Bw's landing (at 300).
+    ASSERT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{true, false}));
+    ASSERT_TRUE(time.can_sit(BLACK));
+    time.advance_action(BLACK, false, false);
+    EXPECT_EQ(time.seat_ready_ms(AB), 201);
+    // Bw passes too: no landing comes, so Ab's pass runs to its cap
+    // (8 x its pace 100), and Bw's to 8 x 300.
+    ASSERT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{false, true}));
+    time.advance_action(BLACK, false, false);
+    EXPECT_EQ(time.seat_ready_ms(AB), 800 - 200);
+    EXPECT_EQ(time.seat_ready_ms(BW), 8 * 300);
+    // From here each pass lasts until a cap ends (one seat's or the
+    // other's), never 1 ms: 20 more passes take black's clocks down by at
+    // least 20 x 100 ms.
+    const int32_t before = time.seat_clock_ms(AB);
+    for (int pass = 0; pass < 20 && time.outcome() == TimeState::Outcome::NONE; ++pass) {
+        const std::array<bool, 2> acts = time.acting_boards(BLACK);
+        ASSERT_TRUE(acts[0] || acts[1]);
+        const int32_t clock = time.seat_clock_ms(AB);
+        time.advance_action(BLACK, false, false);
+        EXPECT_GE(clock - time.seat_clock_ms(AB), 100);
+    }
+    EXPECT_GE(before - time.seat_clock_ms(AB), 20 * 100);
+    // A seat that does move wakes the other board's pass 1 ms later.
+    TimeState moves = durative_state(WHITE, {60000, 60000, 60000, 60000}, 100,
+                                     {100, 100, 300, 100}, true, false,
+                                     WHITE, BLACK);
+    moves.advance_action(WHITE, true, true);
+    moves.advance_action(BLACK, false, false);  // Ab passes
+    moves.advance_action(BLACK, false, false);  // Bw passes
+    ASSERT_EQ(moves.acting_boards(BLACK), (std::array<bool, 2>{true, false}));
+    moves.advance_action(BLACK, true, false);   // Ab moves at its cap
+    EXPECT_EQ(moves.seat_ready_ms(BW), 1);
+}
+
+TEST(DurativeClock, AnOpponentsPassIsCappedAtItsOwnPace) {
+    // The root budget is 100, Bw's pace 1000: Bw's pass lasts up to
+    // 8 x 1000, as the self-play game caps it, not 8 x our budget.
+    TimeState time = durative_state(WHITE, {60000, 60000, 60000, 60000}, 100,
+                                     {100, 100, 1000, 100}, true, false,
+                                     WHITE, WHITE);
+    time.advance_action(WHITE, true, false);   // Aw moves; Ab ready 100, Bw 900
+    time.advance_action(BLACK, true, false);   // Ab moves at 100; Aw ready 100
+    time.advance_action(WHITE, false, false);  // Aw passes until Bw lands (+1)
+    ASSERT_EQ(time.acting_boards(BLACK), (std::array<bool, 2>{false, true}));
+    time.advance_action(BLACK, false, false);  // Bw passes; Aw sits: its cap
+    EXPECT_EQ(time.seat_ready_ms(BW), 8 * 1000);
 }
 
 TEST(DurativeClock, SitGateOffMakesThePassLegalBehindOnTheClock) {

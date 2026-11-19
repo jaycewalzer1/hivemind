@@ -207,9 +207,7 @@ public:
         const int32_t rootMs = config.rootMoveTimeMs > 0
             ? config.rootMoveTimeMs : base.moveTimeMs_[rootTeam];
         d.rootMoveMs = std::max<int32_t>(1, rootMs);
-        d.passCapMs = static_cast<int32_t>(std::clamp<int64_t>(
-            static_cast<int64_t>(std::max<int32_t>(1, config.passCapK)) * d.rootMoveMs,
-            1, MAX_LEAD_MS));
+        d.passCapK = std::clamp<int32_t>(config.passCapK, 1, 64);
         for (int board = 0; board < 2; ++board) {
             const int seat = seat_of(board, d.side[board]);
             if (team_of_seat(seat) == rootTeam) {
@@ -218,6 +216,22 @@ public:
                 d.sitting[seat] = config.seatSitting[seat];
                 d.readyMs[seat] = std::max<int32_t>(
                     1, d.paceMs[seat] - std::max<int32_t>(0, config.seatElapsedMs[seat]));
+                // A sitting seat's pass ends there at the latest.
+                d.capReadyMs[seat] = d.readyMs[seat];
+                if (!config.instantTransfer && !d.sitting[seat]) {
+                    // Without InstantTransfer, what reached its pocket while
+                    // it has been thinking (SeatArrivalsMs younger than its
+                    // SeatElapsedMs) waits for its next decision.
+                    const int32_t elapsed = std::max<int32_t>(0, config.seatElapsedMs[seat]);
+                    for (const SeatLanding& landing : config.recentLandings) {
+                        if (landing.seat == seat && landing.type >= 1
+                            && landing.type < PENDING_TYPES && landing.agoMs >= 0
+                            && landing.agoMs < elapsed
+                            && d.pending[seat][landing.type] < UINT8_MAX) {
+                            ++d.pending[seat][landing.type];
+                        }
+                    }
+                }
             }
         }
         if (config.wideInputs) {
@@ -382,11 +396,14 @@ public:
      *        board it acts on; ignored for the others. Time advances to the
      *        landing, every clock on turn runs by that much, a moved seat
      *        hands the board to its opponent (ready after its own action
-     *        time), a passing seat waits until just after the next event on
-     *        the other board, its flag, or PassCapK x the root budget,
-     *        whichever is first. A team that does not act here only waits:
-     *        nothing moves. With FlagLoss, a clock that runs out on the way
-     *        ends the game (outcome()).
+     *        time), a passing seat waits until just after the next landing
+     *        on the other board, its flag, or PassCapK x its own action time
+     *        (the root budget for the root team, its pace otherwise),
+     *        whichever is first. At the root, the other team's seat that
+     *        lands before our budget is charged only up to its landing; its
+     *        action is dated back that far. A team that does not act here
+     *        only waits: nothing moves. With FlagLoss, a clock that runs out
+     *        on the way ends the game (outcome()).
      */
     void advance_action(Stockfish::Color actingTeam, bool movedA, bool movedB,
                         Stockfish::PieceType handA = Stockfish::NO_PIECE_TYPE,
@@ -407,20 +424,29 @@ public:
         const int32_t dt = turn.dt;
         const int seatA = turn.seat[BOARD_A_IDX];
         const int seatB = turn.seat[BOARD_B_IDX];
+        // How long each seat on turn runs to this node: dt, except at the
+        // root for the other team's seat that lands before our budget. It
+        // is on turn only until it lands; its action follows right after
+        // the root's (at a ready time of 0) and is dated back (earlyMs).
+        const int32_t run[2] = {std::min(dt, std::max(0, d.readyMs[seatA])),
+                                std::min(dt, std::max(0, d.readyMs[seatB]))};
         if (d.flagLoss) {
-            const int32_t first = std::min(d.clockMs[seatA], d.clockMs[seatB]);
-            if (first <= dt) {
-                const bool aOut = d.clockMs[seatA] == first;
-                const bool bOut = d.clockMs[seatB] == first;
+            bool aOut = d.clockMs[seatA] <= run[0];
+            bool bOut = d.clockMs[seatB] <= run[1];
+            if (aOut || bOut) {
+                if (aOut && bOut) {
+                    // Both run out: the lower clock flags first.
+                    const int32_t first = std::min(d.clockMs[seatA], d.clockMs[seatB]);
+                    aOut = d.clockMs[seatA] == first;
+                    bOut = d.clockMs[seatB] == first;
+                }
                 if (aOut && bOut && team_of_seat(seatA) != team_of_seat(seatB)) {
                     d.outcome = Outcome::DRAW;
                 } else {
-                    const Stockfish::Color loser = team_of_seat(aOut ? seatA : seatB);
-                    d.outcome = loser == Stockfish::WHITE
-                        ? Outcome::BLACK_TEAM_WINS : Outcome::WHITE_TEAM_WINS;
+                    flag(aOut ? seatA : seatB);
                 }
-                d.clockMs[seatA] = std::max(0, d.clockMs[seatA] - dt);
-                d.clockMs[seatB] = std::max(0, d.clockMs[seatB] - dt);
+                d.clockMs[seatA] = std::max(0, d.clockMs[seatA] - run[0]);
+                d.clockMs[seatB] = std::max(0, d.clockMs[seatB] - run[1]);
                 sync_lead();
                 return;
             }
@@ -429,8 +455,9 @@ public:
         const bool moved[2] = {movedA, movedB};
         if (d.atRootBefore) {
             // At the root we decide first, but the other team's seat may land
-            // before our budget runs out: remember by how much, for the
-            // landing-time mate race (mate_race_early_ms).
+            // before our budget runs out: remember by how much, to date its
+            // action back and for the landing-time mate race
+            // (mate_race_early_ms).
             for (int board = 0; board < 2; ++board) {
                 const int seat = turn.seat[board];
                 if (!acts[board] && team_of_seat(seat) != actingTeam
@@ -440,9 +467,11 @@ public:
             }
             d.atRootBefore = false;
         }
-        for (int seat : {seatA, seatB}) {
-            d.clockMs[seat] = clamp_lead(static_cast<int64_t>(d.clockMs[seat]) - dt);
+        for (int board = 0; board < 2; ++board) {
+            const int seat = turn.seat[board];
+            d.clockMs[seat] = clamp_lead(static_cast<int64_t>(d.clockMs[seat]) - run[board]);
             d.readyMs[seat] = std::max(0, d.readyMs[seat] - dt);
+            d.capReadyMs[seat] = std::max(0, d.capReadyMs[seat] - dt);
         }
         if (turn.crossTie) {
             d.tieNext = ~d.tieNext;
@@ -450,11 +479,15 @@ public:
         if (d.wide) {
             age_landings(dt);
         }
+        // How long ago an acting seat's action really landed (> 0 only for
+        // the other team's seat that landed during our root budget).
+        int32_t early[2] = {0, 0};
         for (int board = 0; board < 2; ++board) {
             if (!acts[board]) {
                 continue;
             }
             const int seat = turn.seat[board];
+            early[board] = std::max(0, d.earlyMs[seat]);
             d.earlyMs[seat] = -1;
             if (d.sitting[seat]) {
                 // A seat back from a pass decides anew: every piece that
@@ -479,13 +512,13 @@ public:
                 ++d.pending[partner][type];
             }
             if (d.wide && type > 0 && type < PENDING_TYPES) {
-                add_landing(partner, type);
+                add_landing(partner, type, early[board]);
             }
         }
         if (d.wide) {
             for (int board = 0; board < 2; ++board) {
                 if (acts[board] && moved[board]) {
-                    d.sinceLandMs[board] = 0;
+                    d.sinceLandMs[board] = early[board];
                 }
             }
         }
@@ -498,25 +531,62 @@ public:
             d.readyMs[seat] = 0;
             d.side[board] = ~d.side[board];
             const int next = seat_of(board, d.side[board]);
-            d.readyMs[next] = action_time_ms(next);
+            // The seat that comes on turn has been on it since the landing.
+            d.readyMs[next] = std::max(1, action_time_ms(next) - early[board]);
             d.sitting[next] = false;
             // Its decision starts now: everything in its pocket is usable.
             d.pending[next] = {};
             d.earlyMs[next] = -1;
+            if (early[board] > 0) {
+                charge_late(next, early[board]);
+            }
+            // A pass on the other board ends 1 ms after this landing.
+            const int waiting = seat_of(1 - board, d.side[1 - board]);
+            if (!acts[1 - board] && d.sitting[waiting]) {
+                d.readyMs[waiting] = std::min(d.readyMs[waiting], 1);
+            }
+        }
+        // A pass waits until just after the next landing on the other board,
+        // the passing seat's flag, or PassCapK x its own action time,
+        // whichever comes first. A seat that sits (or passes here) on the
+        // other board lands nothing, so it sets no earlier wake-up.
+        bool passed[2] = {false, false};
+        for (int board = 0; board < 2; ++board) {
+            passed[board] = acts[board] && !moved[board];
+            if (passed[board] && early[board] > 0) {
+                charge_late(turn.seat[board], early[board]);
+            }
         }
         for (int board = 0; board < 2; ++board) {
-            if (!acts[board] || moved[board]) {
+            if (!passed[board]) {
                 continue;
             }
             const int seat = turn.seat[board];
             const int other = seat_of(1 - board, d.side[1 - board]);
-            int64_t wait = static_cast<int64_t>(d.readyMs[other]) + 1;
+            int64_t cap = static_cast<int64_t>(d.passCapK) * action_time_ms(seat) - early[board];
             if (d.clockMs[seat] > 0) {
-                wait = std::min<int64_t>(wait, d.clockMs[seat]);
+                cap = std::min<int64_t>(cap, d.clockMs[seat]);
             }
-            wait = std::min<int64_t>(wait, d.passCapMs);
+            cap = std::clamp<int64_t>(cap, 1, MAX_LEAD_MS);
+            d.capReadyMs[seat] = static_cast<int32_t>(cap);
+            int64_t wait = cap;
+            if (!passed[1 - board] && !d.sitting[other]) {
+                wait = std::min<int64_t>(wait, static_cast<int64_t>(d.readyMs[other]) + 1);
+            }
             d.readyMs[seat] = static_cast<int32_t>(std::max<int64_t>(wait, 1));
-            d.sitting[seat] = true;
+        }
+        for (int board = 0; board < 2; ++board) {
+            if (!passed[board]) {
+                continue;
+            }
+            d.sitting[turn.seat[board]] = true;
+            // A seat sitting on the other board waited for this seat to land,
+            // which it did not: its pass runs on to its own cap. (Without
+            // this two seats of one team leapfrog in 1 ms passes for ever.)
+            const int other = seat_of(1 - board, d.side[1 - board]);
+            if (!acts[1 - board] && d.sitting[other]) {
+                d.readyMs[other] = std::max(d.readyMs[other], d.capReadyMs[other]);
+            }
         }
         sync_lead();
         {
@@ -525,7 +595,7 @@ public:
             // arena adjudicates this sit-off as a draw.
             const int nowA = seat_of(BOARD_A_IDX, d.side[BOARD_A_IDX]);
             const int nowB = seat_of(BOARD_B_IDX, d.side[BOARD_B_IDX]);
-            if (d.sitting[nowA] && d.sitting[nowB]
+            if (d.outcome == Outcome::NONE && d.sitting[nowA] && d.sitting[nowB]
                 && team_of_seat(nowA) != team_of_seat(nowB)
                 && d.clockMs[nowA] == d.clockMs[nowB]) {
                 d.outcome = Outcome::DRAW;
@@ -703,7 +773,11 @@ private:
         std::array<int32_t, 4> paceMs{0, 0, 0, 0};
         std::array<bool, 4> sitting{false, false, false, false};
         int32_t rootMoveMs = 1;
-        int32_t passCapMs = 1;
+        // A pass lasts at most passCapK x the passing seat's action time.
+        int32_t passCapK = 8;
+        // For a sitting seat: when its pass ends at the latest (its cap or
+        // flag), relative to this node's time like readyMs.
+        std::array<int32_t, 4> capReadyMs{0, 0, 0, 0};
         // Pieces in each seat's pocket by type that landed during its
         // current decision (InstantTransfer off).
         std::array<std::array<uint8_t, PENDING_TYPES>, 4> pending{};
@@ -730,7 +804,8 @@ private:
             for (int seat = 0; seat < 4; ++seat) {
                 mix(static_cast<uint32_t>(clockMs[seat]));
                 mix(static_cast<uint32_t>(readyMs[seat]) | (uint64_t(sitting[seat]) << 32));
-                mix(static_cast<uint32_t>(paceMs[seat]));
+                mix(static_cast<uint32_t>(paceMs[seat])
+                    | (uint64_t(static_cast<uint32_t>(sitting[seat] ? capReadyMs[seat] : 0)) << 32));
             }
             mix((uint64_t(side[0]) << 0) | (uint64_t(side[1]) << 1)
                 | (uint64_t(tieNext) << 2) | (uint64_t(rootTeam) << 3)
@@ -738,7 +813,7 @@ private:
                 | (uint64_t(instantTransfer) << 6) | (uint64_t(mateRaceByLanding) << 7)
                 | (uint64_t(outcome) << 8));
             mix((uint64_t(static_cast<uint32_t>(rootMoveMs)) << 32)
-                | static_cast<uint32_t>(passCapMs));
+                | static_cast<uint32_t>(passCapK));
             for (int seat = 0; seat < 4; ++seat) {
                 uint64_t packed = 0;
                 for (int type = 1; type < PENDING_TYPES; ++type) {
@@ -840,9 +915,9 @@ private:
         d.landings = kept;
     }
 
-    // A piece lands in @p seat's pocket now. Slots stay newest last; when
-    // all are taken the oldest leaves.
-    void add_landing(int seat, int type) {
+    // A piece landed in @p seat's pocket @p agoMs ago. Slots stay newest
+    // last; when all are taken the oldest leaves.
+    void add_landing(int seat, int type, int32_t agoMs = 0) {
         Durative& d = durative_;
         int slot = 0;
         while (slot < MAX_RECENT_LANDINGS && d.landings[slot].seat >= 0) {
@@ -852,7 +927,26 @@ private:
             std::rotate(d.landings.begin(), d.landings.begin() + 1, d.landings.end());
             slot = MAX_RECENT_LANDINGS - 1;
         }
-        d.landings[slot] = SeatLanding{static_cast<int8_t>(seat), static_cast<int8_t>(type), 0};
+        d.landings[slot] = SeatLanding{static_cast<int8_t>(seat), static_cast<int8_t>(type), agoMs};
+    }
+
+    // @p seat's team loses on the clock (FlagLoss).
+    void flag(int seat) {
+        durative_.outcome = team_of_seat(seat) == Stockfish::WHITE
+            ? Outcome::BLACK_TEAM_WINS : Outcome::WHITE_TEAM_WINS;
+    }
+
+    // @p seat has been on turn @p ms longer than this node's time says: the
+    // other team's seat that acted during our root budget, or the seat its
+    // move handed the board to. With FlagLoss a clock that runs out flags.
+    void charge_late(int seat, int32_t ms) {
+        Durative& d = durative_;
+        if (d.flagLoss && d.outcome == Outcome::NONE && d.clockMs[seat] <= ms) {
+            flag(seat);
+            d.clockMs[seat] = 0;
+            return;
+        }
+        d.clockMs[seat] = clamp_lead(static_cast<int64_t>(d.clockMs[seat]) - ms);
     }
 
     // The lead, as v3 defines it, read off the four clocks.

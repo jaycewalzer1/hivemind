@@ -111,6 +111,30 @@ TEST(DurativeTransfer, ASeatBackFromAPassMayDropWhatLandedMeanwhile) {
     EXPECT_EQ(moved.pending_in_hand(BB, Stockfish::KNIGHT), 0);
 }
 
+TEST(DurativeTransfer, WhatReachedAnOpponentSeatMidDecisionIsPendingAtTheRoot) {
+    // Bw (black team) has been deciding for 600 ms. A knight landed in its
+    // pocket 300 ms ago (during that decision), a pawn 900 ms ago (before).
+    DurativeConfig config;
+    config.instantTransfer = false;
+    config.rootMoveTimeMs = 100;
+    config.seatPaceMs = {100, 100, 1000, 100};
+    config.seatElapsedMs = {0, 0, 600, 0};
+    config.recentLandings[0] = SeatLanding{static_cast<int8_t>(BW), Stockfish::PAWN, 900};
+    config.recentLandings[1] = SeatLanding{static_cast<int8_t>(BW), Stockfish::KNIGHT, 300};
+    const TimeState time = TimeState::durative(
+        TimeState::clocked(WHITE, 0).with_sit_gate(false), WHITE, WHITE, WHITE, config);
+    EXPECT_EQ(time.pending_in_hand(BW, Stockfish::KNIGHT), 1);
+    EXPECT_EQ(time.pending_in_hand(BW, Stockfish::PAWN), 0);
+    // With InstantTransfer, or for a seat that is sitting, nothing waits.
+    config.instantTransfer = true;
+    EXPECT_EQ(TimeState::durative(TimeState::clocked(WHITE, 0), WHITE, WHITE, WHITE, config)
+                  .pending_in_hand(BW, Stockfish::KNIGHT), 0);
+    config.instantTransfer = false;
+    config.seatSitting[BW] = true;
+    EXPECT_EQ(TimeState::durative(TimeState::clocked(WHITE, 0), WHITE, WHITE, WHITE, config)
+                  .pending_in_hand(BW, Stockfish::KNIGHT), 0);
+}
+
 TEST(DurativeTransfer, InstantTransferAndV3StatesNeverHoldPieces) {
     Wave2Setup setup;
     setup.instantTransfer = true;
