@@ -232,7 +232,11 @@ arrivals labels outside [0, 16].
 
 * Loss: weighted MSE over the 20 counts, per type P 1, N 2, B 2, R 2, Q 4 (the same in all four pockets), divided by
   the weights' sum (44); only rows with a label; overall weight `distill-train --arrivals-weight` (0.05). The head
-  trains at the heads' learning rate (`--lr`), the stem's new columns with the trunk (`--trunk-lr`).
+  trains at the heads' learning rate (`--lr`), and so do the stem's new columns (the 26 zero-initialised input planes
+  per board): they sit inside the trunk's stem tensor, so after each AdamW step `NewInputRate` scales their update
+  by `lr / trunk_lr`, which is exactly a step at the heads' rate (AdamW's step, weight decay included, is
+  proportional to the rate). `distill-train --new-inputs-lr trunk` restores the old behaviour (they trained at the
+  trunk's 5e-5 until review fix, which leaned the narrow/wide A/B toward "no difference").
 * `distill-train` reads the layout the network reads (`--init` a wide checkpoint, or `--wide` to widen a narrow one).
   Export adds the `arrivals` output and can write an FP32 copy.
 * `rl-loop --wide` (with `--wave2`): the generator must read 130 planes (and a 130-plane generator needs `--wide`);
@@ -256,6 +260,11 @@ output, checkpoint variant wide. Wall time 2 min 20 s. Not run: matches, any GPU
 `cluster/wave2_iterate.sbatch` (main repo) has `WIDE=1` (a wide lineage) and `AB=1` (narrow and wide lineages,
 same settings, same seeds: rl-loop seeds segment k of iteration n with 1000 n + k). Both gate against it13 at equal
 movetime under the wave 2 rules; the headline against stock v3 rules is the arena's.
+
+Reading `results.tsv` / `results_ab.tsv`: the `vs_it13` and `elo_vs_it13` columns are each iteration's gate, 400
+games (about +-0.05 at 95%) of the candidate against **it13's network inside the wave 2 search and rules**, not
+against stock upstream v3. They are not comparable with the arena's `vs_it13_*` rows (stock upstream binary, stock
+rules for it13, arena rules v3). Use them to compare iterations and arms with each other only.
 
 Same seeds do not mean same games. Integration 2026-11-19 (talisman `docs/wave2_local_check.md`): with the one-worker
 `build-sp1` the narrow and wide arms of a 4-game A/B still played different games (958 vs 555 records). Wide node

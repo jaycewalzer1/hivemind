@@ -28,12 +28,13 @@ import torch
 import torch.nn.functional as F
 
 from hivemind.architectures.twin_board import (
+    STEM_WEIGHT,
     TWIN_BOARD_SIZES,
     get_twin_board_model,
     load_twin_board_checkpoint,
 )
 from hivemind.distill.data import DistillDataset, chunk_paths, chunk_positions, head_chunk, read_chunk
-from hivemind.constants import NUM_WIDE_CHANNELS_PER_BOARD
+from hivemind.constants import NUM_CLOCKED_CHANNELS_PER_BOARD, NUM_WIDE_CHANNELS_PER_BOARD
 from hivemind.paths import PROJECT_ROOT
 
 
@@ -160,6 +161,35 @@ def parameter_groups(model, lr, trunk_lr=None):
     return [{"params": trunk, "lr": trunk_lr, "name": "trunk"}, {"params": heads, "lr": lr, "name": "heads"}]
 
 
+class NewInputRate:
+    """Wave 2b: the stem weights of a wide network's 26 new planes per board
+    start at zero, like the arrivals head, but sit inside the trunk's stem
+    tensor, so parameter groups cannot give them the heads' rate. After each
+    optimizer step this scales their update by lr / trunk_lr. AdamW's step
+    (decoupled weight decay included) is proportional to the group's rate,
+    so that is exactly a step at the heads' rate."""
+
+    def __init__(self, model, lr, trunk_lr):
+        weight = dict(model.named_parameters()).get(STEM_WEIGHT)
+        self.active = (trunk_lr is not None and trunk_lr > 0 and lr != trunk_lr and weight is not None
+                       and weight.shape[1] == NUM_WIDE_CHANNELS_PER_BOARD)
+        self.weight = weight
+        self.ratio = lr / trunk_lr if self.active else 1.0
+        self.before = None
+
+    def _slice(self):
+        return self.weight.data[:, NUM_CLOCKED_CHANNELS_PER_BOARD:NUM_WIDE_CHANNELS_PER_BOARD]
+
+    def save(self):
+        if self.active:
+            self.before = self._slice().clone()
+
+    def apply(self):
+        if self.active:
+            new = self._slice()
+            new.copy_(self.before + (new - self.before) * self.ratio)
+
+
 def concat_batches(first, second):
     """One batch from two (the raw and search streams)."""
     merged = {key: torch.cat((first[key], second[key])) for key in first if key != "policy"}
@@ -227,6 +257,10 @@ def main():
                         help="Chunks held on the device at once")
     parser.add_argument("--eval-every", type=int, default=2000, help="Steps between validations")
     parser.add_argument("--moves-left-weight", type=float, default=0.1)
+    parser.add_argument("--new-inputs-lr", choices=("heads", "trunk"), default="heads",
+                        help="Wave 2b, with --trunk-lr: the rate of the stem weights of the 26 new "
+                             "(zero-initialised) planes per board of a wide network: the heads' --lr "
+                             "(default, like the arrivals head) or the trunk's")
     parser.add_argument("--arrivals-weight", type=float, default=0.05,
                         help="Weight of the wave 2b arrivals loss (wide networks, rows with a label)")
     parser.add_argument("--wide", action="store_true",
@@ -355,8 +389,10 @@ def main():
     print(f"{size}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters", flush=True)
     optimizer = torch.optim.AdamW(parameter_groups(model, args.lr, args.trunk_lr), lr=args.lr,
                                   weight_decay=args.weight_decay)
+    new_inputs = NewInputRate(model, args.lr, args.trunk_lr if args.new_inputs_lr == "heads" else None)
     if args.trunk_lr is not None:
-        print(f"learning rates: trunk {args.trunk_lr}, heads {args.lr}", flush=True)
+        print(f"learning rates: trunk {args.trunk_lr}, heads {args.lr}"
+              + (", wide new-plane stem weights at the heads' rate" if new_inputs.active else ""), flush=True)
     # An epoch is one pass over the raw data, or over the search data without it.
     steps_per_epoch = max(1, positions // raw_rows if raw_rows else search_positions // search_rows)
     total_steps = args.steps if args.steps else int(args.epochs * steps_per_epoch)
@@ -373,7 +409,9 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        new_inputs.save()
         optimizer.step()
+        new_inputs.apply()
         schedule.step()
 
         if step % args.eval_every == 0 or step == total_steps:

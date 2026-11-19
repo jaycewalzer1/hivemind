@@ -1,5 +1,6 @@
 """Wave 2b (talisman fork): the wide planes, HDST v3, the widened network and
 its arrivals head."""
+import copy
 import math
 import struct
 
@@ -530,3 +531,36 @@ def test_python_wide_extras_equal_the_engines(tmp_path):
         for block in range(2):
             extra = slice(block * W + N, (block + 1) * W)
             np.testing.assert_allclose(ours[extra], theirs[extra], atol=1e-6)
+
+
+def test_new_input_stem_weights_train_at_the_heads_rate():
+    # The wide stem's 26 new planes per board start at zero like the arrivals
+    # head; with --trunk-lr they step at the heads' rate, the rest of the stem
+    # at the trunk's (review finding: they trained at the trunk's rate).
+    from hivemind.distill.train import NewInputRate, parameter_groups
+    from hivemind.architectures.twin_board import STEM_WEIGHT
+    torch.manual_seed(0)
+    base = get_twin_board_model("twin-s", planes_per_board=W, arrivals=True, attention_dim=0, se_every=0)
+    planes = torch.rand(2, 2 * W, 8, 8)
+    stems = {}
+    for name, lr, trunk_lr, scaled in (("split", 1e-4, 5e-5, True), ("heads", 1e-4, 1e-4, False),
+                                        ("trunk", 5e-5, 5e-5, False)):
+        model = copy.deepcopy(base)
+        optimizer = torch.optim.AdamW(parameter_groups(model, lr, trunk_lr), lr=lr, weight_decay=1e-4)
+        rate = NewInputRate(model, lr, trunk_lr)
+        assert rate.active == scaled
+        def total(output):
+            return output.float().sum() if torch.is_tensor(output) else sum(total(o) for o in output)
+        total(model(planes)).backward()
+        rate.save()
+        optimizer.step()
+        rate.apply()
+        stems[name] = dict(model.named_parameters())[STEM_WEIGHT].detach()
+    new = slice(NUM_CLOCKED_CHANNELS_PER_BOARD, W)
+    old = slice(0, NUM_CLOCKED_CHANNELS_PER_BOARD)
+    assert torch.allclose(stems["split"][:, new], stems["heads"][:, new], atol=1e-9)
+    assert torch.allclose(stems["split"][:, old], stems["trunk"][:, old], atol=1e-9)
+    assert not torch.allclose(stems["split"][:, new], stems["trunk"][:, new], atol=1e-9)
+    # A narrow network has no new planes: nothing to scale.
+    narrow = get_twin_board_model("twin-s", attention_dim=0, se_every=0)
+    assert not NewInputRate(narrow, 1e-4, 5e-5).active
