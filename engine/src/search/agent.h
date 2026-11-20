@@ -78,6 +78,14 @@ struct SearchOptions {
     // times may differ by at most teamTreeReuseToleranceMs.
     bool teamTreeReuse = false;
     int teamTreeReuseToleranceMs = 250;
+    // Wave 2c, fix 3 (UCI PlanCarry): under a durative clock, remember the
+    // halves of the pair this search chooses for boards our team is on turn
+    // on (Agent::plans_), and at this team's next search mix the root prior
+    // of a remembered move that is still valid by planCarryPermille / 1000
+    // and expand the pair holding it first, so the partner continues the
+    // plan unless the new search finds better.
+    bool planCarry = false;
+    int planCarryPermille = 300;
 
     SearchParams::RuntimeConfig search;
     
@@ -113,6 +121,41 @@ struct TeamTreeReuseReport {
     int clockDiffMs = -1;
     // Nodes of the old tree with the live boards and our team to play.
     int boardMatches = 0;
+    // Fix 2: when the refusal was `committed`, that node's commitment per
+    // seat (fix 3 reads our seats' as the tree's plan for them).
+    std::array<Stockfish::Move, 4> committed{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE,
+                                             Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
+};
+
+/**
+ * @brief Wave 2c, fix 3 (PlanCarry): the remembered half of a chosen pair on
+ * one board, for the seat there whose own decision is still to come.
+ */
+struct CarriedPlan {
+    int board = -1;
+    Stockfish::Move move = Stockfish::MOVE_NONE;
+    std::string fen;               // that board's FEN when the plan was made
+    Stockfish::Color team = Stockfish::WHITE;
+    float edgeQ = 0.0f;            // telemetry only
+    float edgeVisitShare = 0.0f;   // telemetry only
+};
+
+/**
+ * @brief What fix 3 did at the start of one search, per board: the slot's
+ * move (MOVE_NONE: no plan), whether it was mixed into the root's priors,
+ * and if not why: "other team", "not on turn", "board changed", "pocket"
+ * (our seat's pocket lost a piece), "illegal", "not a root action" (legal
+ * but held back, InstantTransfer off). `fromTree`: the slot was filled from
+ * fix 1's `committed` refusal (fix 2's plan for that seat).
+ */
+struct PlanCarryReport {
+    bool attempted = false;
+    std::array<Stockfish::Move, 2> move{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
+    std::array<bool, 2> applied{false, false};
+    std::array<bool, 2> fromTree{false, false};
+    std::array<std::string, 2> reason;
+    float weight = 0.0f;
+    bool any_applied() const { return applied[0] || applied[1]; }
 };
 
 struct RootEdgeStats {
@@ -330,6 +373,18 @@ private:
     // The adoption's re-timed nodes, for the fresh transposition table.
     std::vector<std::shared_ptr<Node>> teamTreeWalked_;
 
+    // Wave 2c, fix 3 (PlanCarry): one slot per board, written at the end of
+    // a durative search (or by record_plans) and read at the start of the
+    // team's next one. Outside the tree: reset_search_state() leaves them,
+    // clear_plans() (ucinewgame, game start) empties them.
+    std::array<CarriedPlan, 2> plans_;
+    PlanCarryReport lastPlanCarry_;
+    void record_plans_locked(Board& board, Stockfish::Color team,
+                             const JointActionCandidate& action, std::array<bool, 2> boards);
+    /** The root's prior mix for this search, validated; fills lastPlanCarry_. */
+    void resolve_plans(Board& board, Stockfish::Color team, int permille,
+                       SearchParams::RuntimeConfig& config);
+
     /** Where find_team_tree_node got to. */
     struct TeamTreeMatch {
         std::shared_ptr<Node> node;
@@ -384,6 +439,7 @@ private:
     friend class AgentDurativePart2Peer;
     friend class AgentContinuityPeer;
     friend class AgentContinuityFix2Peer;
+    friend class AgentContinuityFix3Peer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);
@@ -481,6 +537,22 @@ public:
     bool certified_choice() const { return certifiedChoice_; }
     /** Fix 1: what TeamTreeReuse did at the start of the last search. */
     const TeamTreeReuseReport& team_tree_reuse() const { return lastTeamTreeReuse_; }
+    /** Fix 3: what PlanCarry did at the start of the last search. */
+    const PlanCarryReport& plan_carry() const { return lastPlanCarry_; }
+    /** Fix 3: the remembered halves, one slot per board. */
+    const std::array<CarriedPlan, 2>& carried_plans() const { return plans_; }
+    /** Fix 3: forget both remembered halves (ucinewgame, a new game). */
+    void clear_plans();
+    /**
+     * @brief Fix 3: replace both slots with the halves of @p action on the
+     * boards in @p boards where @p team is on turn and the half is a move;
+     * every other slot is cleared. For a caller that plays another action
+     * than the search chose (self-play samples one) or only some of its
+     * halves: it records the halves of seats whose decision is still to
+     * come. Call after run_search, from @p board, the position it searched.
+     */
+    void record_plans(Board& board, Stockfish::Color team, const JointActionCandidate& action,
+                      std::array<bool, 2> boards);
 
     /** Returns telemetry from the most recent internal mate-probe experiment. */
     InternalMateProbeStats internal_mate_probe_stats() const;

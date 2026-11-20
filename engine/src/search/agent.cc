@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -6184,14 +6185,24 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     // state would be a second difference from a fresh search.
     const bool teamTreeMode = !options.background && options.teamTreeReuse
         && searchTime_.is_durative();
+    // Wave 2c, fix 3 (PlanCarry): the same rule, and with fix 1 off the
+    // retained root goes too (as reset_search_state drops it), so the only
+    // thing this search inherits is the carried plan.
+    const bool planCarryMode = !options.background && options.planCarry
+        && searchTime_.is_durative();
     if (!options.background) {
         lastTeamTreeReuse_ = {};
-        if (teamTreeMode) {
+        lastPlanCarry_ = {};
+        if (teamTreeMode || planCarryMode) {
             mateContinuations_.clear();
             nextRootCandidates_.clear();
             lastSearchHash_ = 0;
-        } else if (teamTree_) {
+        }
+        if (!teamTreeMode && teamTree_) {
             drop_team_tree(false);
+        }
+        if (planCarryMode && !teamTreeMode && rootNode) {
+            discard(std::move(rootNode), false);
         }
     }
     searchStatus_ = adjudicate_game(board, teamSide, searchTime_);
@@ -6293,6 +6304,14 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         }
     }
 
+    // Fix 3: which carried moves this root mixes in. The workers' copy of
+    // the search config carries them; a fresh root mixes and promotes at its
+    // expansion, an adopted one below.
+    SearchParams::RuntimeConfig workerConfig = options.search;
+    if (planCarryMode) {
+        resolve_plans(board, teamSide, options.planCarryPermille, workerConfig);
+    }
+
     if (reusedRoot) {
         // Reuse the existing subtree
         rootNode = reusedRoot;
@@ -6300,6 +6319,20 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         rootNode->set_depth(0);
         if (!options.background) {
             rootNode->refresh_root_noise(options.search);
+        }
+        if (planCarryMode) {
+            // Fix 3 on an expanded root: after the noise, before
+            // configure_root_search rescores the expanded edges.
+            for (int boardNumber : {BOARD_A, BOARD_B}) {
+                if (workerConfig.rootPlanMove[boardNumber] != Stockfish::MOVE_NONE
+                    && !rootNode->apply_root_plan(boardNumber,
+                                                  workerConfig.rootPlanMove[boardNumber],
+                                                  workerConfig.rootPlanWeight)) {
+                    lastPlanCarry_.applied[boardNumber] = false;
+                    lastPlanCarry_.reason[boardNumber] = "not a root action";
+                    workerConfig.rootPlanMove[boardNumber] = Stockfish::MOVE_NONE;
+                }
+            }
         }
         if (targetNodes > 0 && options.reusedVisitsCount) {
             const size_t held = static_cast<size_t>(
@@ -6337,6 +6370,27 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     }
     rootNode->configure_root_search(
         options.search, !mustPlayDespiteTeamMate);
+    if (planCarryMode && rootNode->is_expanded()) {
+        // Fix 3: configure_root_search rebuilt the frontier (and dropped any
+        // promotion), so the pair holding the carried move is promoted now.
+        rootNode->promote_carried_plan(workerConfig.rootPlanMove[BOARD_A],
+                                       workerConfig.rootPlanMove[BOARD_B]);
+    }
+    if (planCarryMode && options.verbose) {
+        const PlanCarryReport& carry = lastPlanCarry_;
+        for (int boardNumber : {BOARD_A, BOARD_B}) {
+            if (carry.move[boardNumber] == Stockfish::MOVE_NONE) {
+                continue;
+            }
+            cout << "info string Plan carry: " << (boardNumber == BOARD_A ? "A " : "B ")
+                 << board.uci_move(boardNumber, carry.move[boardNumber]);
+            if (carry.applied[boardNumber]) {
+                cout << " weight " << carry.weight << endl;
+            } else {
+                cout << " dropped (" << carry.reason[boardNumber] << ")" << endl;
+            }
+        }
+    }
 
     // Certifying the chosen move runs once the tree has stopped growing, so
     // its time comes off the front of the allocation rather than after it.
@@ -6399,7 +6453,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         SearchThread* st = searchThreads[i];
         st->set_root_node(rootNode);
         st->set_search_info(&searchInfo);
-        st->set_runtime_config(options.search);
+        st->set_runtime_config(workerConfig);
         st->set_verdict_team(options.verdictTeam.value_or(teamSide));
         st->set_inference_worker_index(i / engines.size());
         st->set_transposition_table(
@@ -8510,6 +8564,12 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     // guessed nothing: it is always stopped, and its index is the whole point.
     const bool missedPonder = options.isPonder && !options.background
         && stopRequested_.load(std::memory_order_acquire);
+    if (planCarryMode) {
+        // Fix 3: both slots are replaced by the chosen pair's halves on the
+        // boards our team is on turn on; whichever is played changes its
+        // board and is dropped at the next search.
+        record_plans_locked(board, teamSide, result, {true, true});
+    }
     if (teamTreeMode) {
         // Fix 1: the whole tree, whatever retainForReuse says (self-play
         // turns that off); the next search of this team looks in it for the
@@ -9435,6 +9495,9 @@ std::shared_ptr<Node> Agent::adopt_team_tree(Board& board, Stockfish::Color team
     report.reason = match.reason;
     report.clockDiffMs = match.clockDiffMs;
     report.boardMatches = match.boardMatches;
+    if (match.reason == "committed") {
+        report.committed = match.committed;
+    }
     std::shared_ptr<Node> adopted = match.node;
     std::shared_ptr<Node> oldRoot = teamTree_ ? std::move(teamTree_->root) : nullptr;
     teamTree_.reset();
@@ -9483,6 +9546,153 @@ void Agent::drop_team_tree(bool background) {
         discard(std::move(teamTree_->root), background);
     }
     teamTree_.reset();
+}
+
+namespace {
+
+/** The pieces of @p side in a sorted pocket string (white upper case). */
+std::string side_pocket(const std::string& pocket, Stockfish::Color side) {
+    std::string pieces;
+    for (char piece : pocket) {
+        if ((side == Stockfish::WHITE) == (std::isupper(static_cast<unsigned char>(piece)) != 0)) {
+            pieces.push_back(piece);
+        }
+    }
+    return pieces;
+}
+
+}  // namespace
+
+void Agent::clear_plans() {
+    std::unique_lock searchLock(searchMutex_);
+    plans_ = {};
+    lastPlanCarry_ = {};
+}
+
+void Agent::record_plans(Board& board, Stockfish::Color team, const JointActionCandidate& action,
+                         std::array<bool, 2> boards) {
+    std::unique_lock searchLock(searchMutex_);
+    record_plans_locked(board, team, action, boards);
+}
+
+/**
+ * @brief Fix 3: replace both slots. A slot gets the half of @p action on a
+ * board in @p boards where @p team is on turn and the half is a move (a
+ * pass is not carried: "decide later" needs no memory); every other slot is
+ * cleared. The edge's Q and visit share are kept for telemetry.
+ */
+void Agent::record_plans_locked(Board& board, Stockfish::Color team,
+                                const JointActionCandidate& action, std::array<bool, 2> boards) {
+    std::vector<RootEdgeStats> edges = root_edge_stats();
+    int total = 0;
+    const RootEdgeStats* chosen = nullptr;
+    for (const RootEdgeStats& edge : edges) {
+        total += std::max(0, edge.visits);
+        if (edge.action.same_moves(action)) {
+            chosen = &edge;
+        }
+    }
+    for (int boardNumber : {BOARD_A, BOARD_B}) {
+        CarriedPlan& slot = plans_[boardNumber];
+        slot = {};
+        const Stockfish::Move half = boardNumber == BOARD_A ? action.moveA : action.moveB;
+        const Stockfish::Color ours = boardNumber == BOARD_A ? team : ~team;
+        if (!boards[boardNumber] || half == Stockfish::MOVE_NONE
+            || board.side_to_move(boardNumber) != ours) {
+            continue;
+        }
+        slot.board = boardNumber;
+        slot.move = half;
+        slot.fen = board.fen(boardNumber);
+        slot.team = team;
+        if (chosen) {
+            slot.edgeQ = chosen->q;
+            slot.edgeVisitShare = total > 0
+                ? static_cast<float>(std::max(0, chosen->visits)) / static_cast<float>(total)
+                : 0.0f;
+        }
+    }
+}
+
+/**
+ * @brief Fix 3 at the start of a search: which slots this root mixes in.
+ *
+ * A slot left empty by the last search takes fix 1's `committed` refusal
+ * as its source when that commitment is one of our seats' (fix 2's plan
+ * for it; the slot written at the end of the last search wins). A slot
+ * applies when it is this team's, our team is on turn on its board, the
+ * board shows its position, side to move, castling and en passant, our
+ * seat's pocket holds at least what it held, and the move is one of this
+ * root's actions there (legal and not a held-back drop, leaf_board_actions):
+ * otherwise the mix would weight an action that does not exist. Anything
+ * else drops the slot, so a half that was played (its board changed) is
+ * never carried. The valid moves and the weight go into @p config.
+ */
+void Agent::resolve_plans(Board& board, Stockfish::Color team, int permille,
+                          SearchParams::RuntimeConfig& config) {
+    PlanCarryReport& report = lastPlanCarry_;
+    report = {};
+    report.attempted = true;
+    report.weight = static_cast<float>(std::clamp(permille, 0, 1000)) / 1000.0f;
+    const TeamTreeReuseReport& reuse = lastTeamTreeReuse_;
+    if (reuse.attempted && reuse.reason == "committed") {
+        for (int boardNumber : {BOARD_A, BOARD_B}) {
+            const Stockfish::Color ours = boardNumber == BOARD_A ? team : ~team;
+            const Stockfish::Move committed = reuse.committed[TimeState::seat_of(boardNumber, ours)];
+            CarriedPlan& slot = plans_[boardNumber];
+            if (slot.move != Stockfish::MOVE_NONE || committed == Stockfish::MOVE_NONE) {
+                continue;
+            }
+            // The refused node had the live boards: the plan was made here.
+            slot = {};
+            slot.board = boardNumber;
+            slot.move = committed;
+            slot.fen = board.fen(boardNumber);
+            slot.team = team;
+            report.fromTree[boardNumber] = true;
+        }
+    }
+    const LeafTurn turn = leaf_turn(board, team, searchTime_);
+    for (int boardNumber : {BOARD_A, BOARD_B}) {
+        CarriedPlan& slot = plans_[boardNumber];
+        report.move[boardNumber] = slot.move;
+        if (slot.move == Stockfish::MOVE_NONE) {
+            continue;
+        }
+        const Stockfish::Color ours = boardNumber == BOARD_A ? team : ~team;
+        const char* reason = nullptr;
+        if (slot.team != team || slot.board != boardNumber) {
+            reason = "other team";
+        } else if (board.side_to_move(boardNumber) != ours) {
+            reason = "not on turn";
+        } else {
+            const FenParts then = split_fen(slot.fen);
+            const FenParts now = split_fen(board.fen(boardNumber));
+            if (then.position != now.position) {
+                reason = "board changed";
+            } else if (!pocket_within(side_pocket(then.pocket, ours),
+                                      side_pocket(now.pocket, ours))) {
+                reason = "pocket";
+            } else if (!board.is_legal_move(boardNumber, slot.move)) {
+                reason = "illegal";
+            } else {
+                const std::vector<Stockfish::Move> actions = leaf_board_actions(
+                    board, boardNumber,
+                    boardNumber == BOARD_A ? turn.boardAOnTurn : turn.boardBOnTurn, searchTime_);
+                if (std::find(actions.begin(), actions.end(), slot.move) == actions.end()) {
+                    reason = "not a root action";
+                }
+            }
+        }
+        if (reason || report.weight <= 0.0f) {
+            report.reason[boardNumber] = reason ? reason : "weight 0";
+            slot = {};
+            continue;
+        }
+        report.applied[boardNumber] = true;
+        config.rootPlanMove[boardNumber] = slot.move;
+    }
+    config.rootPlanWeight = report.any_applied() ? report.weight : 0.0f;
 }
 
 int Agent::retain_played_line(const Board& board,
