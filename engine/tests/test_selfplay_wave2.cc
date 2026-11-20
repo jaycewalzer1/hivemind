@@ -265,5 +265,88 @@ TEST_F(SelfPlayWave2Test, TournamentPlaysSeatClockPairsWithTheSameOptions) {
     }
 }
 
+TEST_F(SelfPlayWave2Test, PlanCarryInSeatClockGames) {
+    // Wave 2c, fix 3 (spec v5 test 3.6): the half of a team's chosen action
+    // for its on-turn seat that is not deciding (in these games a sitting
+    // seat: a deciding seat's move is played, one in flight lands) is
+    // remembered, and that seat's next search applies it. Two games on the
+    // same agents also run the game-start clear (3.8).
+    // Passes are what leave a seat undecided, and the uniform net passes
+    // rarely: 6 games at 20 s give a few.
+    SelfPlayConfig config = wave2_config(6);
+    config.nodes = 64;
+    config.wave2.baseMix = {{20000, 1.0}};
+    config.wave2.planCarry = true;
+    testing::internal::CaptureStdout();
+    ASSERT_EQ(run_selfplay({engine.get()}, config), 0);
+    const std::string stdoutText = testing::internal::GetCapturedStdout();
+    const size_t at = stdoutText.find("selfplay plan carry: ");
+    ASSERT_NE(at, std::string::npos) << stdoutText;
+    const std::string line = stdoutText.substr(at, stdoutText.find('\n', at) - at);
+    std::istringstream summary(line);
+    std::string word;
+    for (int skip = 0; skip < 3; ++skip) {
+        summary >> word;   // "selfplay plan carry:"
+    }
+    uint64_t recorded = 0, applied = 0, searches = 0;
+    summary >> recorded >> word >> applied >> word >> word >> searches;
+    EXPECT_GT(recorded, 0u) << line;
+    EXPECT_GT(applied, 0u) << line;
+    EXPECT_GE(searches, applied) << line;
+    // One agent per team that never changes team: no plan of the other team.
+    EXPECT_EQ(line.find("other team"), std::string::npos) << line;
+    EXPECT_NE(stdoutText.find("selfplay complete 6 games"), std::string::npos);
+}
+
+TEST_F(SelfPlayWave2Test, PlanCarryNeedsDurativeSeatClocks) {
+    Wave2GameOptions options;
+    options.planCarry = true;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    options.durativeTree = true;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    options.baseMix = {{4000, 1.0}};
+    EXPECT_NO_THROW(options.validate());
+    options.planCarryPermille = 1001;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    Wave2GameOptions parsed;
+    EXPECT_TRUE(parse_wave2_option("--plan-carry", "true", parsed));
+    EXPECT_TRUE(parse_wave2_option("--plan-carry-permille", "450", parsed));
+    EXPECT_TRUE(parsed.planCarry);
+    EXPECT_EQ(parsed.planCarryPermille, 450);
+    EXPECT_TRUE(parsed.changes_search());
+    // The preset sets the three switches and leaves the knobs.
+    Wave2GameOptions preset;
+    EXPECT_TRUE(parse_wave2_option("--continuity", "true", preset));
+    EXPECT_TRUE(preset.teamTreeReuse && preset.jointPlans && preset.planCarry);
+    EXPECT_EQ(preset.planCarryPermille, 300);
+    EXPECT_TRUE(parse_wave2_option("--continuity", "false", preset));
+    EXPECT_FALSE(preset.teamTreeReuse || preset.jointPlans || preset.planCarry);
+}
+
+TEST_F(SelfPlayWave2Test, TournamentWithContinuity) {
+    // Spec v5 3.8: contender and baseline swap teams between the pair's two
+    // games; each game starts with both agents' trees and plans cleared.
+    TournamentConfig config;
+    config.games = 2;
+    config.nodes = 32;
+    config.maxMacroPlies = 400;
+    config.contenderBatchSize = 1;
+    config.baselineBatchSize = 1;
+    config.seed = 9;
+    config.outputDirectory = output;
+    config.clockModel = true;
+    config.clock.moveTimeMinMs = 200;
+    config.clock.moveTimeMaxMs = 2000;
+    config.wave2 = wave2_config(1).wave2;
+    config.wave2.teamTreeReuse = true;
+    config.wave2.jointPlans = true;
+    config.wave2.planCarry = true;
+    config.wave2.validate();
+    testing::internal::CaptureStdout();
+    ASSERT_EQ(run_tournament(engine.get(), engine.get(), "uniform-a", "uniform-b", config), 0);
+    const std::string stdoutText = testing::internal::GetCapturedStdout();
+    EXPECT_NE(stdoutText.find("tournament game 2/2"), std::string::npos) << stdoutText;
+}
+
 }  // namespace
 #endif
