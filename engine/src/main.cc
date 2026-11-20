@@ -154,6 +154,9 @@ void printUsage(const char* progName) {
     cout << "    --team-tree-reuse <bool> (each team keeps its tree between decisions and adopts the" << endl;
     cout << "      node the game reached, re-timed; self-play tops the root up to its budget)" << endl;
     cout << "    --team-tree-reuse-tolerance-ms <0..5000> (largest clock difference adopted; default 250)" << endl;
+    cout << "    --joint-plans <bool> (below the root a team that acts plans its other on-turn seat's" << endl;
+    cout << "      move in the same joint action; needs --durative-tree true only)" << endl;
+    cout << "    --joint-plan-free-permille <0..1000> (prior share of decide-later; default 500)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;

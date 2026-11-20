@@ -54,6 +54,11 @@ struct Wave2GameOptions {
     // Seat-clock games with the durative tree only.
     bool teamTreeReuse = false;
     int32_t teamTreeReuseToleranceMs = 250;
+    // Wave 2c, fix 2 (UCI JointPlans): below the root a team that acts plans
+    // its other on-turn seat's move in the same joint action, with this prior
+    // share of "decide later". Durative tree only; inside each search.
+    bool jointPlans = false;
+    int32_t jointPlanFreePermille = 500;
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
@@ -61,7 +66,8 @@ struct Wave2GameOptions {
     bool changes_search() const {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
             || mateRaceByLanding || passCapK != 8 || teamTreeReuse
-            || teamTreeReuseToleranceMs != 250;
+            || teamTreeReuseToleranceMs != 250 || jointPlans
+            || jointPlanFreePermille != 500;
     }
 
     void validate() const {
@@ -70,6 +76,12 @@ struct Wave2GameOptions {
         }
         if (teamTreeReuseToleranceMs < 0 || teamTreeReuseToleranceMs > 5000) {
             throw std::invalid_argument("--team-tree-reuse-tolerance-ms must be in 0..5000");
+        }
+        if (jointPlanFreePermille < 0 || jointPlanFreePermille > 1000) {
+            throw std::invalid_argument("--joint-plan-free-permille must be in 0..1000");
+        }
+        if (jointPlans && !durativeTree) {
+            throw std::invalid_argument("--joint-plans needs --durative-tree true");
         }
         if (teamTreeReuse && (!durativeTree || baseMix.empty())) {
             throw std::invalid_argument(
@@ -93,6 +105,8 @@ struct Wave2GameOptions {
         config.instantTransfer = instantTransfer;
         config.mateRaceByLanding = mateRaceByLanding;
         config.passCapK = passCapK;
+        config.jointPlans = jointPlans;
+        config.jointPlanFreePermille = jointPlanFreePermille;
         return config;
     }
 };
@@ -140,6 +154,8 @@ inline bool parse_wave2_option(const std::string& option, const std::string& val
     else if (option == "--pace-ema-alpha") options.paceEmaAlpha = std::stod(value);
     else if (option == "--team-tree-reuse") options.teamTreeReuse = boolean();
     else if (option == "--team-tree-reuse-tolerance-ms") options.teamTreeReuseToleranceMs = std::stoi(value);
+    else if (option == "--joint-plans") options.jointPlans = boolean();
+    else if (option == "--joint-plan-free-permille") options.jointPlanFreePermille = std::stoi(value);
     else return false;
     return true;
 }
