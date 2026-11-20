@@ -62,6 +62,12 @@ struct DurativeConfig {
     // Pieces that landed in pockets in the last RECENT_LANDING_WINDOW_MS
     // (UCI SeatArrivalsMs); unused slots have seat -1.
     std::array<SeatLanding, MAX_RECENT_LANDINGS> recentLandings{};
+    // Wave 2c, fix 2 (UCI JointPlans): below the root, a team that acts
+    // also plans its other on-turn seat's move in the same joint action.
+    bool jointPlans = false;
+    // Fix 2 (UCI JointPlanFreePermille): the prior share of "decide later"
+    // (no plan) for the planned seat.
+    int32_t jointPlanFreePermille = 500;
 };
 
 /**
@@ -208,6 +214,9 @@ public:
             ? config.rootMoveTimeMs : base.moveTimeMs_[rootTeam];
         d.rootMoveMs = std::max<int32_t>(1, rootMs);
         d.passCapK = std::clamp<int32_t>(config.passCapK, 1, 64);
+        d.jointPlans = config.jointPlans;
+        d.jointPlanFreePermille = static_cast<int16_t>(
+            std::clamp<int32_t>(config.jointPlanFreePermille, 0, 1000));
         for (int board = 0; board < 2; ++board) {
             const int seat = seat_of(board, d.side[board]);
             if (team_of_seat(seat) == rootTeam) {
@@ -404,10 +413,18 @@ public:
      *        action is dated back that far. A team that does not act here
      *        only waits: nothing moves. With FlagLoss, a clock that runs out
      *        on the way ends the game (outcome()).
+     * @param plannedA, plannedB Fix 2 (JointPlans): the move planned for
+     *        the acting team's seat on that board, on turn there but not
+     *        ready (planned_boards()); MOVE_NONE = no plan. It is not made
+     *        now: it becomes the seat's committed move and lands at the
+     *        seat's ready time, which it does not change. A seat that acts
+     *        clears its commitment (it acts with the committed move).
      */
     void advance_action(Stockfish::Color actingTeam, bool movedA, bool movedB,
                         Stockfish::PieceType handA = Stockfish::NO_PIECE_TYPE,
-                        Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE) {
+                        Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE,
+                        Stockfish::Move plannedA = Stockfish::MOVE_NONE,
+                        Stockfish::Move plannedB = Stockfish::MOVE_NONE) {
         Durative& d = durative_;
         const Turn turn = turn_at_node();
         const bool actA = turn.acts[BOARD_A_IDX]
@@ -489,10 +506,26 @@ public:
             const int seat = turn.seat[board];
             early[board] = std::max(0, d.earlyMs[seat]);
             d.earlyMs[seat] = -1;
+            // A committed seat acts with its committed move: it has landed.
+            d.committed[seat] = Stockfish::MOVE_NONE;
             if (d.sitting[seat]) {
                 // A seat back from a pass decides anew: every piece that
                 // landed in its pocket meanwhile is its to drop.
                 d.pending[seat] = {};
+            }
+        }
+        if (d.jointPlans) {
+            // Fix 2: a planned half is stored, not made. Only a seat of the
+            // acting team that is on turn, not acting here and not already
+            // committed takes one (planned_boards()).
+            const Stockfish::Move planned[2] = {plannedA, plannedB};
+            for (int board = 0; board < 2; ++board) {
+                const int seat = turn.seat[board];
+                if (planned[board] != Stockfish::MOVE_NONE && !acts[board]
+                    && team_of_seat(seat) == actingTeam
+                    && d.committed[seat] == Stockfish::MOVE_NONE) {
+                    d.committed[seat] = planned[board];
+                }
             }
         }
         const Stockfish::PieceType hand[2] = {handA, handB};
@@ -558,6 +591,17 @@ public:
             }
         }
         for (int board = 0; board < 2; ++board) {
+            // Fix 2: a sitting seat with a committed move beside this pass
+            // waited for a landing here that does not come: its pass, and
+            // so its landing, runs on to its own cap (as below), and the
+            // passing seat then wakes after that landing.
+            const int other = seat_of(1 - board, d.side[1 - board]);
+            if (passed[board] && !acts[1 - board] && d.sitting[other]
+                && d.committed[other] != Stockfish::MOVE_NONE) {
+                d.readyMs[other] = std::max(d.readyMs[other], d.capReadyMs[other]);
+            }
+        }
+        for (int board = 0; board < 2; ++board) {
             if (!passed[board]) {
                 continue;
             }
@@ -570,7 +614,10 @@ public:
             cap = std::clamp<int64_t>(cap, 1, MAX_LEAD_MS);
             d.capReadyMs[seat] = static_cast<int32_t>(cap);
             int64_t wait = cap;
-            if (!passed[1 - board] && !d.sitting[other]) {
+            // A committed seat lands at its ready time even while sitting:
+            // it counts as deciding (fix 2).
+            if (!passed[1 - board]
+                && (!d.sitting[other] || d.committed[other] != Stockfish::MOVE_NONE)) {
                 wait = std::min<int64_t>(wait, static_cast<int64_t>(d.readyMs[other]) + 1);
             }
             d.readyMs[seat] = static_cast<int32_t>(std::max<int64_t>(wait, 1));
@@ -595,7 +642,10 @@ public:
             // arena adjudicates this sit-off as a draw.
             const int nowA = seat_of(BOARD_A_IDX, d.side[BOARD_A_IDX]);
             const int nowB = seat_of(BOARD_B_IDX, d.side[BOARD_B_IDX]);
+            // A committed seat (fix 2) is certain to land: not a sitter here.
             if (d.outcome == Outcome::NONE && d.sitting[nowA] && d.sitting[nowB]
+                && d.committed[nowA] == Stockfish::MOVE_NONE
+                && d.committed[nowB] == Stockfish::MOVE_NONE
                 && team_of_seat(nowA) != team_of_seat(nowB)
                 && d.clockMs[nowA] == d.clockMs[nowB]) {
                 d.outcome = Outcome::DRAW;
@@ -606,10 +656,64 @@ public:
     /** The state after @p actingTeam's action; see advance_action(). */
     TimeState after_action(Stockfish::Color actingTeam, bool movedA, bool movedB,
                            Stockfish::PieceType handA = Stockfish::NO_PIECE_TYPE,
-                           Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE) const {
+                           Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE,
+                           Stockfish::Move plannedA = Stockfish::MOVE_NONE,
+                           Stockfish::Move plannedB = Stockfish::MOVE_NONE) const {
         TimeState next = *this;
-        next.advance_action(actingTeam, movedA, movedB, handA, handB);
+        next.advance_action(actingTeam, movedA, movedB, handA, handB, plannedA, plannedB);
         return next;
+    }
+
+    /** Fix 2: whether this durative state plans partner moves (JointPlans). */
+    bool joint_plans() const { return durative_.active && durative_.jointPlans; }
+
+    /** Fix 2: the prior share of "decide later" at a planning node (0..1). */
+    float joint_plan_free_share() const {
+        return static_cast<float>(durative_.jointPlanFreePermille) / 1000.0f;
+    }
+
+    /**
+     * @brief Fix 2: the boards on which @p team, acting at this node, plans
+     * a move for its seat instead of deciding now: the seat is on turn, is
+     * not ready (does not act here) and has no committed move. At most one,
+     * since the team acts on the other board. None outside a durative
+     * state, at the root, with JointPlans off, or where @p team only waits.
+     */
+    std::array<bool, 2> planned_boards(Stockfish::Color team) const {
+        std::array<bool, 2> planned{false, false};
+        const Durative& d = durative_;
+        if (!d.active || !d.jointPlans || d.atRoot || d.outcome != Outcome::NONE) {
+            return planned;
+        }
+        const Turn turn = turn_at_node();
+        const bool actsA = turn.acts[BOARD_A_IDX] && team_of_seat(turn.seat[BOARD_A_IDX]) == team;
+        const bool actsB = turn.acts[BOARD_B_IDX] && team_of_seat(turn.seat[BOARD_B_IDX]) == team;
+        if (actsA == actsB) {
+            // Both boards act (nothing to plan) or the team only waits.
+            return planned;
+        }
+        const int board = actsA ? BOARD_B_IDX : BOARD_A_IDX;
+        const int seat = turn.seat[board];
+        planned[board] = team_of_seat(seat) == team
+            && d.committed[seat] == Stockfish::MOVE_NONE;
+        return planned;
+    }
+
+    /**
+     * @brief Fix 2: the move @p seat committed to at a planning node, which
+     * lands at its ready time; MOVE_NONE when it has none.
+     */
+    Stockfish::Move committed_move(int seat) const {
+        return durative_.active ? durative_.committed[seat] : Stockfish::MOVE_NONE;
+    }
+
+    /** Fix 2: whether any seat has a committed move. */
+    bool has_committed() const {
+        if (!durative_.active) {
+            return false;
+        }
+        return std::any_of(durative_.committed.begin(), durative_.committed.end(),
+                           [](Stockfish::Move move) { return move != Stockfish::MOVE_NONE; });
     }
 
     /**
@@ -846,6 +950,14 @@ private:
         bool timing = false;
         std::array<int32_t, 2> sinceLandMs{0, 0};
         std::array<SeatLanding, MAX_RECENT_LANDINGS> landings{};
+        // Wave 2c, fix 2 (DurativeConfig::jointPlans; else all default): the
+        // move each seat committed to at a planning node, landing at its
+        // ready time; MOVE_NONE = none. The free share is a prior knob of
+        // planning nodes and not part of the key.
+        bool jointPlans = false;
+        int16_t jointPlanFreePermille = 500;
+        std::array<Stockfish::Move, 4> committed{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE,
+                                                 Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
 
         bool operator==(const Durative&) const = default;
 
@@ -886,6 +998,14 @@ private:
                     mix((uint64_t(static_cast<uint8_t>(landing.seat)) << 40)
                         | (uint64_t(static_cast<uint8_t>(landing.type)) << 32)
                         | static_cast<uint32_t>(landing.agoMs));
+                }
+            }
+            if (jointPlans) {
+                // Only a planning tree keys on commitments; with fix 2 off
+                // the keys are exactly v4's.
+                mix(0x4a4f494e54ULL);
+                for (int seat = 0; seat < 4; ++seat) {
+                    mix((uint64_t(seat) << 32) | static_cast<uint32_t>(committed[seat]));
                 }
             }
             return h;
@@ -938,10 +1058,13 @@ private:
         for (int board = 0; board < 2; ++board) {
             const int seat = turn.seat[board];
             const int other = turn.seat[1 - board];
+            // A committed sitting seat (fix 2) lands its move: it is no
+            // sitter that could outwait this one.
             if (turn.acts[board] && !turn.acts[1 - board]
                 && team_of_seat(seat) == team
                 && team_of_seat(other) != team
                 && d.sitting[other]
+                && d.committed[other] == Stockfish::MOVE_NONE
                 && d.clockMs[seat] < d.clockMs[other]) {
                 return true;
             }

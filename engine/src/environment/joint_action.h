@@ -188,6 +188,13 @@ struct JointActionCandidate {
     float jointPrior;              // P(a|s) = P_A(a_A|s) * P_B(a_B|s)
     float expansionPriority;       // Candidate ordering (same as jointPrior)
     float gumbelScore;              // Root-only log-prior plus independent Gumbel noise
+    // Wave 2c, fix 2 (JointPlans): the move planned for the acting team's
+    // seat that is on turn but not ready, on the node's planned board
+    // (Node::planned_board()). It is not made now: moveA/moveB stay the
+    // halves applied on the board, and that board's field is MOVE_NONE.
+    // MOVE_NONE = no plan ("decide later"), always outside a planning node.
+    // It sits in the padding after gumbelScore, so the size is unchanged.
+    Stockfish::Move planned;
     size_t idxA;                   // Index in sorted actionsA
     size_t idxB;                   // Index in sorted actionsB
 
@@ -195,6 +202,7 @@ struct JointActionCandidate {
         : moveA(Stockfish::MOVE_NONE), moveB(Stockfish::MOVE_NONE),
           priorA(0.0f), priorB(0.0f), jointPrior(0.0f), expansionPriority(0.0f),
           gumbelScore(-std::numeric_limits<float>::infinity()),
+          planned(Stockfish::MOVE_NONE),
           idxA(0), idxB(0) {}
 
     JointActionCandidate(Stockfish::Move mA, float pA, size_t iA,
@@ -204,6 +212,7 @@ struct JointActionCandidate {
                          bool moveBIsCapture = false)
         : moveA(mA), moveB(mB),
           priorA(pA), priorB(pB),
+          planned(Stockfish::MOVE_NONE),
           idxA(iA), idxB(iB) {
 
         jointPrior = is_joint_action_legal(
@@ -218,7 +227,20 @@ struct JointActionCandidate {
     bool operator<(const JointActionCandidate& other) const {
         return expansionPriority < other.expansionPriority;
     }
+
+    /**
+     * @brief Whether @p other is the same action: both applied halves and
+     * the planned half (fix 2). Every lookup of a below-root action by its
+     * moves goes through this; outside a planning node `planned` is always
+     * MOVE_NONE and it is the old (moveA, moveB) comparison.
+     */
+    bool same_moves(const JointActionCandidate& other) const {
+        return moveA == other.moveA && moveB == other.moveB && planned == other.planned;
+    }
 };
+
+// Fix 2 keeps the candidate at 48 bytes: `planned` fills the padding.
+static_assert(sizeof(JointActionCandidate) == 48, "JointActionCandidate grew");
 
 /**
  * @brief Lazy priority queue generator for joint action candidates.
@@ -243,6 +265,11 @@ private:
     std::vector<uint8_t> sortedCapturesB;
     std::vector<float> sortedJointFactorsA;
     std::vector<float> sortedJointFactorsB;
+    // Fix 2 (JointPlans): per action, on the planned board the pocket piece
+    // type a supplied drop needs (0 = none), on the other board the type its
+    // capture sends to the partner (0 = none). Empty without a planned board.
+    std::vector<uint8_t> sortedHandTypesA;
+    std::vector<uint8_t> sortedHandTypesB;
     // Max-heap for lazy generation
     std::priority_queue<JointActionCandidate> heap;
     
@@ -266,7 +293,50 @@ private:
     
     // Turn, time and pass context used to reject illegal joint actions
     JointActionRules rules;
+    // Fix 2: the board whose list holds planned moves (its entries go into
+    // JointActionCandidate::planned), -1 = none. In the padding after rules.
+    int8_t plannedBoard = -1;
     float legalPriorMass = 0.0f;
+
+    /**
+     * The candidate for one index pair. On a planned board the entry goes
+     * into `planned` and the board's move stays MOVE_NONE, so the pass rules
+     * see that board as not acting, as without planning. A planned drop
+     * that needs a supplied piece is legal only beside a half that captures
+     * that type (jointPrior -1 otherwise).
+     */
+    JointActionCandidate makeCandidate(size_t idxA, size_t idxB) const {
+        Stockfish::Move moveA = sortedActionsA[idxA];
+        Stockfish::Move moveB = sortedActionsB[idxB];
+        Stockfish::Move planned = Stockfish::MOVE_NONE;
+        if (plannedBoard == 0) {
+            planned = moveA;
+            moveA = Stockfish::MOVE_NONE;
+        } else if (plannedBoard == 1) {
+            planned = moveB;
+            moveB = Stockfish::MOVE_NONE;
+        }
+        JointActionCandidate candidate(
+            moveA, sortedPriorsA[idxA], idxA,
+            moveB, sortedPriorsB[idxB], idxB,
+            rules, sortedCapturesA[idxA] != 0, sortedCapturesB[idxB] != 0);
+        candidate.planned = planned;
+        if (plannedBoard >= 0 && candidate.jointPrior >= 0.0f) {
+            const uint8_t needed = plannedBoard == 0
+                ? handTypeAt(sortedHandTypesA, idxA) : handTypeAt(sortedHandTypesB, idxB);
+            const uint8_t supplied = plannedBoard == 0
+                ? handTypeAt(sortedHandTypesB, idxB) : handTypeAt(sortedHandTypesA, idxA);
+            if (needed != 0 && needed != supplied) {
+                candidate.jointPrior = -1.0f;
+                candidate.expansionPriority = -1.0f;
+            }
+        }
+        return candidate;
+    }
+
+    static uint8_t handTypeAt(const std::vector<uint8_t>& types, size_t index) {
+        return index < types.size() ? types[index] : uint8_t{0};
+    }
 
     void pushCandidate(size_t idxA, size_t idxB) {
         if (idxA >= sortedActionsA.size() || idxB >= sortedActionsB.size()) {
@@ -285,13 +355,7 @@ private:
         }
         
         // Create candidate to check if it's valid
-        JointActionCandidate candidate(
-            sortedActionsA[idxA], sortedPriorsA[idxA], idxA,
-            sortedActionsB[idxB], sortedPriorsB[idxB], idxB,
-            rules,
-            sortedCapturesA[idxA] != 0,
-            sortedCapturesB[idxB] != 0
-        );
+        const JointActionCandidate candidate = makeCandidate(idxA, idxB);
         
         // Only push valid candidates (jointPrior >= 0)
         if (candidate.jointPrior >= 0.0f) {
@@ -335,7 +399,13 @@ private:
                            const std::vector<uint8_t>& capturesA,
                            const std::vector<Stockfish::Move>& actionsB,
                            const std::vector<float>& priorsB,
-                           const std::vector<uint8_t>& capturesB) const {
+                           const std::vector<uint8_t>& capturesB,
+                           const std::vector<uint8_t>& handTypesA = {},
+                           const std::vector<uint8_t>& handTypesB = {}) const {
+        if (plannedBoard >= 0) {
+            return planned_legal_prior_mass(actionsA, priorsA, capturesA, handTypesA,
+                                            actionsB, priorsB, capturesB, handTypesB);
+        }
         auto categoryMass = [](const auto& actions, const auto& priors, const auto& captures) {
             std::array<double, 3> mass{};
             for (size_t i = 0; i < actions.size(); ++i) {
@@ -361,6 +431,58 @@ private:
     }
 
     /**
+     * Fix 2: legal_prior_mass at a planning node. Every planned entry counts
+     * as that board's MOVE_NONE for the pass rules, and a planned drop that
+     * needs a type is legal only beside a half that supplies it, so the
+     * immediate board sums by (sit/quiet/capture, supplied type) and the
+     * planned board by needed type: at most 3 x 6 x 6 products.
+     */
+    float planned_legal_prior_mass(const std::vector<Stockfish::Move>& actionsA,
+                                   const std::vector<float>& priorsA,
+                                   const std::vector<uint8_t>& capturesA,
+                                   const std::vector<uint8_t>& handTypesA,
+                                   const std::vector<Stockfish::Move>& actionsB,
+                                   const std::vector<float>& priorsB,
+                                   const std::vector<uint8_t>& capturesB,
+                                   const std::vector<uint8_t>& handTypesB) const {
+        constexpr int TYPES = 6;
+        const bool plannedA = plannedBoard == 0;
+        const auto& immediateActions = plannedA ? actionsB : actionsA;
+        const auto& immediatePriors = plannedA ? priorsB : priorsA;
+        const auto& immediateCaptures = plannedA ? capturesB : capturesA;
+        const auto& supplied = plannedA ? handTypesB : handTypesA;
+        const auto& plannedPriors = plannedA ? priorsA : priorsB;
+        const auto& needed = plannedA ? handTypesA : handTypesB;
+        std::array<std::array<double, TYPES>, 3> immediateMass{};
+        for (size_t i = 0; i < immediateActions.size() && i < immediatePriors.size(); ++i) {
+            const int category = immediateActions[i] == Stockfish::MOVE_NONE ? 0
+                : i < immediateCaptures.size() && immediateCaptures[i] ? 2 : 1;
+            const int type = std::min<int>(handTypeAt(supplied, i), TYPES - 1);
+            immediateMass[category][type] += immediatePriors[i];
+        }
+        std::array<double, TYPES> plannedMass{};
+        for (size_t i = 0; i < plannedPriors.size(); ++i) {
+            plannedMass[std::min<int>(handTypeAt(needed, i), TYPES - 1)] += plannedPriors[i];
+        }
+        double legalMass = 0.0;
+        for (int category = 0; category < 3; ++category) {
+            const Stockfish::Move immediate = category ? Stockfish::Move(1) : Stockfish::MOVE_NONE;
+            const bool legal = plannedA
+                ? is_joint_action_legal(rules, Stockfish::MOVE_NONE, immediate, false, category == 2)
+                : is_joint_action_legal(rules, immediate, Stockfish::MOVE_NONE, category == 2, false);
+            if (!legal) {
+                continue;
+            }
+            for (int type = 0; type < TYPES; ++type) {
+                // No need, or the need this half supplies.
+                legalMass += immediateMass[category][type]
+                    * (plannedMass[0] + (type > 0 ? plannedMass[type] : 0.0));
+            }
+        }
+        return static_cast<float>(legalMass);
+    }
+
+    /**
      * Re-sort one board's lists by its (re-noised) priors. Expanded candidates
      * keep their moves and follow them to their new indices.
      */
@@ -368,6 +490,7 @@ private:
                      std::vector<float>& priors,
                      std::vector<uint8_t>& captures,
                      std::vector<float>& jointFactors,
+                     std::vector<uint8_t>& handTypes,
                      bool boardA) {
         std::vector<size_t> order(actions.size());
         std::iota(order.begin(), order.end(), 0);
@@ -392,6 +515,7 @@ private:
         permute(actions, 1);
         permute(priors, 1);
         permute(captures, 1);
+        permute(handTypes, 1);
         permute(jointFactors, jointFactorRank);
         for (JointActionCandidate& candidate : generatedCandidates) {
             size_t& index = boardA ? candidate.idxA : candidate.idxB;
@@ -449,11 +573,7 @@ private:
         float originalMass = 0.0f;
         for (size_t indexA = 0; indexA < countA; ++indexA) {
             for (size_t indexB = 0; indexB < countB; ++indexB) {
-                JointActionCandidate candidate(
-                    sortedActionsA[indexA], sortedPriorsA[indexA], indexA,
-                    sortedActionsB[indexB], sortedPriorsB[indexB], indexB,
-                    rules, sortedCapturesA[indexA] != 0,
-                    sortedCapturesB[indexB] != 0);
+                JointActionCandidate candidate = makeCandidate(indexA, indexB);
                 if (candidate.jointPrior < 0.0f) {
                     continue;
                 }
@@ -518,14 +638,25 @@ public:
     // factorized legal total also applies after rescoring that prefix.
     float legal_prior_mass() const { return legalPriorMass; }
 
-    bool promote(Stockfish::Move moveA, Stockfish::Move moveB) {
+    /**
+     * @brief Expand the action (@p moveA, @p moveB, @p planned) next. At a
+     * planning node the planned board's entry is looked up by @p planned
+     * (its move field must be MOVE_NONE); elsewhere @p planned must be
+     * MOVE_NONE.
+     */
+    bool promote(Stockfish::Move moveA, Stockfish::Move moveB,
+                 Stockfish::Move planned = Stockfish::MOVE_NONE) {
         if (promotedCandidate) {
             return false;
         }
+        if (plannedBoard < 0 ? planned != Stockfish::MOVE_NONE
+                             : (plannedBoard == 0 ? moveA : moveB) != Stockfish::MOVE_NONE) {
+            return false;
+        }
         const auto foundA = std::find(
-            sortedActionsA.begin(), sortedActionsA.end(), moveA);
+            sortedActionsA.begin(), sortedActionsA.end(), plannedBoard == 0 ? planned : moveA);
         const auto foundB = std::find(
-            sortedActionsB.begin(), sortedActionsB.end(), moveB);
+            sortedActionsB.begin(), sortedActionsB.end(), plannedBoard == 1 ? planned : moveB);
         if (foundA == sortedActionsA.end() || foundB == sortedActionsB.end()) {
             return false;
         }
@@ -542,11 +673,7 @@ public:
             return false;
         }
 
-        JointActionCandidate candidate(
-            moveA, sortedPriorsA[idxA], idxA,
-            moveB, sortedPriorsB[idxB], idxB,
-            rules, sortedCapturesA[idxA] != 0,
-            sortedCapturesB[idxB] != 0);
+        const JointActionCandidate candidate = makeCandidate(idxA, idxB);
         if (candidate.jointPrior < 0.0f) {
             return false;
         }
@@ -640,7 +767,10 @@ public:
                     const std::vector<float>& jointFactorsB = {},
                     size_t jointFactorRank = 0,
                     size_t jointPolicyTopK = 8,
-                    float jointResidualScale = 1.0f) {
+                    float jointResidualScale = 1.0f,
+                    int plannedBoardIndex = -1,
+                    const std::vector<uint8_t>& handTypesA = {},
+                    const std::vector<uint8_t>& handTypesB = {}) {
         // Clear previous state
         sortedActionsA.clear();
         sortedActionsB.clear();
@@ -650,6 +780,8 @@ public:
         sortedCapturesB.clear();
         sortedJointFactorsA.clear();
         sortedJointFactorsB.clear();
+        sortedHandTypesA.clear();
+        sortedHandTypesB.clear();
         while (!heap.empty()) heap.pop();
         visited.clear();
         generatedCandidates.clear();
@@ -674,8 +806,12 @@ public:
         };
         rules.boardACanMove = isAOnTurn && hasRealMove(actionsA);
         rules.boardBCanMove = isBOnTurn && hasRealMove(actionsB);
+        // Fix 2: a planned board is never one the team acts on now.
+        plannedBoard = plannedBoardIndex == 0 && !isAOnTurn ? 0
+            : plannedBoardIndex == 1 && !isBOnTurn ? 1 : -1;
         legalPriorMass = legal_prior_mass(
-            actionsA, priorsA, capturesA, actionsB, priorsB, capturesB);
+            actionsA, priorsA, capturesA, actionsB, priorsB, capturesB,
+            handTypesA, handTypesB);
 
         if (actionsA.empty() || actionsB.empty()) {
             return;
@@ -705,6 +841,9 @@ public:
             sortedActionsA.push_back(actionsA[idx]);
             sortedPriorsA.push_back(priorsA[idx]);
             sortedCapturesA.push_back(captureAt(capturesA, idx));
+            if (plannedBoard >= 0) {
+                sortedHandTypesA.push_back(handTypeAt(handTypesA, idx));
+            }
             if (jointFactorRank > 0 &&
                 jointFactorsA.size() == actionsA.size() * jointFactorRank) {
                 sortedJointFactorsA.insert(
@@ -721,6 +860,9 @@ public:
             sortedActionsB.push_back(actionsB[idx]);
             sortedPriorsB.push_back(priorsB[idx]);
             sortedCapturesB.push_back(captureAt(capturesB, idx));
+            if (plannedBoard >= 0) {
+                sortedHandTypesB.push_back(handTypeAt(handTypesB, idx));
+            }
             if (jointFactorRank > 0 &&
                 jointFactorsB.size() == actionsB.size() * jointFactorRank) {
                 sortedJointFactorsB.insert(
@@ -761,12 +903,13 @@ public:
         mix_dirichlet_noise(sortedPriorsA, alpha, epsilon, seedA);
         mix_dirichlet_noise(sortedPriorsB, alpha, epsilon, seedB);
         resortBoard(sortedActionsA, sortedPriorsA, sortedCapturesA,
-                    sortedJointFactorsA, true);
+                    sortedJointFactorsA, sortedHandTypesA, true);
         resortBoard(sortedActionsB, sortedPriorsB, sortedCapturesB,
-                    sortedJointFactorsB, false);
+                    sortedJointFactorsB, sortedHandTypesB, false);
         legalPriorMass = legal_prior_mass(
             sortedActionsA, sortedPriorsA, sortedCapturesA,
-            sortedActionsB, sortedPriorsB, sortedCapturesB);
+            sortedActionsB, sortedPriorsB, sortedCapturesB,
+            sortedHandTypesA, sortedHandTypesB);
     }
 
     /**
@@ -966,6 +1109,9 @@ public:
 
     /** The turn and pass rules initialize() was given. */
     const JointActionRules& actionRules() const { return rules; }
+
+    /** Fix 2: the board whose entries are planned moves, -1 = none. */
+    int planned_board() const { return plannedBoard; }
 
     /**
      * @brief Get total possible candidates (N * M).
