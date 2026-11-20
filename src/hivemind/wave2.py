@@ -15,6 +15,15 @@ The engine's wave 2 options (docs/wave2_training.md has the exact contract):
                        at the drawn base (then the usual lead odds apply)
   --seat-move-times    each seat draws its own move time, not each team
 
+Wave 2c (talisman docs/custom_engine_spec_v5_continuity.md), off by default:
+
+  --team-tree-reuse    each team keeps its search tree between its decisions
+                       and adopts the node the game reached, re-timed to the
+                       real clocks (UCI TeamTreeReuse); needs the durative
+                       tree and a base mix
+  --team-tree-reuse-tolerance-ms
+                       largest clock difference a node may have (0..5000)
+
 Every option's stock value reproduces v3.0.3, so `STOCK` is the engine with
 none of them. `WAVE2` is the setting the arena and self-play send.
 """
@@ -56,10 +65,17 @@ class Options:
     pass_cap_k: int = 8
     base_mix: tuple = ()
     seat_move_times: bool = False
+    team_tree_reuse: bool = False
+    team_tree_reuse_tolerance_ms: int = 250
 
     def __post_init__(self):
         if not 1 <= self.pass_cap_k <= 64:
             raise ValueError("pass_cap_k must be in 1..64")
+        if not 0 <= self.team_tree_reuse_tolerance_ms <= 5000:
+            raise ValueError("team_tree_reuse_tolerance_ms must be in 0..5000")
+        if self.team_tree_reuse and not (self.durative_tree and self.base_mix):
+            # The engine refuses it too: it acts on durative seat-clock games only.
+            raise ValueError("team_tree_reuse needs durative_tree and a base_mix")
         if self.flag_loss and not self.base_mix:
             # Without seat clocks nothing can flag: the option would do nothing.
             raise ValueError("flag_loss needs a base_mix (real seat clocks)")
@@ -102,7 +118,7 @@ WAVE2 = Options(durative_tree=True, sit_gate=False, flag_loss=True, instant_tran
 
 # The engine flags rl-loop overrides, by Options field.
 BOOLEAN_FIELDS = ("durative_tree", "sit_gate", "flag_loss", "instant_transfer", "mate_race_by_landing",
-                  "seat_move_times")
+                  "seat_move_times", "team_tree_reuse")
 
 
 def from_args(args):
@@ -118,6 +134,8 @@ def from_args(args):
         changes["pass_cap_k"] = args.pass_cap_k
     if getattr(args, "base_mix", None) is not None:
         changes["base_mix"] = parse_base_mix(args.base_mix)
+    if getattr(args, "team_tree_reuse_tolerance_ms", None) is not None:
+        changes["team_tree_reuse_tolerance_ms"] = args.team_tree_reuse_tolerance_ms
     return replace(base, **changes)
 
 
@@ -133,6 +151,8 @@ def add_arguments(parser):
         group.add_argument("--" + name.replace("_", "-"), choices=("true", "false"), default=None)
     group.add_argument("--pass-cap-k", type=int, default=None)
     group.add_argument("--base-mix", default=None, help="MS:WEIGHT,... or off")
+    group.add_argument("--team-tree-reuse-tolerance-ms", type=int, default=None,
+                       help="Wave 2c: largest clock difference --team-tree-reuse adopts (default 250)")
 
 
 def missing_engine_options(options, engine_help):

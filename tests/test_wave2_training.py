@@ -69,6 +69,32 @@ def test_bad_base_mix_is_refused(text):
         wave2.parse_base_mix(text)
 
 
+def test_team_tree_reuse_options():
+    """Wave 2c fix 1: off by default (stock and the WAVE2 preset send nothing
+    new), on top of the preset it sends its flags, and it needs the durative
+    tree on seat clocks."""
+    assert not wave2.STOCK.team_tree_reuse and not wave2.WAVE2.team_tree_reuse
+    assert "--team-tree-reuse" not in wave2.WAVE2.engine_args()
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    options = wave2.from_args(parser.parse_args(["--wave2", "--team-tree-reuse", "true",
+                                                 "--team-tree-reuse-tolerance-ms", "1000"]))
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--team-tree-reuse"] == "true"
+    assert pairs["--team-tree-reuse-tolerance-ms"] == "1000"
+    only_reuse = wave2.from_args(parser.parse_args(["--wave2", "--team-tree-reuse", "true"]))
+    assert "--team-tree-reuse-tolerance-ms" not in only_reuse.engine_args()
+    with pytest.raises(ValueError):
+        wave2.Options(team_tree_reuse=True)
+    with pytest.raises(ValueError):
+        wave2.Options(durative_tree=True, team_tree_reuse=True)
+    with pytest.raises(ValueError):
+        wave2.replace(wave2.WAVE2, team_tree_reuse_tolerance_ms=5001)
+    assert wave2.missing_engine_options(options, "--durative-tree --sit-gate --flag-loss "
+                                        "--instant-transfer --base-mix --seat-move-times") == [
+        "--team-tree-reuse", "--team-tree-reuse-tolerance-ms"]
+
+
 def test_missing_options_are_read_off_the_engine_help():
     assert wave2.missing_engine_options(wave2.WAVE2, "--durative-tree --sit-gate --flag-loss") == [
         "--instant-transfer", "--base-mix", "--seat-move-times"]
