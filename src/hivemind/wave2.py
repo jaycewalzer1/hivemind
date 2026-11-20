@@ -23,6 +23,19 @@ Wave 2c (talisman docs/custom_engine_spec_v5_continuity.md), off by default:
                        tree and a base mix
   --team-tree-reuse-tolerance-ms
                        largest clock difference a node may have (0..5000)
+  --joint-plans        below the root a team that acts plans its other
+                       on-turn seat's move in the same joint action (UCI
+                       JointPlans); needs the durative tree
+  --joint-plan-free-permille
+                       prior share of "decide later" (0..1000)
+  --plan-carry         the half of a team's chosen action for its on-turn
+                       seat that is not deciding is mixed into that seat's
+                       next search (UCI PlanCarry); needs the durative tree
+                       and a base mix
+  --plan-carry-permille
+                       prior weight of the carried move (0..1000)
+  --continuity         rl-loop only: the three switches above at once (the
+                       engine gets the three flags)
 
 Every option's stock value reproduces v3.0.3, so `STOCK` is the engine with
 none of them. `WAVE2` is the setting the arena and self-play send.
@@ -69,6 +82,8 @@ class Options:
     team_tree_reuse_tolerance_ms: int = 250
     joint_plans: bool = False
     joint_plan_free_permille: int = 500
+    plan_carry: bool = False
+    plan_carry_permille: int = 300
 
     def __post_init__(self):
         if not 1 <= self.pass_cap_k <= 64:
@@ -77,6 +92,12 @@ class Options:
             raise ValueError("team_tree_reuse_tolerance_ms must be in 0..5000")
         if not 0 <= self.joint_plan_free_permille <= 1000:
             raise ValueError("joint_plan_free_permille must be in 0..1000")
+        if not 0 <= self.plan_carry_permille <= 1000:
+            raise ValueError("plan_carry_permille must be in 0..1000")
+        if self.plan_carry and not (self.durative_tree and self.base_mix):
+            # The engine refuses it too: only seat-clock games play one seat's
+            # half and keep the agent until the partner decides.
+            raise ValueError("plan_carry needs durative_tree and a base_mix")
         if self.joint_plans and not self.durative_tree:
             # Fix 2 acts inside each durative search; the engine refuses it otherwise.
             raise ValueError("joint_plans needs durative_tree")
@@ -125,7 +146,9 @@ WAVE2 = Options(durative_tree=True, sit_gate=False, flag_loss=True, instant_tran
 
 # The engine flags rl-loop overrides, by Options field.
 BOOLEAN_FIELDS = ("durative_tree", "sit_gate", "flag_loss", "instant_transfer", "mate_race_by_landing",
-                  "seat_move_times", "team_tree_reuse", "joint_plans")
+                  "seat_move_times", "team_tree_reuse", "joint_plans", "plan_carry")
+# Wave 2c: what --continuity switches on (an explicit switch still overrides it).
+CONTINUITY_FIELDS = ("team_tree_reuse", "joint_plans", "plan_carry")
 
 
 def from_args(args):
@@ -133,6 +156,8 @@ def from_args(args):
     wave 2 preset with --wave2, else stock, then each explicit override."""
     base = WAVE2 if getattr(args, "wave2", False) else STOCK
     changes = {}
+    if getattr(args, "continuity", False):
+        changes.update({name: True for name in CONTINUITY_FIELDS})
     for name in BOOLEAN_FIELDS:
         value = getattr(args, name, None)
         if value is not None:
@@ -145,6 +170,8 @@ def from_args(args):
         changes["team_tree_reuse_tolerance_ms"] = args.team_tree_reuse_tolerance_ms
     if getattr(args, "joint_plan_free_permille", None) is not None:
         changes["joint_plan_free_permille"] = args.joint_plan_free_permille
+    if getattr(args, "plan_carry_permille", None) is not None:
+        changes["plan_carry_permille"] = args.plan_carry_permille
     return replace(base, **changes)
 
 
@@ -164,6 +191,11 @@ def add_arguments(parser):
                        help="Wave 2c: largest clock difference --team-tree-reuse adopts (default 250)")
     group.add_argument("--joint-plan-free-permille", type=int, default=None,
                        help="Wave 2c: prior share of decide-later under --joint-plans (default 500)")
+    group.add_argument("--plan-carry-permille", type=int, default=None,
+                       help="Wave 2c: prior weight of the carried move under --plan-carry (default 300)")
+    group.add_argument("--continuity", action="store_true",
+                       help="Wave 2c: --team-tree-reuse, --joint-plans and --plan-carry true at once "
+                            "(an explicit switch overrides it)")
 
 
 def missing_engine_options(options, engine_help):

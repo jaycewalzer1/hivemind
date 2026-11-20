@@ -120,6 +120,65 @@ def test_joint_plans_options():
         "--joint-plans", "--joint-plan-free-permille"]
 
 
+def test_plan_carry_options():
+    """Wave 2c fix 3: off by default (stock and WAVE2 send nothing new), on
+    top of the preset it sends its flags, and like fix 1 it needs the
+    durative tree on seat clocks."""
+    assert not wave2.STOCK.plan_carry and not wave2.WAVE2.plan_carry
+    assert "--plan-carry" not in wave2.WAVE2.engine_args()
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    options = wave2.from_args(parser.parse_args(["--wave2", "--plan-carry", "true",
+                                                 "--plan-carry-permille", "450"]))
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--plan-carry"] == "true"
+    assert pairs["--plan-carry-permille"] == "450"
+    only_carry = wave2.from_args(parser.parse_args(["--wave2", "--plan-carry", "true"]))
+    assert "--plan-carry-permille" not in only_carry.engine_args()
+    with pytest.raises(ValueError):
+        wave2.Options(plan_carry=True)
+    with pytest.raises(ValueError):
+        wave2.Options(durative_tree=True, plan_carry=True)
+    with pytest.raises(ValueError):
+        wave2.replace(wave2.WAVE2, plan_carry_permille=1001)
+    assert wave2.missing_engine_options(options, "--durative-tree --sit-gate --flag-loss "
+                                        "--instant-transfer --base-mix --seat-move-times") == [
+        "--plan-carry", "--plan-carry-permille"]
+
+
+def test_continuity_sets_the_three_switches():
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    options = wave2.from_args(parser.parse_args(["--wave2", "--continuity"]))
+    assert options.team_tree_reuse and options.joint_plans and options.plan_carry
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--team-tree-reuse"] == pairs["--joint-plans"] == pairs["--plan-carry"] == "true"
+    # The knobs keep their defaults, so they are not sent.
+    assert not {"--team-tree-reuse-tolerance-ms", "--joint-plan-free-permille",
+                "--plan-carry-permille"} & set(options.engine_args())
+    # An explicit switch overrides the preset.
+    ablation = wave2.from_args(parser.parse_args(["--wave2", "--continuity", "--joint-plans", "false"]))
+    assert ablation.team_tree_reuse and ablation.plan_carry and not ablation.joint_plans
+    assert wave2.from_args(parser.parse_args(["--wave2"])) == wave2.WAVE2
+
+
+def test_continuity_flags_are_in_the_engine_help():
+    """missing_engine_options is empty against the built engine's --help (spec v5 5.2)."""
+    import shutil
+    import subprocess
+
+    engine = Path(__file__).resolve().parents[1] / "engine" / "build-ninja" / "hivemind"
+    if not engine.is_file() and shutil.which("hivemind") is None:
+        pytest.skip("no built engine")
+    text = subprocess.run([str(engine), "--help"], capture_output=True, text=True, timeout=60).stdout
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    every = wave2.from_args(parser.parse_args([
+        "--wave2", "--continuity", "--team-tree-reuse-tolerance-ms", "1000",
+        "--joint-plan-free-permille", "300", "--plan-carry-permille", "450"]))
+    assert wave2.missing_engine_options(every, text) == []
+
+
 def test_missing_options_are_read_off_the_engine_help():
     assert wave2.missing_engine_options(wave2.WAVE2, "--durative-tree --sit-gate --flag-loss") == [
         "--instant-transfer", "--base-mix", "--seat-move-times"]
