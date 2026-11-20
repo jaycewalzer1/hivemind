@@ -720,6 +720,50 @@ TEST_F(TeamTreeReuse, SelfPlayNoiseRefreshes) {
     EXPECT_EQ(AgentContinuityPeer::root(agent), expected);
 }
 
+TEST_F(TeamTreeReuse, OldRootReadoptedWithoutASecondNoiseMix) {
+    // Review fix: when no move landed since the last search (the partner
+    // decides while our move is in flight), the old root itself is the
+    // match. Its priors already hold that search's root noise: it is adopted
+    // (oldRoot) but not re-noised, so the noise share stays what the
+    // settings say instead of compounding with each re-adoption.
+    Board root;
+    root.set(std::string(kSmallWhite) + " | " + kSmallBlack);
+    Clocks clocks;
+    const TimeState t0 = live_clock(root, WHITE, clocks);
+    SearchOptions noisy = options(t0, 200, true);
+    noisy.search.rootDirichletAlpha = 0.3f;
+    noisy.search.rootDirichletEpsilon = 0.25f;
+    noisy.search.rootNoiseSeed = 11;
+    Agent agent(1);
+    search(agent, root, WHITE, noisy);
+    const std::shared_ptr<Node> oldRoot = AgentContinuityPeer::root(agent);
+    ASSERT_TRUE(oldRoot);
+    const auto priorsA = oldRoot->board_priors(BOARD_A);
+    const auto priorsB = oldRoot->board_priors(BOARD_B);
+    // The partner's decision 1 ms later, same boards, a new noise seed.
+    clocks.clocks[AW] -= 1;
+    clocks.clocks[BB] -= 1;
+    SearchOptions again = noisy;
+    again.clock = live_clock(root, WHITE, clocks);
+    again.search.rootNoiseSeed = 12;
+    search(agent, root, WHITE, again);
+    const TeamTreeReuseReport& reuse = agent.team_tree_reuse();
+    ASSERT_TRUE(reuse.adopted) << reuse.reason;
+    EXPECT_TRUE(reuse.oldRoot);
+    EXPECT_EQ(AgentContinuityPeer::root(agent), oldRoot);
+    for (const auto& [before, boardNumber] :
+         {std::pair{priorsA, BOARD_A}, std::pair{priorsB, BOARD_B}}) {
+        const auto after = oldRoot->board_priors(boardNumber);
+        ASSERT_EQ(after.size(), before.size());
+        for (size_t i = 0; i < after.size(); ++i) {
+            EXPECT_EQ(after[i].first, before[i].first);
+            EXPECT_FLOAT_EQ(after[i].second, before[i].second);
+        }
+    }
+    // A node below an old root never had root noise: adopted after a
+    // landing, it gets it (1.11, SelfPlayNoiseRefreshes), and is no oldRoot.
+}
+
 // ---- 1.12 --------------------------------------------------------------------
 
 TEST_F(TeamTreeReuse, FourWorkersAfterAdoption) {

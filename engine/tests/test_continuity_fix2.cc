@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -1012,6 +1013,127 @@ TEST_F(JointPlansSearch, TeamTreeReuseRefusesCommittedCandidate) {
                   }
               });
     EXPECT_GT(opponentCommitted, 0);
+}
+
+TEST_F(JointPlansSearch, CommittedRefusalCarriesTheMostVisitedPlan) {
+    // Review fix: among `committed` refusals at the live boards, fix 1
+    // reports the one with the most visits, so the plan fix 3 carries is the
+    // line the search preferred, not the first sibling the walk reached
+    // (planned halves are not made on the path board, so pairs that differ
+    // only in the planned half all reach the same live boards).
+    Board board = boards(kSmallWhite, kSmallBlack);
+    Rules r;
+    r.freePermille = 0;  // planned pairs expanded early, several per A move
+    const TimeState time = aw_ready_bb_planned(r);
+    Agent agent(1);
+    search(agent, board, WHITE, options(time, 4000, true));
+    std::shared_ptr<Node> root = AgentContinuityFix2Peer::team_tree_root(agent);
+    ASSERT_TRUE(root);
+
+    // Every white node of the tree with our Bb committed, by live boards.
+    struct Candidate {
+        Node* node;
+        Board board;
+        TimeState time;
+        Stockfish::Move planned;
+        int visits;
+    };
+    std::map<std::string, std::vector<Candidate>> byBoards;
+    walk_tree(root.get(), board, time, [&](Node& node, Board& at, const TimeState& t) {
+        if (&node == root.get() || node.get_team_to_play() != WHITE || !node.is_expanded()
+            || node.get_node_type() != NodeType::UNSOLVED || t.committed_move(BB) == MOVE_NONE) {
+            return;
+        }
+        byBoards[at.fen(BOARD_A) + " | " + at.fen(BOARD_B)].push_back(
+            {&node, at, t, t.committed_move(BB), node.get_visits()});
+    });
+    int checked = 0;
+    for (auto& [fens, candidates] : byBoards) {
+        std::set<Stockfish::Move> plans;
+        for (const Candidate& c : candidates) {
+            plans.insert(c.planned);
+        }
+        if (plans.size() < 2) {
+            continue;
+        }
+        // The live root at the first candidate's clocks; a wide tolerance.
+        Board live(candidates.front().board);
+        Rules liveRules = r;
+        for (int seat = 0; seat < 4; ++seat) {
+            liveRules.clocks[seat] = candidates.front().time.seat_clock_ms(seat);
+        }
+        liveRules.elapsed = {0, 0, 0, 0};
+        const TimeState liveTime = durative_root(WHITE, live.side_to_move(BOARD_A),
+                                                 live.side_to_move(BOARD_B), liveRules);
+        // The expected plan: the most visited candidate the walk would rank
+        // `committed` (same turn state, within the tolerance); skip ties.
+        const Candidate* best = nullptr;
+        bool tie = false;
+        for (const Candidate& c : candidates) {
+            if (!c.time.same_turn_state(liveTime) || c.time.clock_distance(liveTime) > 5000) {
+                continue;
+            }
+            if (!best || c.visits > best->visits) {
+                best = &c;
+                tie = false;
+            } else if (c.visits == best->visits) {
+                tie = true;
+            }
+        }
+        if (!best || tie) {
+            continue;
+        }
+        const auto match = AgentContinuityFix2Peer::find(agent, live, WHITE, liveTime, 5000);
+        if (match.reason != "committed") {
+            continue;  // a node of a nearer rank was adopted or refused
+        }
+        ++checked;
+        EXPECT_EQ(match.committed[BB], best->planned)
+            << fens << ": " << candidates.size() << " committed nodes, best has "
+            << best->visits << " visits";
+    }
+    EXPECT_GT(checked, 0);
+}
+
+TEST_F(JointPlansSearch, PlannedPairsGetVisits) {
+    // Review fix (2.4a cannot tell the trees apart): planned pairs are not
+    // only generated but searched. With "decide later" at its default half
+    // of the prior, a white planning node's planned edges together hold a
+    // real share of its visits, and some line below the root runs through a
+    // planned edge and on to that half's forced landing.
+    Board board = boards(kSmallWhite, kSmallBlack);
+    const TimeState time = aw_ready_bb_planned(Rules{});
+    Agent agent(1);
+    search(agent, board, WHITE, options(time, 3000));
+    std::shared_ptr<Node> root = AgentContinuityFix2Peer::root(agent);
+    ASSERT_TRUE(root);
+    ASSERT_EQ(root->planned_board(), BOARD_B);
+    int plannedVisits = 0;
+    int totalVisits = 0;
+    const std::vector<int> visits = root->get_child_visits();
+    for (size_t i = 0; i < visits.size(); ++i) {
+        totalVisits += visits[i];
+        if (root->get_joint_action(static_cast<int>(i)).planned != MOVE_NONE) {
+            plannedVisits += visits[i];
+        }
+    }
+    ASSERT_GT(totalVisits, 0);
+    // A prior bug that starves planned pairs (planned_legal_prior_mass, the
+    // free share) leaves them a handful of exploratory visits at most.
+    EXPECT_GT(plannedVisits * 10, totalVisits) << plannedVisits << " of " << totalVisits;
+    // Visited forced landings: nodes where Bb lands its committed move.
+    int visitedLandings = 0;
+    walk_tree(root.get(), board, time, [&](Node& node, Board& at, const TimeState& t) {
+        if (node.get_visits() < 2 || !node.is_expanded()) {
+            return;
+        }
+        const Stockfish::Color team = node.get_team_to_play();
+        if (team == WHITE && t.acting_boards(WHITE)[BOARD_B]
+            && t.committed_move(TimeState::seat_of(BOARD_B, at.side_to_move(BOARD_B))) != MOVE_NONE) {
+            ++visitedLandings;
+        }
+    });
+    EXPECT_GT(visitedLandings, 0);
 }
 
 // ---- 2.4a, 2.4b: coordination with a real network --------------------------

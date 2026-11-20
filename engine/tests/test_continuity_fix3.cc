@@ -688,6 +688,108 @@ TEST_F(PlanCarry, CommittedRefusalBecomesThePlanWhenTheSlotIsEmpty) {
     }
 }
 
+// ---- review fixes: proven returns, missed ponders ------------------------------
+
+TEST_F(PlanCarry, ProvenMateRecordsItsPairAndKeepsTheTree) {
+    // A root proof returns before the end of the search (return_proven_mate,
+    // return_proven_loss): it still records the pair it returns and keeps
+    // the tree, so the partner's next search does not carry an older plan.
+    // White mates on A (Ra8#); white's Bb is on turn on B.
+    Board board = make_board("6k1/5ppp/8/8/8/8/8/R5K1[] w - - 0 1", kOursB);
+    const Stockfish::Move stale = uci_move(board, BOARD_B, "a7a6");
+    Agent agent(1);
+    AgentContinuityFix3Peer::plans(agent)[BOARD_B] = plan_for(board, BOARD_B, stale);
+    SearchOptions opts = options(live_clock(board, WHITE, Clocks{}), 400, true, true);
+    opts.search.enableRootMateSearch = true;
+    JointActionCandidate chosen;
+    search(agent, board, WHITE, opts, &chosen);
+    ASSERT_EQ(agent.root_type(), NodeType::WIN);
+    ASSERT_EQ(board.uci_move(BOARD_A, chosen.moveA), "a1a8");
+    // Both slots are the returned pair's halves (a pass records nothing).
+    EXPECT_EQ(agent.carried_plans()[BOARD_A].move, chosen.moveA);
+    EXPECT_EQ(agent.carried_plans()[BOARD_B].move, chosen.moveB);
+    EXPECT_NE(agent.carried_plans()[BOARD_B].move, stale);
+    // The proof's tree is this team's retained tree.
+    EXPECT_TRUE(agent.has_team_tree());
+    EXPECT_EQ(AgentContinuityFix3Peer::team_tree_root(agent), AgentContinuityFix3Peer::root(agent));
+}
+
+TEST_F(PlanCarry, OldRootGetsNoSecondPlanMix) {
+    // Fix 1 re-adopts the old root when no move landed since (the partner
+    // decides while our move is in flight). Its priors already hold that
+    // search's plan mix; the carried halves are not mixed in again on top
+    // ("old root"), and no pair is promoted for them.
+    Board board = make_board(kOursA, kOursB);
+    Clocks clocks;
+    Agent agent(1);
+    AgentContinuityFix3Peer::plans(agent)[BOARD_B] =
+        plan_for(board, BOARD_B, uci_move(board, BOARD_B, "a7a6"));
+    search(agent, board, WHITE, options(live_clock(board, WHITE, clocks), 200, true, true));
+    ASSERT_TRUE(agent.plan_carry().applied[BOARD_B]) << agent.plan_carry().reason[BOARD_B];
+    const std::shared_ptr<Node> oldRoot = AgentContinuityFix3Peer::root(agent);
+    ASSERT_TRUE(oldRoot);
+    const auto priorsA = oldRoot->board_priors(BOARD_A);
+    const auto priorsB = oldRoot->board_priors(BOARD_B);
+    // The search recorded its own pair: at least one half to carry.
+    ASSERT_TRUE(agent.carried_plans()[BOARD_A].move != MOVE_NONE
+                || agent.carried_plans()[BOARD_B].move != MOVE_NONE);
+    clocks.clocks[AW] -= 1;
+    clocks.clocks[BB] -= 1;
+    search(agent, board, WHITE, options(live_clock(board, WHITE, clocks), 64, true, true));
+    ASSERT_TRUE(agent.team_tree_reuse().adopted) << agent.team_tree_reuse().reason;
+    ASSERT_TRUE(agent.team_tree_reuse().oldRoot);
+    EXPECT_FALSE(agent.plan_carry().any_applied());
+    for (int boardNumber : {BOARD_A, BOARD_B}) {
+        if (agent.plan_carry().move[boardNumber] != MOVE_NONE) {
+            EXPECT_EQ(agent.plan_carry().reason[boardNumber], "old root");
+        }
+    }
+    for (const auto& [before, boardNumber] :
+         {std::pair{priorsA, BOARD_A}, std::pair{priorsB, BOARD_B}}) {
+        const auto after = oldRoot->board_priors(boardNumber);
+        ASSERT_EQ(after.size(), before.size());
+        for (size_t i = 0; i < after.size(); ++i) {
+            EXPECT_EQ(after[i].first, before[i].first);
+            EXPECT_FLOAT_EQ(after[i].second, before[i].second);
+        }
+    }
+}
+
+TEST_F(PlanCarry, MissedPonderKeepsTheRealPlan) {
+    // A ponder that is stopped guessed the reply wrong: as its team tree,
+    // its pair is not recorded, so the real decision's carried half (slot B
+    // here) survives it, and no half of the guess is remembered (slot A).
+    Board board = make_board(kOursA, kOursB);
+    const Stockfish::Move real = uci_move(board, BOARD_B, "a7a6");
+    Agent agent(1);
+    AgentContinuityFix3Peer::plans(agent)[BOARD_B] = plan_for(board, BOARD_B, real);
+    SearchOptions opts = options(live_clock(board, WHITE, Clocks{}), 0, true, true);
+    opts.isPonder = true;
+    testing::internal::CaptureStdout();
+    std::thread ponder([&] { agent.run_search(board, {engine.get()}, WHITE, false, opts); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!agent.is_running() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    agent.set_is_running(false);
+    ponder.join();
+    testing::internal::GetCapturedStdout();
+    ASSERT_TRUE(agent.plan_carry().applied[BOARD_B]) << agent.plan_carry().reason[BOARD_B];
+    EXPECT_EQ(agent.carried_plans()[BOARD_B].move, real);
+    EXPECT_EQ(agent.carried_plans()[BOARD_B].edgeVisitShare, 0.0f);
+    EXPECT_EQ(agent.carried_plans()[BOARD_A].move, MOVE_NONE);
+    EXPECT_FALSE(agent.has_team_tree());
+
+    // The same search not pondering records its pair over the planted slot.
+    Agent decided(1);
+    AgentContinuityFix3Peer::plans(decided)[BOARD_B] = plan_for(board, BOARD_B, real);
+    search(decided, board, WHITE, options(live_clock(board, WHITE, Clocks{}), 64, true, true));
+    EXPECT_GT(decided.carried_plans()[BOARD_A].edgeVisitShare
+                  + decided.carried_plans()[BOARD_B].edgeVisitShare, 0.0f);
+    EXPECT_TRUE(decided.has_team_tree());
+}
+
 // ---- 3.5, 3.8 (agent level) ----------------------------------------------------
 
 TEST_F(PlanCarry, ClearedByClearPlansNotByResetSearchState) {

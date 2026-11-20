@@ -107,11 +107,14 @@ struct SearchOptions {
  * (no node of the tree has the live boards), "clock" (the closest has
  * clocks beyond the tolerance), "shape" (it would act on other boards, or
  * sits or holds pieces back differently), "committed" (fix 2), "solved"
- * (unexpanded or proven), "no tree" (nothing retained).
+ * (unexpanded or proven), "no tree" (nothing retained). `oldRoot`: the
+ * adopted node is the old root itself (no move landed since the last
+ * search), whose priors already hold that search's noise and plan mix.
  */
 struct TeamTreeReuseReport {
     bool attempted = false;
     bool adopted = false;
+    bool oldRoot = false;
     std::string reason;
     // The adopted root's visits after re-timing; edges cleared by it.
     int visits = 0;
@@ -145,8 +148,10 @@ struct CarriedPlan {
  * move (MOVE_NONE: no plan), whether it was mixed into the root's priors,
  * and if not why: "other team", "not on turn", "board changed", "pocket"
  * (our seat's pocket lost a piece), "illegal", "not a root action" (legal
- * but held back, InstantTransfer off). `fromTree`: the slot was filled from
- * fix 1's `committed` refusal (fix 2's plan for that seat).
+ * but held back, InstantTransfer off), "old root" (fix 1 re-adopted the
+ * last search's root, whose priors already hold its plan mix). `fromTree`:
+ * the slot was filled from fix 1's `committed` refusal (fix 2's plan for
+ * that seat).
  */
 struct PlanCarryReport {
     bool attempted = false;
@@ -391,6 +396,8 @@ private:
         int clockDiffMs = -1;
         std::string reason = "no node";
         int boardMatches = 0;
+        // The node is the stored tree's root (no move landed since).
+        bool oldRoot = false;
         // Fix 2: when the furthest refusal was `committed`, that node's
         // commitments per seat (fix 3 reads our seats' as the tree's plan).
         std::array<Stockfish::Move, 4> committed{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE,
@@ -541,6 +548,8 @@ public:
     const PlanCarryReport& plan_carry() const { return lastPlanCarry_; }
     /** Fix 3: the remembered halves, one slot per board. */
     const std::array<CarriedPlan, 2>& carried_plans() const { return plans_; }
+    /** Fix 1: whether a team tree is retained for the next search. */
+    bool has_team_tree() const { return teamTree_.has_value(); }
     /** Fix 3: forget both remembered halves (ucinewgame, a new game). */
     void clear_plans();
     /**

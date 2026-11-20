@@ -6317,10 +6317,23 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         rootNode = reusedRoot;
         rootNode->set_hash(positionHash);
         rootNode->set_depth(0);
-        if (!options.background) {
+        // Fix 1 on the old root itself (no move landed since): its priors
+        // already hold that search's noise and plan mix, applied once; a
+        // second mix would compound them. Its own visits carry the pair it
+        // chose, which is the plan its partner seat would carry.
+        const bool oldTeamRoot = teamTreeMode && lastTeamTreeReuse_.oldRoot;
+        if (!options.background && !oldTeamRoot) {
             rootNode->refresh_root_noise(options.search);
         }
-        if (planCarryMode) {
+        if (planCarryMode && oldTeamRoot) {
+            for (int boardNumber : {BOARD_A, BOARD_B}) {
+                if (workerConfig.rootPlanMove[boardNumber] != Stockfish::MOVE_NONE) {
+                    lastPlanCarry_.applied[boardNumber] = false;
+                    lastPlanCarry_.reason[boardNumber] = "old root";
+                    workerConfig.rootPlanMove[boardNumber] = Stockfish::MOVE_NONE;
+                }
+            }
+        } else if (planCarryMode) {
             // Fix 3 on an expanded root: after the noise, before
             // configure_root_search rescores the expanded edges.
             for (int boardNumber : {BOARD_A, BOARD_B}) {
@@ -7533,6 +7546,37 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                     chrono::steady_clock::now() - searchStart).count());
     };
 
+    // Fix 1 and fix 3 after a search has chosen `result`, on every return
+    // that hands an action back, the proven ones included.
+    //
+    // A ponder that was stopped rather than hit guessed the reply wrong: its
+    // tree is dropped and its pair is not recorded, so the real decision's
+    // carried half survives it (record_plans_locked replaces both slots).
+    // Otherwise both slots take the chosen pair's halves on the boards our
+    // team is on turn on (whichever is played changes its board and is
+    // dropped at the next search), and the whole tree is kept, whatever
+    // retainForReuse says (self-play turns that off); the next search of this
+    // team looks in it for the node the game reaches.
+    const auto keep_continuity = [&] {
+        if (!planCarryMode && !teamTreeMode) {
+            return;
+        }
+        const bool missedPonder = options.isPonder
+            && stopRequested_.load(std::memory_order_acquire);
+        if (planCarryMode && !missedPonder) {
+            record_plans_locked(board, teamSide, result, {true, true});
+        }
+        if (teamTreeMode) {
+            nextRootCandidates_.clear();
+            lastSearchHash_ = 0;
+            if (missedPonder) {
+                drop_team_tree(false);
+            } else {
+                store_team_tree(board, teamSide);
+            }
+        }
+    };
+
     // Replace the tree with a synthetic one-edge root holding the proven
     // action, report it, and hand it back. The workers are concurrently
     // reading rootNode, and the probe thread polls the node they fill, so both
@@ -7596,6 +7640,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 cout << scanSummary << endl;
             }
         }
+        keep_continuity();
         return result;
     };
 
@@ -7737,6 +7782,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 cout << scanSummary << endl;
             }
         }
+        keep_continuity();
         return result;
     };
 
@@ -8564,23 +8610,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     // guessed nothing: it is always stopped, and its index is the whole point.
     const bool missedPonder = options.isPonder && !options.background
         && stopRequested_.load(std::memory_order_acquire);
-    if (planCarryMode) {
-        // Fix 3: both slots are replaced by the chosen pair's halves on the
-        // boards our team is on turn on; whichever is played changes its
-        // board and is dropped at the next search.
-        record_plans_locked(board, teamSide, result, {true, true});
-    }
+    keep_continuity();
     if (teamTreeMode) {
-        // Fix 1: the whole tree, whatever retainForReuse says (self-play
-        // turns that off); the next search of this team looks in it for the
-        // node the game reaches. A missed ponder guessed wrong: drop it.
-        nextRootCandidates_.clear();
-        lastSearchHash_ = 0;
-        if (missedPonder) {
-            drop_team_tree(false);
-        } else {
-            store_team_tree(board, teamSide);
-        }
+        // Fix 1 kept or dropped the whole tree above.
     } else if (SearchParams::ENABLE_TREE_REUSE && missedPonder) {
         nextRootCandidates_.clear();
         lastSearchHash_ = 0;
@@ -9224,6 +9256,15 @@ bool pocket_within(const std::string& part, const std::string& whole) {
  * difference wins, then the most visits. Depth-first with make/unmake; the
  * board test leaves only the played line and its wait nodes, so the caps
  * (TEAM_TREE_MAX_PLIES, TEAM_TREE_MAX_VISITED) rarely bind.
+ *
+ * The old root itself can match (no move landed since the last search: the
+ * partner decides while our move is in flight); match.oldRoot says so, since
+ * its priors already hold that search's root noise and plan mix and must not
+ * get them a second time (run_search). No node below it ever had either.
+ *
+ * Among refusals the one that got furthest is reported; between two that
+ * got as far, the one with more visits, so a `committed` refusal carries the
+ * plan of the line the search preferred, not of the first one walked.
  */
 Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color team,
                                                 const TimeState& live, int toleranceMs) {
@@ -9247,8 +9288,10 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
     // How far the best refusal got: solved < turn state < clock < expansion
     // < commitment (fix 2). A commitment is checked before the expansion key
     // (which holds it, so it never matches a live root) and outranks it: a
-    // board match refused only for its commitment reports `committed`.
+    // board match refused only for its commitment reports `committed`. Equal
+    // ranks go to the node with more visits.
     int bestRefusal = -1;
+    int bestRefusalVisits = -1;
     int bestClockDiff = std::numeric_limits<int>::max();
     int adoptedDiff = std::numeric_limits<int>::max();
     int adoptedVisits = -1;
@@ -9282,8 +9325,11 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
             reason = "shape";
         }
         if (reason) {
-            if (refusal > bestRefusal) {
+            const int visits = node->get_visits();
+            if (refusal > bestRefusal
+                || (refusal == bestRefusal && visits > bestRefusalVisits)) {
                 bestRefusal = refusal;
+                bestRefusalVisits = visits;
                 match.reason = reason;
                 for (int seat = 0; seat < 4; ++seat) {
                     match.committed[seat] = refusal == 4 ? time.committed_move(seat)
@@ -9297,6 +9343,7 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
             adoptedDiff = diff;
             adoptedVisits = visits;
             match.node = node->shared_from_this();
+            match.oldRoot = node == tree.root.get();
         }
     };
 
@@ -9507,6 +9554,7 @@ std::shared_ptr<Node> Agent::adopt_team_tree(Board& board, Stockfish::Color team
         // A proof found in the new search stops at its root.
         adopted->clear_parent_edges();
         report.adopted = true;
+        report.oldRoot = match.oldRoot;
         report.visits = adopted->get_visits();
         report.pruned = retimed.pruned;
         teamTreeWalked_ = std::move(retimed.walked);
