@@ -272,6 +272,14 @@ constexpr size_t TEAM_TREE_MAX_VISITED = 20000;
 constexpr size_t TEAM_TREE_MAX_RETAINED = TREE_REUSE_REINDEX_MAX_NODES;
 
 /**
+ * Wave 2c, fix 2 (JointPlans): the least prior a planned move gets when it
+ * mates on its board as it lands (the planned half's priors are read before
+ * the immediate half's capture reaches the pocket). The half is then
+ * renormalised; 0 ablates the raise.
+ */
+constexpr float JOINT_PLAN_MATE_PRIOR = 0.25f;
+
+/**
  * Permanent brain: keep searching between moves instead of sitting idle.
  *
  * Ponder only fires when the GUI sends "go ponder" for the exact predicted

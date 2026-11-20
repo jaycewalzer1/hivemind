@@ -1,6 +1,7 @@
 #include "search/searchthread.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -74,8 +75,15 @@ bool has_unavoidable_waiting_board_mate(Board& board,
     const bool weakestDefenderRight = teamToPlayHasTimeAdvantage
         && afterMateFollowingMove.can_sit(teamToPlay)
         && afterMateFollowingSit.can_sit(teamToPlay);
-    const std::vector<Stockfish::Move> matingMoves = immediate_mates_on_board(
+    std::vector<Stockfish::Move> matingMoves = immediate_mates_on_board(
         board, waitingBoard, teamToPlay, weakestDefenderRight);
+    // Fix 2: a seat with a committed move lands that move and no other, so
+    // it is credited only with a mate its commitment is.
+    const Stockfish::Move committed = time.committed_move(
+        TimeState::seat_of(waitingBoard, board.side_to_move(waitingBoard)));
+    if (committed != Stockfish::MOVE_NONE) {
+        std::erase_if(matingMoves, [committed](Stockfish::Move move) { return move != committed; });
+    }
     if (matingMoves.empty()) {
         return false;
     }
@@ -612,9 +620,154 @@ uint32_t durative_expansion_key(Board& board, Stockfish::Color team, const TimeS
         race |= uint64_t(last ? 1 + static_cast<int>(*last) : 0) << 16;
         mix(race);
     }
+    if (time.joint_plans()) {
+        // Fix 2: the planned board and every commitment (the forced halves
+        // of seats that land one here). Off, keys are fix 1's.
+        const std::array<bool, 2> planned = time.planned_boards(team);
+        mix(0x504c414eULL | (uint64_t(planned[BOARD_A]) << 32) | (uint64_t(planned[BOARD_B]) << 33));
+        for (int seat = 0; seat < 4; ++seat) {
+            mix((uint64_t(seat) << 32) | static_cast<uint32_t>(time.committed_move(seat)));
+        }
+    }
     const uint32_t key = static_cast<uint32_t>(h ^ (h >> 32));
     return key == 0 ? 1u : key;
 }
+
+TimeState durative_time_after(const TimeState& time, Board& board, Stockfish::Color team,
+                              const JointActionCandidate& action) {
+    Stockfish::Move plannedA = Stockfish::MOVE_NONE;
+    Stockfish::Move plannedB = Stockfish::MOVE_NONE;
+    if (action.planned != Stockfish::MOVE_NONE) {
+        // The node's path time names its planned board; the candidate
+        // carries only the move.
+        const std::array<bool, 2> planned = time.planned_boards(team);
+        if (planned[BOARD_A]) {
+            plannedA = action.planned;
+        } else if (planned[BOARD_B]) {
+            plannedB = action.planned;
+        }
+    }
+    return time.after_action(team, action.moveA != Stockfish::MOVE_NONE,
+                             action.moveB != Stockfish::MOVE_NONE,
+                             board.hand_piece_type(BOARD_A, action.moveA),
+                             board.hand_piece_type(BOARD_B, action.moveB),
+                             plannedA, plannedB);
+}
+
+PlannedHalf leaf_planned_half(Board& board, int plannedBoard, Stockfish::Color team,
+                              const TimeState& time, int immediateBoard,
+                              const vector<Stockfish::Move>& immediate) {
+    PlannedHalf half;
+    half.suppliedTypes.reserve(immediate.size());
+    std::array<bool, 7> supplied{};
+    for (Stockfish::Move move : immediate) {
+        const Stockfish::PieceType type = board.hand_piece_type(immediateBoard, move);
+        const int index = static_cast<int>(type);
+        half.suppliedTypes.push_back(static_cast<uint8_t>(
+            index >= Stockfish::PAWN && index <= Stockfish::QUEEN ? index : 0));
+        if (index >= Stockfish::PAWN && index <= Stockfish::QUEEN) {
+            supplied[index] = true;
+        }
+    }
+    // The seat's own moves, held-back drops removed, and a trailing
+    // MOVE_NONE ("decide later").
+    half.actions = leaf_board_actions(board, plannedBoard, true, time);
+    half.actions.pop_back();
+    half.neededTypes.assign(half.actions.size(), 0);
+    const Stockfish::Color side = board.side_to_move(plannedBoard);
+    const int seat = TimeState::seat_of(plannedBoard, side);
+    // A supplied piece is the seat's to drop at its landing only if it
+    // reaches the pocket before the decision that lands it starts: always
+    // with InstantTransfer, otherwise only for a seat back from a pass.
+    const bool mayDropSupplied = time.instant_transfer() || time.seat_sitting(seat);
+    const Stockfish::Color victim = ~team;
+    const auto mates_on_landing = [&](Stockfish::Move move) {
+        if (!board.gives_check(plannedBoard, move)) {
+            return false;
+        }
+        board.push_move(plannedBoard, move);
+        // Mate however the victims could wait for a blocker.
+        const bool mate = board.is_checkmate(victim, true);
+        board.pop_move(plannedBoard);
+        return mate;
+    };
+    half.mates.reserve(half.actions.size() + 8);
+    for (Stockfish::Move move : half.actions) {
+        half.mates.push_back(mates_on_landing(move) ? 1 : 0);
+    }
+    if (mayDropSupplied) {
+        for (int type = Stockfish::PAWN; type <= Stockfish::QUEEN; ++type) {
+            const Stockfish::PieceType piece = static_cast<Stockfish::PieceType>(type);
+            if (!supplied[type] || board.count_in_hand(plannedBoard, side, piece) > 0) {
+                continue;
+            }
+            const Stockfish::Piece handPiece = Stockfish::make_piece(side, piece);
+            board.add_to_hand(plannedBoard, handPiece);
+            for (Stockfish::Move move : board.legal_moves(plannedBoard)) {
+                if (type_of(move) != Stockfish::DROP
+                    || Stockfish::in_hand_piece_type(move) != piece
+                    || !is_policy_move_representable(board, plannedBoard, move)) {
+                    continue;
+                }
+                half.actions.push_back(move);
+                half.neededTypes.push_back(static_cast<uint8_t>(type));
+                half.mates.push_back(mates_on_landing(move) ? 1 : 0);
+            }
+            board.remove_from_hand(plannedBoard, handPiece);
+        }
+    }
+    half.actions.push_back(Stockfish::MOVE_NONE);
+    half.neededTypes.push_back(0);
+    half.mates.push_back(0);
+    return half;
+}
+
+void shape_planned_priors(vector<float>& priors, const vector<Stockfish::Move>& actions,
+                          const vector<uint8_t>& mates, float freeShare) {
+    const auto none = std::find(actions.begin(), actions.end(), Stockfish::MOVE_NONE);
+    if (none == actions.end() || priors.size() != actions.size()) {
+        return;
+    }
+    const size_t later = static_cast<size_t>(none - actions.begin());
+    if (actions.size() == 1) {
+        priors[later] = 1.0f;
+        return;
+    }
+    const float free = std::clamp(std::max(priors[later], freeShare), 0.0f, 1.0f);
+    float rest = 0.0f;
+    for (size_t i = 0; i < priors.size(); ++i) {
+        rest += i == later ? 0.0f : priors[i];
+    }
+    for (size_t i = 0; i < priors.size(); ++i) {
+        if (i == later) {
+            priors[i] = rest > 0.0f ? free : 1.0f;
+        } else {
+            priors[i] = rest > 0.0f ? priors[i] * (1.0f - free) / rest : 0.0f;
+        }
+    }
+    if (SearchParams::JOINT_PLAN_MATE_PRIOR <= 0.0f) {
+        return;
+    }
+    bool raised = false;
+    for (size_t i = 0; i < priors.size() && i < mates.size(); ++i) {
+        if (mates[i] && priors[i] < SearchParams::JOINT_PLAN_MATE_PRIOR) {
+            priors[i] = SearchParams::JOINT_PLAN_MATE_PRIOR;
+            raised = true;
+        }
+    }
+    if (raised) {
+        float total = 0.0f;
+        for (float prior : priors) {
+            total += prior;
+        }
+        for (float& prior : priors) {
+            prior /= total;
+        }
+    }
+}
+
+std::atomic<bool> SearchThread::checkDurativeSides{false};
+std::atomic<int> SearchThread::durativeSideMismatches{0};
 
 SearchThread::SearchThread()
         : transpositionTable(nullptr), mateCandidateTable(nullptr),
@@ -1006,6 +1159,15 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             continue;
         }
         ctx.leafHash = board.search_hash_key(ctx.teamToPlay, ctx.time);
+        if (ctx.time.is_durative()) {
+            // Fix 2's invariant: a planned move is made only when it lands.
+            const bool sidesAgree = board.side_to_move(BOARD_A) == ctx.time.side_on(BOARD_A)
+                && board.side_to_move(BOARD_B) == ctx.time.side_on(BOARD_B);
+            assert(sidesAgree);
+            if (!sidesAgree && checkDurativeSides.load(std::memory_order_relaxed)) {
+                durativeSideMismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         // Only the boards whose seat lands now are this team's to act on
         // under a durative clock (leaf_turn).
@@ -1035,6 +1197,62 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
                         ctx.capturesA, ctx.policyIndicesA);
         prepare_actions(BOARD_B, ctx.boardBOnTurn, ctx.actionsB,
                         ctx.capturesB, ctx.policyIndicesB);
+        if (ctx.time.joint_plans() && !ctx.forcedWait) {
+            // Wave 2c, fix 2. A seat that lands its committed move has that
+            // move as its only action (the forced half).
+            for (int boardNumber : {BOARD_A, BOARD_B}) {
+                if (!(boardNumber == BOARD_A ? ctx.boardAOnTurn : ctx.boardBOnTurn)) {
+                    continue;
+                }
+                const Stockfish::Color side = board.side_to_move(boardNumber);
+                const Stockfish::Move committed =
+                    ctx.time.committed_move(TimeState::seat_of(boardNumber, side));
+                if (committed == Stockfish::MOVE_NONE) {
+                    continue;
+                }
+                // It stays legal until it lands (its board waits for it,
+                // its pocket only grows); were it not, the seat decides.
+                assert(board.is_legal_move(boardNumber, committed));
+                if (!board.is_legal_move(boardNumber, committed)) {
+                    continue;
+                }
+                vector<Stockfish::Move>& actions = boardNumber == BOARD_A ? ctx.actionsA : ctx.actionsB;
+                vector<uint8_t>& captures = boardNumber == BOARD_A ? ctx.capturesA : ctx.capturesB;
+                vector<int>& indices = boardNumber == BOARD_A ? ctx.policyIndicesA : ctx.policyIndicesB;
+                actions = {committed};
+                captures = {static_cast<uint8_t>(board.is_capture(boardNumber, committed) ? 1 : 0)};
+                indices = {get_fast_policy_index(committed, side)};
+            }
+            // The seat on turn that is not ready gets a planned half, chosen
+            // with the acting board's move as one joint action.
+            const std::array<bool, 2> planned = ctx.time.planned_boards(ctx.teamToPlay);
+            const int plannedBoard = planned[BOARD_A] ? BOARD_A : planned[BOARD_B] ? BOARD_B : -1;
+            if (plannedBoard >= 0) {
+                const int immediateBoard = 1 - plannedBoard;
+                PlannedHalf half = leaf_planned_half(
+                    board, plannedBoard, ctx.teamToPlay, ctx.time, immediateBoard,
+                    immediateBoard == BOARD_A ? ctx.actionsA : ctx.actionsB);
+                // A seat with no move to plan stays as without planning.
+                if (half.actions.size() > 1) {
+                    ctx.plannedBoard = plannedBoard;
+                    const Stockfish::Color side = board.side_to_move(plannedBoard);
+                    vector<int>& indices = plannedBoard == BOARD_A
+                        ? ctx.policyIndicesA : ctx.policyIndicesB;
+                    indices.clear();
+                    for (Stockfish::Move move : half.actions) {
+                        indices.push_back(get_fast_policy_index(move, side));
+                    }
+                    // Planned entries are that board's MOVE_NONE to the pass
+                    // rules, captures or not.
+                    (plannedBoard == BOARD_A ? ctx.capturesA : ctx.capturesB)
+                        .assign(half.actions.size(), 0);
+                    (plannedBoard == BOARD_A ? ctx.handTypesA : ctx.handTypesB) = half.neededTypes;
+                    (plannedBoard == BOARD_A ? ctx.handTypesB : ctx.handTypesA) = half.suppliedTypes;
+                    (plannedBoard == BOARD_A ? ctx.actionsA : ctx.actionsB) = std::move(half.actions);
+                    ctx.plannedMates = std::move(half.mates);
+                }
+            }
+        }
         if (ctx.forcedWait) {
             // The other team lands first: this node's one action is to wait
             // (pass, pass), which keeps the tree alternating teams. The
@@ -1158,6 +1376,14 @@ void SearchThread::process_batch(
                 priorsB = get_normalized_probability(
                     batchPiB, ctx.policyIndicesB, runtimeConfig.policyTemperature);
             }
+            if (ctx.plannedBoard >= 0) {
+                // Fix 2: the planned seat's policy (supplied drops at their
+                // raw logits), "decide later" at least the free share, mates
+                // on landing raised.
+                shape_planned_priors(ctx.plannedBoard == BOARD_A ? priorsA : priorsB,
+                                     ctx.plannedBoard == BOARD_A ? ctx.actionsA : ctx.actionsB,
+                                     ctx.plannedMates, ctx.time.joint_plan_free_share());
+            }
 
             auto action_factors = [jointFactorRank, jointVocabularySize](
                 const vector<Stockfish::Move>& actions,
@@ -1192,7 +1418,8 @@ void SearchThread::process_batch(
                              ctx.boardAOnTurn, ctx.boardBOnTurn,
                              ctx.capturesA, ctx.capturesB,
                              jointFactorsA, jointFactorsB,
-                             jointFactorRank, ctx.leafHash, ctx.expansionKey);
+                             jointFactorRank, ctx.leafHash, ctx.expansionKey,
+                             ctx.plannedBoard, ctx.handTypesA, ctx.handTypesB);
             ctx.leaf->release_evaluation_reservation();
                 
             // Backup value with WDL and moves-left shaping
@@ -1517,12 +1744,9 @@ LeafSelection SearchThread::select_and_expand(
         const Stockfish::Color actingTeam = node.get_team_to_play();
         if (next.is_durative()) {
             // The pieces the action sends to the partners' pockets: delayed
-            // transfer and the last-capture tie rule read them.
-            next.advance_action(actingTeam, action.moveA != Stockfish::MOVE_NONE,
-                                action.moveB != Stockfish::MOVE_NONE,
-                                board.hand_piece_type(BOARD_A, action.moveA),
-                                board.hand_piece_type(BOARD_B, action.moveB));
-            return next;
+            // transfer and the last-capture tie rule read them. A planned
+            // half (fix 2) becomes its seat's committed move.
+            return durative_time_after(next, board, actingTeam, action);
         }
         next.advance(actingTeam, board.on_turn_on_both_boards(actingTeam));
         return next;
@@ -1702,7 +1926,10 @@ void SearchThread::expand_leaf_node(Node* leaf,
                                     const vector<float>& jointFactorsB,
                                     size_t jointFactorRank,
                                     uint64_t positionHash,
-                                    uint32_t expansionKey) {
+                                    uint32_t expansionKey,
+                                    int plannedBoard,
+                                    const vector<uint8_t>& handTypesA,
+                                    const vector<uint8_t>& handTypesB) {
     // Store the position hash in the node for MCGS
     if (positionHash != 0) {
         leaf->set_hash(positionHash);
@@ -1714,7 +1941,7 @@ void SearchThread::expand_leaf_node(Node* leaf,
                               teamHasTimeAdvantage, boardAOnTurn, boardBOnTurn,
                               runtimeConfig, capturesA, capturesB,
                               jointFactorsA, jointFactorsB, jointFactorRank,
-                              expansionKey);
+                              expansionKey, plannedBoard, handTypesA, handTypesB);
     
     // Note: The first child created during try_init_and_expand doesn't have its
     // hash computed yet (would require board access). However, when that child

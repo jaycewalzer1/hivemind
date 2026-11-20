@@ -155,6 +155,50 @@ vector<Stockfish::Move> leaf_board_actions(Board& board, int boardNumber, bool o
 uint32_t durative_expansion_key(Board& board, Stockfish::Color team, const TimeState& time);
 
 /**
+ * @brief The durative clock after @p team plays @p action from @p time, as
+ * the search charges it: the applied halves move, the pieces they capture
+ * reach the partners' pockets, and a planned half (fix 2) becomes that
+ * seat's committed move on the board planned_boards() names. @p board is
+ * the position before the action. Every walk that recomputes path times
+ * (selection, fix 1's descent and re-timing, tests) goes through this.
+ */
+TimeState durative_time_after(const TimeState& time, Board& board, Stockfish::Color team,
+                              const JointActionCandidate& action);
+
+/**
+ * @brief Wave 2c, fix 2 (JointPlans): the planned half of a planning leaf.
+ *
+ * @p actions are the planned seat's representable legal moves on @p board
+ * (held-back drops removed as on an acting board), then drops of each type
+ * one of @p immediate's captures would send it that it cannot drop now
+ * (tagged in @p neededTypes; offered only where the transfer rule lets the
+ * seat drop it at its landing: with InstantTransfer, or for a sitting seat),
+ * then "decide later" (MOVE_NONE). @p mates flags each move that mates on
+ * its board as it lands (checked only for checking moves, with the needed
+ * piece in the pocket). @p suppliedTypes is, per entry of @p immediate, the
+ * type its capture sends (0 = none).
+ */
+struct PlannedHalf {
+    vector<Stockfish::Move> actions;
+    vector<uint8_t> neededTypes;
+    vector<uint8_t> mates;
+    vector<uint8_t> suppliedTypes;
+};
+PlannedHalf leaf_planned_half(Board& board, int plannedBoard, Stockfish::Color team,
+                              const TimeState& time, int immediateBoard,
+                              const vector<Stockfish::Move>& immediate);
+
+/**
+ * @brief Fix 2: the planned half's priors, in place. @p priors is the
+ * network's policy over @p actions (MOVE_NONE = its pass logit). "Decide
+ * later" gets max(its pass prior, @p freeShare) and the moves share the rest
+ * in proportion; each move flagged in @p mates is then raised to at least
+ * SearchParams::JOINT_PLAN_MATE_PRIOR and the half renormalised.
+ */
+void shape_planned_priors(vector<float>& priors, const vector<Stockfish::Move>& actions,
+                          const vector<uint8_t>& mates, float freeShare);
+
+/**
  * @brief Entry in an MCTS selection trajectory.
  * 
  * Stores the node, action taken, and selected child index for backup.
@@ -197,6 +241,15 @@ struct LeafContext {
     // Wave 2c, fix 1: durative_expansion_key() of this leaf (0 outside a
     // durative clock), stored in the node at its expansion.
     uint32_t expansionKey = 0;
+    // Wave 2c, fix 2 (JointPlans): the board whose list (actionsA or
+    // actionsB) is a planned half, -1 = none; per action the needed type
+    // (planned board) or supplied type (other board); and which planned
+    // moves mate as they land. A board whose seat lands a committed move has
+    // that move as its only action (forced half).
+    int plannedBoard = -1;
+    vector<uint8_t> handTypesA;
+    vector<uint8_t> handTypesB;
+    vector<uint8_t> plannedMates;
     bool isTerminal;     // True if this is a terminal node (draw/checkmate)
     bool hasEvaluationReservation;
     float terminalValue; // Value to use for terminal nodes
@@ -228,6 +281,17 @@ struct LeafSelection {
 };
 
 class SearchThread {
+public:
+    /**
+     * Fix 2's invariant: at every leaf of a durative search the board and
+     * the clock agree on who is to move (board.side_to_move(b) ==
+     * time.side_on(b)); a planned move made early, or a committed one never
+     * made, breaks it at once. Asserted in debug builds; with
+     * checkDurativeSides on (tests) every leaf counts its violations.
+     */
+    static std::atomic<bool> checkDurativeSides;
+    static std::atomic<int> durativeSideMismatches;
+
 private: 
     struct SearchBatch {
         __half* observations = nullptr;
@@ -339,7 +403,10 @@ public:
                           const vector<float>& jointFactorsB = {},
                           size_t jointFactorRank = 0,
                           uint64_t positionHash = 0,
-                          uint32_t expansionKey = 0);
+                          uint32_t expansionKey = 0,
+                          int plannedBoard = -1,
+                          const vector<uint8_t>& handTypesA = {},
+                          const vector<uint8_t>& handTypesB = {});
     void backup(vector<TrajectoryEntry>& trajectory, float value);
     void cancel_virtual_losses(const vector<TrajectoryEntry>& trajectory);
     

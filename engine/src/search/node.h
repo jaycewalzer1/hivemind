@@ -348,8 +348,7 @@ private:
                 const float nEffective = static_cast<float>(n + static_cast<uint32_t>(vl));
                 float score = selection_q(edge, n, vl, fpuQ)
                     + explorationBase * edge.prior / (1.0f + nEffective);
-                if (preferredAction && action.moveA == preferredAction->moveA
-                    && action.moveB == preferredAction->moveB) {
+                if (preferredAction && action.same_moves(*preferredAction)) {
                     score += config.internalMateProbeBias
                         / (1.0f + nEffective
                             / std::max(config.internalMateProbeBiasDecayVisits, 1.0f));
@@ -487,8 +486,10 @@ public:
      *        null when this node has not generated that action or has not
      *        expanded its child.
      */
+    /** The child of the action (@p moveA, @p moveB, @p planned); see JointActionCandidate::same_moves. */
     std::shared_ptr<Node> child_for_action(Stockfish::Move moveA,
-                                           Stockfish::Move moveB) const {
+                                           Stockfish::Move moveB,
+                                           Stockfish::Move planned = Stockfish::MOVE_NONE) const {
         std::shared_lock<std::shared_mutex> guard(nodeMutex);
         if (!m_is_expanded.load(std::memory_order_acquire)) {
             return nullptr;
@@ -498,7 +499,7 @@ public:
              ++index) {
             const JointActionCandidate& action =
                 candidateGenerator.getGenerated(index);
-            if (action.moveA == moveA && action.moveB == moveB) {
+            if (action.moveA == moveA && action.moveB == moveB && action.planned == planned) {
                 return children[index];
             }
         }
@@ -582,7 +583,7 @@ public:
 
     bool promote_joint_action(const JointActionCandidate& action) {
         std::unique_lock<std::shared_mutex> guard(nodeMutex);
-        return candidateGenerator.promote(action.moveA, action.moveB);
+        return candidateGenerator.promote(action.moveA, action.moveB, action.planned);
     }
 
     /**
@@ -712,7 +713,10 @@ public:
                              const std::vector<float>& jointFactorsA = {},
                              const std::vector<float>& jointFactorsB = {},
                              size_t jointFactorRank = 0,
-                             uint32_t expansionKey = 0) {
+                             uint32_t expansionKey = 0,
+                             int plannedBoard = -1,
+                             const std::vector<uint8_t>& handTypesA = {},
+                             const std::vector<uint8_t>& handTypesB = {}) {
         std::unique_lock<std::shared_mutex> guard(nodeMutex);
         
         // Already expanded by another thread
@@ -744,7 +748,8 @@ public:
                               0, m_depth.load(std::memory_order_relaxed) == 0
                                   ? config.rootJointPolicyTopK
                                   : config.jointPolicyTopK)),
-                          config.jointPolicyResidualScale);
+                          config.jointPolicyResidualScale,
+                          plannedBoard, handTypesA, handTypesB);
         expandedCount = 0;
         expandedPriorSum = 0.0f;
         visitedPolicySum = 0.0f;
@@ -830,6 +835,16 @@ public:
                 output.push_back(child.get());
             }
         }
+    }
+
+    /**
+     * @brief Wave 2c, fix 2 (JointPlans): the board on which this node's
+     * actions carry a planned move (JointActionCandidate::planned), -1 =
+     * none. It lives in the candidate generator, set once at expansion.
+     */
+    int planned_board() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return candidateGenerator.planned_board();
     }
 
     /** Fix 1: the key this node was expanded with (see expansionKey_). */

@@ -336,6 +336,10 @@ private:
         int clockDiffMs = -1;
         std::string reason = "no node";
         int boardMatches = 0;
+        // Fix 2: when the furthest refusal was `committed`, that node's
+        // commitments per seat (fix 3 reads our seats' as the tree's plan).
+        std::array<Stockfish::Move, 4> committed{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE,
+                                                 Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
     };
     /** What retime_team_tree did. */
     struct TeamTreeRetime {
@@ -379,6 +383,7 @@ private:
     friend class AgentDurativeTestPeer;
     friend class AgentDurativePart2Peer;
     friend class AgentContinuityPeer;
+    friend class AgentContinuityFix2Peer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);

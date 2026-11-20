@@ -106,7 +106,7 @@ bool node_generated_action(const std::shared_ptr<Node>& node,
     for (size_t index = 0; index < generated; ++index) {
         const JointActionCandidate existing = node->get_joint_action(
             static_cast<int>(index));
-        if (existing.moveA == action.moveA && existing.moveB == action.moveB) {
+        if (existing.same_moves(action)) {
             return true;
         }
     }
@@ -948,7 +948,7 @@ std::optional<JointActionCandidate> Agent::race_safe_alternative(
     for (size_t index = 0; index < generated; ++index) {
         const JointActionCandidate action =
             node.get_joint_action(static_cast<int>(index));
-        if (action.moveA == claimed->moveA && action.moveB == claimed->moveB) {
+        if (action.same_moves(*claimed)) {
             continue;
         }
         byVisits.push_back(index);
@@ -1132,7 +1132,7 @@ std::optional<JointActionCandidate> Agent::certified_mate_free_alternative(
         {visits.size(), children.size(), node.get_num_generated()});
     const auto same_action = [](const JointActionCandidate& lhs,
                                 const JointActionCandidate& rhs) {
-        return lhs.moveA == rhs.moveA && lhs.moveB == rhs.moveB;
+        return lhs.same_moves(rhs);
     };
     // The child is the opponents' node, so their proven mate is its WIN. The
     // solver carries that up to the root edge, and tree reuse keeps it.
@@ -5206,8 +5206,7 @@ bool Agent::find_root_loss_proofs(
                     const auto known = std::find_if(
                         knownProofs->begin(), knownProofs->end(),
                         [&](const RootLossProof& proof) {
-                            return proof.action.moveA == defense.moveA
-                                && proof.action.moveB == defense.moveB;
+                            return proof.action.same_moves(defense);
                         });
                     if (known == knownProofs->end()) {
                         return false;
@@ -5281,7 +5280,7 @@ bool Agent::find_root_loss_proofs(
 
     const auto actions_equal = [](const JointActionCandidate& lhs,
                                   const JointActionCandidate& rhs) {
-        return lhs.moveA == rhs.moveA && lhs.moveB == rhs.moveB;
+        return lhs.same_moves(rhs);
     };
 
     // Once one defense has established a partner-board-agnostic mate after a
@@ -7353,8 +7352,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                         const bool known = std::any_of(
                             rootLossProofs.begin(), rootLossProofs.end(),
                             [&](const RootLossProof& seen) {
-                                return seen.action.moveA == proof.action.moveA
-                                    && seen.action.moveB == proof.action.moveB;
+                                return seen.action.same_moves(proof.action);
                             });
                         if (!known) {
                             rootLossProofs.push_back(proof);
@@ -7783,8 +7781,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         const auto proof = std::find_if(
             rootLossProofs.begin(), rootLossProofs.end(),
             [&](const RootLossProof& candidate) {
-                return candidate.action.moveA == action.moveA
-                    && candidate.action.moveB == action.moveB;
+                return candidate.action.same_moves(action);
             });
         return proof == rootLossProofs.end()
             ? string{}
@@ -9187,7 +9184,10 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
 
     Board path(*tree.board);
     std::unordered_set<const Node*> seen;
-    // How far the best refusal got: solved < turn state < clock < expansion.
+    // How far the best refusal got: solved < turn state < clock < expansion
+    // < commitment (fix 2). A commitment is checked before the expansion key
+    // (which holds it, so it never matches a live root) and outranks it: a
+    // board match refused only for its commitment reports `committed`.
     int bestRefusal = -1;
     int bestClockDiff = std::numeric_limits<int>::max();
     int adoptedDiff = std::numeric_limits<int>::max();
@@ -9208,6 +9208,13 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
         } else if (diff > toleranceMs) {
             refusal = 2;
             reason = "clock";
+        } else if (time.has_committed()) {
+            // Fix 2: a commitment of ours belongs to a root where both our
+            // seats decide; one of the other team's would force its move on
+            // the whole subtree, though the real opponent committed to
+            // nothing.
+            refusal = 4;
+            reason = "committed";
         } else if (node->expansion_key() != durative_expansion_key(path, team, live)) {
             // At the live root our team acts on every board it is on turn;
             // a node where one of those seats was not ready acted on one.
@@ -9218,6 +9225,10 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
             if (refusal > bestRefusal) {
                 bestRefusal = refusal;
                 match.reason = reason;
+                for (int seat = 0; seat < 4; ++seat) {
+                    match.committed[seat] = refusal == 4 ? time.committed_move(seat)
+                                                         : Stockfish::MOVE_NONE;
+                }
             }
             return;
         }
@@ -9262,11 +9273,9 @@ Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color t
                 if (next[BOARD_A] > liveOffset[BOARD_A] || next[BOARD_B] > liveOffset[BOARD_B]) {
                     continue;
                 }
-                const TimeState childTime = time.after_action(
-                    acting, action.moveA != Stockfish::MOVE_NONE,
-                    action.moveB != Stockfish::MOVE_NONE,
-                    path.hand_piece_type(BOARD_A, action.moveA),
-                    path.hand_piece_type(BOARD_B, action.moveB));
+                // Planned halves (fix 2) are not made: only the applied
+                // halves count as moves, but commitments are in the time.
+                const TimeState childTime = durative_time_after(time, path, acting, action);
                 path.make_moves(action.moveA, action.moveB);
                 bool follows = true;
                 for (int boardNumber : {BOARD_A, BOARD_B}) {
@@ -9378,11 +9387,7 @@ Agent::TeamTreeRetime Agent::retime_team_tree(const std::shared_ptr<Node>& root,
                 }
                 const int childIdx = static_cast<int>(index);
                 const JointActionCandidate action = node.get_joint_action(childIdx);
-                const TimeState childTime = time.after_action(
-                    acting, action.moveA != Stockfish::MOVE_NONE,
-                    action.moveB != Stockfish::MOVE_NONE,
-                    board.hand_piece_type(BOARD_A, action.moveA),
-                    board.hand_piece_type(BOARD_B, action.moveB));
+                const TimeState childTime = durative_time_after(time, board, acting, action);
                 board.make_moves(action.moveA, action.moveB);
                 const Stockfish::Color childTeam = child->get_team_to_play();
                 const uint64_t childHash = board.search_hash_key(childTeam, childTime);
@@ -9499,7 +9504,7 @@ int Agent::retain_played_line(const Board& board,
         for (size_t index = 0; index < children.size(); ++index) {
             const JointActionCandidate edge =
                 node->get_joint_action(static_cast<int>(index));
-            if (edge.moveA == action.moveA && edge.moveB == action.moveB) {
+            if (edge.same_moves(action)) {
                 next = children[index];
                 break;
             }

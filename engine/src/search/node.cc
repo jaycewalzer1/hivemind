@@ -533,8 +533,7 @@ Node::ChildSelection Node::select_child_and_apply_virtual_loss(
                 if (preferredAction) {
                     const JointActionCandidate& candidate =
                         candidateGenerator.getGenerated(i);
-                    if (candidate.moveA == preferredAction->moveA
-                        && candidate.moveB == preferredAction->moveB) {
+                    if (candidate.same_moves(*preferredAction)) {
                         score += config.internalMateProbeBias
                             / (1.0f + static_cast<float>(n_effective)
                                 / std::max(
@@ -583,8 +582,7 @@ Node::ChildSelection Node::select_child_and_apply_virtual_loss(
                 for (size_t index = 0; index < limit; ++index) {
                     const JointActionCandidate& candidate =
                         candidateGenerator.getGenerated(index);
-                    if (candidate.moveA == preferredAction->moveA
-                        && candidate.moveB == preferredAction->moveB) {
+                    if (candidate.same_moves(*preferredAction)) {
                         preferredIdx = static_cast<int>(index);
                         if (visitedEdgePositions[index] < 0) {
                             considerChild(index);
