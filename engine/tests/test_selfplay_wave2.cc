@@ -159,6 +159,72 @@ TEST_F(SelfPlayWave2Test, SeatClockGamesWriteMatchingRecordsClocksAndTags) {
     }
 }
 
+TEST_F(SelfPlayWave2Test, TeamTreeReuseInSeatClockGames) {
+    // Wave 2c, fix 1 (spec v5 test 1.8): each team's agent keeps its tree
+    // between decisions. The tolerance is the widest allowed: this checks
+    // the plumbing; how often the default tolerance hits is the probe's
+    // question. Hits are rare anyway: a tree only holds the landings in the
+    // order its paces predicted (docs/wave2_engine.md, Wave 2c), so the
+    // games are 20 s and 256 nodes to give each team a few.
+    SelfPlayConfig config = wave2_config(4);
+    config.nodes = 256;
+    config.wave2.baseMix = {{20000, 1.0}};
+    config.wave2.teamTreeReuse = true;
+    config.wave2.teamTreeReuseToleranceMs = 5000;
+    testing::internal::CaptureStdout();
+    ASSERT_EQ(run_selfplay({engine.get()}, config), 0);
+    const std::string stdoutText = testing::internal::GetCapturedStdout();
+    const size_t at = stdoutText.find("selfplay team tree reuse: ");
+    ASSERT_NE(at, std::string::npos) << stdoutText;
+    const std::string line = stdoutText.substr(at, stdoutText.find('\n', at) - at);
+    std::istringstream summary(line);
+    std::string word;
+    for (int skip = 0; skip < 4; ++skip) {
+        summary >> word;   // "selfplay team tree reuse:"
+    }
+    double percent = 0.0;
+    summary >> percent;
+    EXPECT_GT(percent, 0.0) << line;
+    std::array<int, 4> hits{};
+    const char* const seats[4] = {"Aw", "Ab", "Bw", "Bb"};
+    for (int seat = 0; seat < 4; ++seat) {
+        const size_t named = line.find(std::string(" ") + seats[seat] + " ");
+        ASSERT_NE(named, std::string::npos) << line;
+        hits[seat] = std::stoi(line.substr(named + 4));
+    }
+    // Every adopting search counted its deciding seat(s). Which seats adopt
+    // varies run to run (four search workers); that one seat adopts the
+    // tree its partner's search built is TeamTreeReuse.BothSeatsOfTheTeam.
+    const size_t open = line.find('(');
+    const int adopted = std::stoi(line.substr(open + 1));
+    EXPECT_GT(adopted, 0) << line;
+    EXPECT_GE(hits[0] + hits[1] + hits[2] + hits[3], adopted) << line;
+    EXPECT_NE(line.find(", refused"), std::string::npos);
+    // One seat_clocks.tsv row per record, as without the option.
+    const std::string rows = read_file(output / "seat_clocks.tsv");
+    const size_t lines = static_cast<size_t>(std::count(rows.begin(), rows.end(), '\n'));
+    EXPECT_EQ(lines - 1, hvm_records(output / "training_data"));
+    EXPECT_NE(stdoutText.find("selfplay complete 4 games"), std::string::npos);
+}
+
+TEST_F(SelfPlayWave2Test, TeamTreeReuseNeedsDurativeSeatClocks) {
+    Wave2GameOptions options;
+    options.teamTreeReuse = true;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    options.durativeTree = true;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    options.baseMix = {{4000, 1.0}};
+    EXPECT_NO_THROW(options.validate());
+    options.teamTreeReuseToleranceMs = 5001;
+    EXPECT_THROW(options.validate(), std::invalid_argument);
+    Wave2GameOptions parsed;
+    EXPECT_TRUE(parse_wave2_option("--team-tree-reuse", "true", parsed));
+    EXPECT_TRUE(parse_wave2_option("--team-tree-reuse-tolerance-ms", "1000", parsed));
+    EXPECT_TRUE(parsed.teamTreeReuse);
+    EXPECT_EQ(parsed.teamTreeReuseToleranceMs, 1000);
+    EXPECT_TRUE(parsed.changes_search());
+}
+
 TEST_F(SelfPlayWave2Test, TreeOptionsAloneKeepTheLeadOnlyGame) {
     SelfPlayConfig config = wave2_config(1);
     config.wave2.baseMix.clear();

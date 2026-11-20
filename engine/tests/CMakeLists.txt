@@ -33,6 +33,7 @@ add_executable(
   test_seat_clock_game.cc
   test_selfplay_wave2.cc
   test_wave2b.cc
+  test_continuity_fix1.cc
 )
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
 
