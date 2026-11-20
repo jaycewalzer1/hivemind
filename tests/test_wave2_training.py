@@ -95,6 +95,31 @@ def test_team_tree_reuse_options():
         "--team-tree-reuse", "--team-tree-reuse-tolerance-ms"]
 
 
+def test_joint_plans_options():
+    """Wave 2c fix 2: off by default (stock and WAVE2 send nothing new), on
+    top of the preset it sends its flags, and it needs the durative tree only
+    (not seat clocks: it acts inside each search)."""
+    assert not wave2.STOCK.joint_plans and not wave2.WAVE2.joint_plans
+    assert "--joint-plans" not in wave2.WAVE2.engine_args()
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    options = wave2.from_args(parser.parse_args(["--wave2", "--joint-plans", "true",
+                                                 "--joint-plan-free-permille", "300"]))
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--joint-plans"] == "true"
+    assert pairs["--joint-plan-free-permille"] == "300"
+    only_plans = wave2.from_args(parser.parse_args(["--wave2", "--joint-plans", "true"]))
+    assert "--joint-plan-free-permille" not in only_plans.engine_args()
+    assert wave2.Options(durative_tree=True, joint_plans=True).joint_plans
+    with pytest.raises(ValueError):
+        wave2.Options(joint_plans=True)
+    with pytest.raises(ValueError):
+        wave2.replace(wave2.WAVE2, joint_plan_free_permille=1001)
+    assert wave2.missing_engine_options(options, "--durative-tree --sit-gate --flag-loss "
+                                        "--instant-transfer --base-mix --seat-move-times") == [
+        "--joint-plans", "--joint-plan-free-permille"]
+
+
 def test_missing_options_are_read_off_the_engine_help():
     assert wave2.missing_engine_options(wave2.WAVE2, "--durative-tree --sit-gate --flag-loss") == [
         "--instant-transfer", "--base-mix", "--seat-move-times"]

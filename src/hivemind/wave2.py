@@ -67,12 +67,19 @@ class Options:
     seat_move_times: bool = False
     team_tree_reuse: bool = False
     team_tree_reuse_tolerance_ms: int = 250
+    joint_plans: bool = False
+    joint_plan_free_permille: int = 500
 
     def __post_init__(self):
         if not 1 <= self.pass_cap_k <= 64:
             raise ValueError("pass_cap_k must be in 1..64")
         if not 0 <= self.team_tree_reuse_tolerance_ms <= 5000:
             raise ValueError("team_tree_reuse_tolerance_ms must be in 0..5000")
+        if not 0 <= self.joint_plan_free_permille <= 1000:
+            raise ValueError("joint_plan_free_permille must be in 0..1000")
+        if self.joint_plans and not self.durative_tree:
+            # Fix 2 acts inside each durative search; the engine refuses it otherwise.
+            raise ValueError("joint_plans needs durative_tree")
         if self.team_tree_reuse and not (self.durative_tree and self.base_mix):
             # The engine refuses it too: it acts on durative seat-clock games only.
             raise ValueError("team_tree_reuse needs durative_tree and a base_mix")
@@ -118,7 +125,7 @@ WAVE2 = Options(durative_tree=True, sit_gate=False, flag_loss=True, instant_tran
 
 # The engine flags rl-loop overrides, by Options field.
 BOOLEAN_FIELDS = ("durative_tree", "sit_gate", "flag_loss", "instant_transfer", "mate_race_by_landing",
-                  "seat_move_times", "team_tree_reuse")
+                  "seat_move_times", "team_tree_reuse", "joint_plans")
 
 
 def from_args(args):
@@ -136,6 +143,8 @@ def from_args(args):
         changes["base_mix"] = parse_base_mix(args.base_mix)
     if getattr(args, "team_tree_reuse_tolerance_ms", None) is not None:
         changes["team_tree_reuse_tolerance_ms"] = args.team_tree_reuse_tolerance_ms
+    if getattr(args, "joint_plan_free_permille", None) is not None:
+        changes["joint_plan_free_permille"] = args.joint_plan_free_permille
     return replace(base, **changes)
 
 
@@ -153,6 +162,8 @@ def add_arguments(parser):
     group.add_argument("--base-mix", default=None, help="MS:WEIGHT,... or off")
     group.add_argument("--team-tree-reuse-tolerance-ms", type=int, default=None,
                        help="Wave 2c: largest clock difference --team-tree-reuse adopts (default 250)")
+    group.add_argument("--joint-plan-free-permille", type=int, default=None,
+                       help="Wave 2c: prior share of decide-later under --joint-plans (default 500)")
 
 
 def missing_engine_options(options, engine_help):
