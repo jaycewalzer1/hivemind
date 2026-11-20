@@ -386,3 +386,81 @@ Checks run 2026-11-19 (ONNX Runtime on the Mac):
 - Thinking time is per board, not per seat: a seat that comes back from a pass keeps the board's time since the last
   landing, as the contract defines `e`.
 - The root mate provers and tree reuse still run on the v3 clock, where wide timing is 0.
+
+## Wave 2c: continuity
+
+Spec: talisman `docs/custom_engine_spec_v5_continuity.md`. Three fixes, each a UCI option and a self-play flag, off
+by default; with them off the engine is bit for bit the `261081b` one (`engine/tests/stock_parity.sh` and
+`engine/tests/wave2_parity.sh`, 8/8 each). Fix 1 is built; fixes 2 (joint plans) and 3 (plan carry) are not yet.
+
+### Fix 1: team tree reuse (`TeamTreeReuse`, `TeamTreeReuseToleranceMs`)
+
+| UCI option | Self-play / tournament flag | Default |
+|---|---|---|
+| `TeamTreeReuse` (check) | `--team-tree-reuse <bool>` | false |
+| `TeamTreeReuseToleranceMs` (spin 0..5000) | `--team-tree-reuse-tolerance-ms <ms>` | 250 |
+
+Only under a durative clock (`DurativeTree true` under `TimeModel clock`). With `DurativeTree` off the option is
+accepted and does nothing (`setoption` says so). The self-play and tournament flag needs `--durative-tree true` and
+`--base-mix` (seat-clock games); `validate()` refuses it otherwise. Python: `hivemind.wave2.Options.team_tree_reuse`,
+`team_tree_reuse_tolerance_ms`; `rl-loop --team-tree-reuse true` passes both to `selfplay` and `tournament`.
+
+What it does (`Agent::run_search`, `agent.cc`):
+
+* **Keep.** A durative search with the option stores its whole tree (`Agent::TeamTree`: root, a copy of the root
+  board, both FENs and `game_ply`s, the root clock, the team). It does not index exact-hash candidates and keeps no
+  single-board mate continuations: the next search of the team starts with nothing else from this one.
+  `ucinewgame`, `reset_search_state()` and a missed ponder drop it; so does a search with the option off.
+* **Find** (`find_team_tree_node`). The moves that landed since are the board difference, so the walk follows
+  them: an edge is followed while no board has moved more often along the path than in the game (`game_ply`
+  offsets from the old root), and a board that has moved as often shows the live FEN (counters left out: the
+  arena sends FENs) with a pocket at most the live one. Waits and passes are followed. Each node's time is the
+  durative charge the search used (`TimeState::after_action`). Depth-first with make/unmake, at most 8 joint
+  plies and 20000 nodes; the board test leaves only the played line and its wait nodes.
+* **Adopt** a node with the live boards and our team to play that is expanded and unsolved, in the live turn
+  state (`TimeState::same_turn_state`: sides, sitting and held-back pieces on turn, rules), within the tolerance
+  (`TimeState::clock_distance`: every seat clock and the other team's on-turn ready times), and expanded as the
+  live root would be (its expansion key under the live clock: at the root our team decides on every board it is
+  on turn). Smallest clock difference first, then most visits.
+* **Re-time** (`retime_team_tree`). A breadth-first count keeps the shallowest 100000 nodes; a depth-first walk
+  carries each path's time down from the live clock and replaces by a fresh node (with its path's hash) any child
+  beyond the cap, reached again through another parent with another hash (the tree is an MCGS graph: a split),
+  solved with a changed hash (its time state moved: `rootMoveMs` and the paces are in the key, so a new budget
+  drops every verdict below), or expanded with another expansion key. A replaced child's edge goes back to a new
+  edge (no visits, `Q_INIT`) and its visits and value come off the parent's totals (`Node::reset_edge_for_reuse`);
+  ancestors keep theirs. Every node kept gets its recomputed hash and goes into the fresh transposition table.
+  The adopted root's reverse edges are cleared. The rest of the old tree goes to the GC thread.
+* **Expansion key** (`durative_expansion_key`, `searchthread.cc`; stored in `Node::expansionKey_` at expansion):
+  the acting boards after the durative filter, a forced wait, the sit right the generator gets, the drops held
+  back on the acting boards (InstantTransfer off), and the time inputs of the terminal check (the other team's sit
+  right, a clock result, and with MateRaceByLanding the landing order of the seats on turn, the early landings and
+  the last capturer). `collect_batch` now builds a leaf's lists through `leaf_turn` and `leaf_board_actions`, which
+  the tests use too. `sizeof(Node)` is 1040 bytes before and after (the key sits in padding after `teamToPlay`).
+* **Budget.** UCI `go nodes N` searches N new nodes on top of the adopted ones. Self-play tops the root up to its
+  budget (`reusedVisitsCount`, at least `--tree-reuse-min-new-fraction` new); tournament likewise (at least a
+  quarter new).
+* **UCI** does not start the permanent brain after a search that keeps a team tree (it would re-root with v3's
+  `advance()`). Opening noise still resets the agent before the search, so it drops the tree.
+* **Telemetry.** Verbose UCI prints `info string Team tree reuse: <visits> visits recovered, clock diff <ms> ms,
+  <pruned> pruned`, or `... none (<reason>)` with `no tree`, `no node`, `clock`, `shape`, `solved` (followed by
+  `, clock diff <ms> ms` when some node had the live boards). The exact path's `Tree reuse:` line is never printed
+  under the option. Self-play prints `selfplay team tree reuse: <hit %> of searches (<hits>/<searches>), <mean>
+  mean visits recovered, by seat Aw .. Bb .., refused <reason> <count> ...`.
+
+**Hit rate seen so far** (self-play only; the arena gate, `tools/continuity_probe.py reuse`, is still to run):
+
+| Network, nodes, base | Tolerance | Searches adopting | Refused (no node / shape / clock) |
+|---|---|---|---|
+| uniform test net (`build-ninja`), 256 nodes, 20 s, 4 games | 250 / 5000 ms | 2.3% (5/213) / 3.8% (8/213) | about 87% / 3-4% / under 1% |
+| it13 fp32 (`twin-s-clock-it13-fp32.onnx`), 400 nodes, 60 s, 2 games (`build-sp1`) | 250 ms | 28.4% (54/190) | 55 / 56 / 19 |
+| same | 1000 ms | 29.9% (38/127) | 38 / 38 / 3 |
+| same | 3000 ms | 33.3% (42/126) | 39 / 40 / 0 |
+
+"no node" is mostly structural, not a tolerance question: the tree holds the other team's landings only in the
+order their paces predict (a durative node has one timing, not a choice), so when the real order differs no node
+has the live boards; and in self-play a seat of ours whose move is in flight acted at the old root (the root acts
+on every board our team is on turn), so the tree's line on that board is not the game's.
+
+Tests: `engine/tests/test_continuity_fix1.cc` (spec v5 0.1 and 1.1-1.7, 1.9-1.15, 1.17, plus UCI `ucinewgame` and
+option-off cases) and `SelfPlayWave2Test.TeamTreeReuse*` in `test_selfplay_wave2.cc` (1.8). Not yet: 1.16 (needs
+fix 2's committed moves).
