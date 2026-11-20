@@ -243,6 +243,14 @@ void Node::refresh_root_noise(const SearchParams::RuntimeConfig& config) {
         config.rootNoiseSeed ^ hash ^ ROOT_NOISE_SALT_B);
 }
 
+bool Node::apply_root_plan(int boardIndex, Stockfish::Move move, float weight) {
+    std::unique_lock<std::shared_mutex> guard(nodeMutex);
+    if (!m_is_expanded.load(std::memory_order_relaxed) || weight <= 0.0f) {
+        return false;
+    }
+    return candidateGenerator.applyRootPlan(boardIndex, move, weight);
+}
+
 void Node::configure_root_search(
     const SearchParams::RuntimeConfig& config,
     bool allowProvenLoss) {

@@ -164,6 +164,23 @@ inline void mix_dirichlet_noise(std::vector<float>& priors, float alpha,
     }
 }
 
+/**
+ * @brief Wave 2c, fix 3 (PlanCarry): mix one board's root priors toward the
+ * carried move at @p index, in place: p(move) <- (1 - w) p + w, every other
+ * action p <- (1 - w) p, with w = @p weight clamped to [0, 1]. Priors summing
+ * to one still do.
+ */
+inline void mix_root_plan(std::vector<float>& priors, size_t index, float weight) {
+    if (index >= priors.size()) {
+        return;
+    }
+    const float w = std::clamp(weight, 0.0f, 1.0f);
+    for (float& prior : priors) {
+        prior *= 1.0f - w;
+    }
+    priors[index] += w;
+}
+
 // Hash function for pair<size_t, size_t>, still used by the transient
 // generated-index map that rebuildCandidateFrontier builds and discards.
 struct PairHash {
@@ -916,6 +933,108 @@ public:
         legalPriorMass = legal_prior_mass(
             sortedActionsA, sortedPriorsA, sortedCapturesA,
             sortedActionsB, sortedPriorsB, sortedCapturesB);
+    }
+
+    /**
+     * Wave 2c, fix 3 (PlanCarry): mix the prior of @p move on board
+     * @p boardIndex toward it by @p weight (mix_root_plan) and re-sort that
+     * board, as applyRootNoise does for noise; reprepareJointPolicyPool then
+     * rescores the expanded candidates. False (nothing changed) when the move
+     * is not on that board's list.
+     */
+    bool applyRootPlan(int boardIndex, Stockfish::Move move, float weight) {
+        std::vector<Stockfish::Move>& actions = boardIndex == 0 ? sortedActionsA : sortedActionsB;
+        std::vector<float>& priors = boardIndex == 0 ? sortedPriorsA : sortedPriorsB;
+        const auto found = std::find(actions.begin(), actions.end(), move);
+        if (move == Stockfish::MOVE_NONE || found == actions.end()) {
+            return false;
+        }
+        mix_root_plan(priors, static_cast<size_t>(std::distance(actions.begin(), found)), weight);
+        if (boardIndex == 0) {
+            resortBoard(sortedActionsA, sortedPriorsA, sortedCapturesA, sortedJointFactorsA, true);
+        } else {
+            resortBoard(sortedActionsB, sortedPriorsB, sortedCapturesB, sortedJointFactorsB, false);
+        }
+        legalPriorMass = legal_prior_mass(
+            sortedActionsA, sortedPriorsA, sortedCapturesA,
+            sortedActionsB, sortedPriorsB, sortedCapturesB);
+        return true;
+    }
+
+    /**
+     * Fix 3: expand next the best legal pair (by factorized joint prior)
+     * holding the carried move(s): both when both are given and the pair is
+     * legal, else the better of the pairs holding one of them. The lists are
+     * sorted by prior, so the first legal partner on the other board is the
+     * best. Nothing is promoted when an expanded pair already holds a carried
+     * move (it has its visits), at a planning node, or when a promotion is
+     * already pending. Call after the frontier is built: rebuilding it
+     * (configure_root_search) drops a promotion.
+     */
+    bool promoteCarried(Stockfish::Move planA, Stockfish::Move planB) {
+        if (promotedCandidate || plannedBoard >= 0) {
+            return false;
+        }
+        const auto indexOf = [](const std::vector<Stockfish::Move>& actions,
+                                Stockfish::Move move) -> long {
+            if (move == Stockfish::MOVE_NONE) {
+                return -1;
+            }
+            const auto found = std::find(actions.begin(), actions.end(), move);
+            return found == actions.end() ? -1 : static_cast<long>(found - actions.begin());
+        };
+        const long fixedA = indexOf(sortedActionsA, planA);
+        const long fixedB = indexOf(sortedActionsB, planB);
+        if (fixedA < 0 && fixedB < 0) {
+            return false;
+        }
+        for (const JointActionCandidate& generated : generatedCandidates) {
+            if ((fixedA >= 0 && static_cast<long>(generated.idxA) == fixedA)
+                || (fixedB >= 0 && static_cast<long>(generated.idxB) == fixedB)) {
+                return false;
+            }
+        }
+        std::optional<JointActionCandidate> best;
+        if (fixedA >= 0 && fixedB >= 0) {
+            const JointActionCandidate both = makeCandidate(static_cast<size_t>(fixedA),
+                                                            static_cast<size_t>(fixedB));
+            if (both.jointPrior >= 0.0f) {
+                best = both;
+            }
+        }
+        const auto bestPartner = [&](bool fixA, size_t fixed) {
+            const size_t count = fixA ? sortedActionsB.size() : sortedActionsA.size();
+            for (size_t other = 0; other < count; ++other) {
+                const JointActionCandidate candidate =
+                    fixA ? makeCandidate(fixed, other) : makeCandidate(other, fixed);
+                if (candidate.jointPrior >= 0.0f) {
+                    if (!best || candidate.jointPrior > best->jointPrior) {
+                        best = candidate;
+                    }
+                    return;
+                }
+            }
+        };
+        if (!best) {
+            if (fixedA >= 0) {
+                bestPartner(true, static_cast<size_t>(fixedA));
+            }
+            if (fixedB >= 0) {
+                bestPartner(false, static_cast<size_t>(fixedB));
+            }
+        }
+        return best && promote(best->moveA, best->moveB, best->planned);
+    }
+
+    /** The promoted candidate waiting to be expanded, if any (fix 3 tests). */
+    std::optional<JointActionCandidate> promoted() const { return promotedCandidate; }
+
+    /** Board @p boardIndex's actions and priors in their sorted order (fix 3 tests). */
+    const std::vector<Stockfish::Move>& sorted_actions(int boardIndex) const {
+        return boardIndex == 0 ? sortedActionsA : sortedActionsB;
+    }
+    const std::vector<float>& sorted_priors(int boardIndex) const {
+        return boardIndex == 0 ? sortedPriorsA : sortedPriorsB;
     }
 
     /**

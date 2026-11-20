@@ -1,7 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+
+#include "Fairy-Stockfish/src/types.h"
 
 /**
  * @file search_params.h
@@ -944,6 +947,13 @@ struct RuntimeConfig {
     int jointPolicyTopK = JOINT_POLICY_TOP_K;
     int rootJointPolicyTopK = ROOT_JOINT_POLICY_TOP_K;
     float jointPolicyResidualScale = JOINT_POLICY_RESIDUAL_SCALE;
+    // Wave 2c, fix 3 (PlanCarry): the carried move per board (MOVE_NONE =
+    // none) and its mixing weight. Read only at the search root (depth 0):
+    // a fresh root mixes it into its priors and promotes the pair holding it
+    // at expansion (Node::try_init_and_expand). Agent::run_search fills it
+    // for the workers' copy; every caller's config leaves it empty.
+    std::array<Stockfish::Move, 2> rootPlanMove{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
+    float rootPlanWeight = 0.0f;
 };
 
 // =============================================================================

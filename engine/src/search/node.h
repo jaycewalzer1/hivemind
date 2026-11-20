@@ -739,6 +739,24 @@ public:
                                 config.rootDirichletEpsilon,
                                 config.rootNoiseSeed ^ hash ^ ROOT_NOISE_SALT_B);
         }
+        // Wave 2c, fix 3 (PlanCarry): a fresh root mixes the carried move(s)
+        // into its priors after the noise, so noisy self-play still explores.
+        const bool carriesPlan = m_depth.load(std::memory_order_relaxed) == 0
+            && config.rootPlanWeight > 0.0f
+            && (config.rootPlanMove[0] != Stockfish::MOVE_NONE
+                || config.rootPlanMove[1] != Stockfish::MOVE_NONE);
+        if (carriesPlan) {
+            for (int boardIndex : {0, 1}) {
+                const std::vector<Stockfish::Move>& actions = boardIndex == 0 ? actionsA : actionsB;
+                const Stockfish::Move move = config.rootPlanMove[boardIndex];
+                const auto found = std::find(actions.begin(), actions.end(), move);
+                if (move != Stockfish::MOVE_NONE && found != actions.end()) {
+                    mix_root_plan(boardIndex == 0 ? rootPriorsA : rootPriorsB,
+                                  static_cast<size_t>(std::distance(actions.begin(), found)),
+                                  config.rootPlanWeight);
+                }
+            }
+        }
 
         candidateGenerator.initialize(actionsA, actionsB, rootPriorsA, rootPriorsB,
                           teamHasTimeAdvantage, boardAOnTurn, boardBOnTurn,
@@ -758,7 +776,13 @@ public:
         visitedEdgePositions.clear();
         provenWinningChildCount = 0;
         initialize_root_gumbel_locked(config);
-        
+        if (carriesPlan) {
+            // Fix 3: the frontier now exists and nothing rebuilds it before
+            // the first child below, so the pair holding the carried move is
+            // that child: its "initial visit" (spec v5, fix 3 step 3).
+            candidateGenerator.promoteCarried(config.rootPlanMove[0], config.rootPlanMove[1]);
+        }
+
         // Try to expand the first child
         if (candidateGenerator.hasNext()) {
             JointActionCandidate candidate = candidateGenerator.getNext();
@@ -1077,6 +1101,44 @@ public:
      */
     void refresh_root_noise(const SearchParams::RuntimeConfig& config);
 
+    /**
+     * @brief Wave 2c, fix 3 (PlanCarry): mix the carried move @p move into
+     * board @p boardIndex's priors of an expanded root by @p weight, as
+     * refresh_root_noise does for noise (after it, before
+     * configure_root_search, which then rescores the expanded edges). False
+     * when the move is not on that board's list or the node is unexpanded:
+     * a fresh root gets the mix at its expansion instead.
+     */
+    bool apply_root_plan(int boardIndex, Stockfish::Move move, float weight);
+
+    /**
+     * @brief Fix 3: expand next the best pair holding the carried move(s)
+     * (JointCandidateGenerator::promoteCarried). On an adopted root call it
+     * after configure_root_search, which rebuilds the frontier and drops any
+     * promotion made before it.
+     */
+    bool promote_carried_plan(Stockfish::Move planA, Stockfish::Move planB) {
+        std::unique_lock<std::shared_mutex> guard(nodeMutex);
+        return m_is_expanded.load(std::memory_order_relaxed)
+            && candidateGenerator.promoteCarried(planA, planB);
+    }
+
+    /** Fix 3 tests: the generator's pending promotion and sorted lists. */
+    std::optional<JointActionCandidate> promoted_candidate() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return candidateGenerator.promoted();
+    }
+    std::vector<std::pair<Stockfish::Move, float>> board_priors(int boardIndex) const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        std::vector<std::pair<Stockfish::Move, float>> priors;
+        const auto& actions = candidateGenerator.sorted_actions(boardIndex);
+        const auto& values = candidateGenerator.sorted_priors(boardIndex);
+        for (size_t i = 0; i < actions.size() && i < values.size(); ++i) {
+            priors.emplace_back(actions[i], values[i]);
+        }
+        return priors;
+    }
+
     // =========================================================================
     // MCTS Solver Methods
     // =========================================================================
@@ -1174,7 +1236,16 @@ public:
         }
         return 0.0f;
     }
-    
+
+    /** The prior of the edge to child @p childIdx (0 for an invalid index). */
+    float get_child_prior(int childIdx) const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        if (childIdx >= 0 && static_cast<size_t>(childIdx) < edges.size()) {
+            return edges[childIdx].prior;
+        }
+        return 0.0f;
+    }
+
     /**
      * @brief Get the best move index using Q-value veto and weighting.
      * 
