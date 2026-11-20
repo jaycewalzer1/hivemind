@@ -70,6 +70,14 @@ struct SearchOptions {
     // permanent brain searches the opponents' position to prepare our next
     // search, so it judges for us.
     std::optional<Stockfish::Color> verdictTeam;
+    // Wave 2c, fix 1 (UCI TeamTreeReuse, docs/custom_engine_spec_v5_continuity.md):
+    // under a durative clock, keep the whole tree between this team's
+    // searches and root the next one at the node the game reached, re-timed
+    // to the real clocks, instead of the exact-hash candidates above (which
+    // never match a seat clock). Its seat clocks and the other team's ready
+    // times may differ by at most teamTreeReuseToleranceMs.
+    bool teamTreeReuse = false;
+    int teamTreeReuseToleranceMs = 250;
 
     SearchParams::RuntimeConfig search;
     
@@ -83,6 +91,28 @@ struct SearchOptions {
         return opts;
     }
     
+};
+
+/**
+ * @brief What fix 1 (TeamTreeReuse) did at the start of one search: whether
+ * it adopted a node of the retained tree, and if not why. Reasons: "no node"
+ * (no node of the tree has the live boards), "clock" (the closest has
+ * clocks beyond the tolerance), "shape" (it would act on other boards, or
+ * sits or holds pieces back differently), "committed" (fix 2), "solved"
+ * (unexpanded or proven), "no tree" (nothing retained).
+ */
+struct TeamTreeReuseReport {
+    bool attempted = false;
+    bool adopted = false;
+    std::string reason;
+    // The adopted root's visits after re-timing; edges cleared by it.
+    int visits = 0;
+    int pruned = 0;
+    // Largest clock difference at the adopted node, or at the closest node
+    // with the live boards (-1: none).
+    int clockDiffMs = -1;
+    // Nodes of the old tree with the live boards and our team to play.
+    int boardMatches = 0;
 };
 
 struct RootEdgeStats {
@@ -285,6 +315,43 @@ private:
     std::vector<MateContinuation> mateContinuations_;
     uint64_t lastSearchHash_ = 0;            // Hash of last search position
 
+    // Wave 2c, fix 1 (TeamTreeReuse): the last durative search's whole tree,
+    // kept for this team's next search to adopt the node the game reached.
+    struct TeamTree {
+        std::shared_ptr<Node> root;      // the last search's root; owns the tree
+        std::shared_ptr<Board> board;    // its position, to replay edges from
+        std::string boardA, boardB;      // its FENs (pockets included)
+        std::array<int, 2> plies{};      // game_ply per board
+        TimeState rootTime;              // the durative clock it was rooted at
+        Stockfish::Color team = Stockfish::WHITE;  // only this team reuses it
+    };
+    std::optional<TeamTree> teamTree_;
+    TeamTreeReuseReport lastTeamTreeReuse_;
+    // The adoption's re-timed nodes, for the fresh transposition table.
+    std::vector<std::shared_ptr<Node>> teamTreeWalked_;
+
+    /** Where find_team_tree_node got to. */
+    struct TeamTreeMatch {
+        std::shared_ptr<Node> node;
+        int clockDiffMs = -1;
+        std::string reason = "no node";
+        int boardMatches = 0;
+    };
+    /** What retime_team_tree did. */
+    struct TeamTreeRetime {
+        int pruned = 0;
+        std::vector<std::shared_ptr<Node>> walked;
+    };
+    TeamTreeMatch find_team_tree_node(Board& board, Stockfish::Color team,
+                                      const TimeState& live, int toleranceMs);
+    TeamTreeRetime retime_team_tree(const std::shared_ptr<Node>& root, Board& board,
+                                    const TimeState& rootTime, bool background,
+                                    size_t maxRetained = SearchParams::TEAM_TREE_MAX_RETAINED);
+    std::shared_ptr<Node> adopt_team_tree(Board& board, Stockfish::Color team,
+                                          const SearchOptions& options);
+    void store_team_tree(Board& board, Stockfish::Color team);
+    void drop_team_tree(bool background);
+
     /**
      * Root pre-pass accounting.
      *
@@ -311,6 +378,7 @@ private:
     friend class AgentTreeReuseTestPeer;
     friend class AgentDurativeTestPeer;
     friend class AgentDurativePart2Peer;
+    friend class AgentContinuityPeer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);
@@ -406,6 +474,8 @@ public:
     GameStatus search_status() const { return searchStatus_; }
     NodeType root_type() const { return rootNode ? rootNode->get_node_type() : NodeType::UNSOLVED; }
     bool certified_choice() const { return certifiedChoice_; }
+    /** Fix 1: what TeamTreeReuse did at the start of the last search. */
+    const TeamTreeReuseReport& team_tree_reuse() const { return lastTeamTreeReuse_; }
 
     /** Returns telemetry from the most recent internal mate-probe experiment. */
     InternalMateProbeStats internal_mate_probe_stats() const;

@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -6055,6 +6056,7 @@ void Agent::reset_search_state() {
     nextRootCandidates_.clear();
     mateContinuations_.clear();
     lastSearchHash_ = 0;
+    drop_team_tree(false);
     if (transpositionTable) {
         discard(transpositionTable->detach(), false);
     }
@@ -6176,10 +6178,28 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         ? *options.clock
         : TimeState::legacy(teamSide, teamHasTimeAdvantage);
     teamHasTimeAdvantage = searchTime_.can_sit(teamSide);
+    // Wave 2c, fix 1 (TeamTreeReuse): under a durative clock this team's
+    // whole last tree replaces the exact-hash candidates, which never match
+    // a seat clock. Nothing else survives from one search to the next: the
+    // single-board mate continuations are not re-timed, and the exact-path
+    // state would be a second difference from a fresh search.
+    const bool teamTreeMode = !options.background && options.teamTreeReuse
+        && searchTime_.is_durative();
+    if (!options.background) {
+        lastTeamTreeReuse_ = {};
+        if (teamTreeMode) {
+            mateContinuations_.clear();
+            nextRootCandidates_.clear();
+            lastSearchHash_ = 0;
+        } else if (teamTree_) {
+            drop_team_tree(false);
+        }
+    }
     searchStatus_ = adjudicate_game(board, teamSide, searchTime_);
     if (searchStatus_ != GameStatus::ONGOING) {
         if (!options.background) {
             nextRootCandidates_.clear();
+            drop_team_tree(false);
         }
         if (options.verbose) {
             cout << "bestmove (none)" << endl;
@@ -6228,7 +6248,11 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
 
     // Try to reuse tree from previous search (if enabled)
     std::shared_ptr<Node> reusedRoot = nullptr;
-    if (SearchParams::ENABLE_TREE_REUSE) {
+    if (teamTreeMode) {
+        // Fix 1: the node the game reached in this team's last tree,
+        // re-timed to these clocks (the exact path is not used).
+        reusedRoot = adopt_team_tree(board, teamSide, options);
+    } else if (SearchParams::ENABLE_TREE_REUSE) {
         reusedRoot = try_reuse_tree(
             positionHash, teamSide, positionSignature, options.background);
     }
@@ -6257,8 +6281,12 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             options.search.drawContempt > 0.0f);
         if (claimed && loses_mate_race(board, *claimed)) {
             if (options.verbose) {
-                cout << "info string Tree reuse: discarding a proven win that "
-                        "loses the mate race" << endl;
+                cout << "info string " << (teamTreeMode ? "Team tree reuse" : "Tree reuse")
+                     << ": discarding a proven win that loses the mate race" << endl;
+            }
+            if (teamTreeMode) {
+                lastTeamTreeReuse_.adopted = false;
+                lastTeamTreeReuse_.reason = "solved";
             }
             reusedRoot.reset();
             drop_retained_candidates();
@@ -6282,13 +6310,31 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                  size_t{1}});
         }
 
-        if (options.verbose) {
+        if (options.verbose && !teamTreeMode) {
             cout << "info string Tree reuse: " << rootNode->get_visits()
                  << " visits recovered" << endl;
         }
     } else {
         // Create new root node
         rootNode = make_shared<Node>(teamSide, positionHash);
+    }
+    if (teamTreeMode && reusedRoot == nullptr) {
+        // A refused or dropped adoption keeps no part of the old tree.
+        teamTreeWalked_.clear();
+    }
+    if (teamTreeMode && options.verbose) {
+        const TeamTreeReuseReport& reuse = lastTeamTreeReuse_;
+        if (reusedRoot) {
+            cout << "info string Team tree reuse: " << reuse.visits
+                 << " visits recovered, clock diff " << reuse.clockDiffMs << " ms, "
+                 << reuse.pruned << " pruned" << endl;
+        } else {
+            cout << "info string Team tree reuse: none (" << reuse.reason << ")";
+            if (reuse.clockDiffMs >= 0) {
+                cout << ", clock diff " << reuse.clockDiffMs << " ms";
+            }
+            cout << endl;
+        }
     }
     rootNode->configure_root_search(
         options.search, !mustPlayDespiteTeamMate);
@@ -6329,12 +6375,22 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         // Released on the GC thread: clearing in place costs tens of
         // milliseconds before the first mate check can run.
         discard(transpositionTable->detach(), options.background);
-        if (reusedRoot) {
+        if (reusedRoot && teamTreeMode) {
+            // Fix 1: exactly the nodes the re-timing walk validated, under
+            // the hashes it recomputed from these clocks.
+            for (const std::shared_ptr<Node>& node : teamTreeWalked_) {
+                if (node->get_hash() != 0) {
+                    transpositionTable->insertOrGet(node->get_hash(), node);
+                }
+            }
+        } else if (reusedRoot) {
             reindex_reused_subtree(rootNode, options.background);
         } else {
             transpositionTable->insertOrGet(positionHash, rootNode);
         }
     }
+
+    teamTreeWalked_.clear();
 
     const size_t workerCount = static_cast<size_t>(numThreads) * engines.size();
     ensure_worker_pool(workerCount);
@@ -8457,7 +8513,18 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     // guessed nothing: it is always stopped, and its index is the whole point.
     const bool missedPonder = options.isPonder && !options.background
         && stopRequested_.load(std::memory_order_acquire);
-    if (SearchParams::ENABLE_TREE_REUSE && missedPonder) {
+    if (teamTreeMode) {
+        // Fix 1: the whole tree, whatever retainForReuse says (self-play
+        // turns that off); the next search of this team looks in it for the
+        // node the game reaches. A missed ponder guessed wrong: drop it.
+        nextRootCandidates_.clear();
+        lastSearchHash_ = 0;
+        if (missedPonder) {
+            drop_team_tree(false);
+        } else {
+            store_team_tree(board, teamSide);
+        }
+    } else if (SearchParams::ENABLE_TREE_REUSE && missedPonder) {
         nextRootCandidates_.clear();
         lastSearchHash_ = 0;
     } else if (SearchParams::ENABLE_TREE_REUSE) {
@@ -9039,6 +9106,378 @@ std::shared_ptr<Node> Agent::try_reuse_tree(uint64_t positionHash,
     nextRootCandidates_.clear();
 
     return reused;
+}
+
+namespace {
+
+/**
+ * A board's FEN split for fix 1's descent: the position (placement, side to
+ * move, castling, en passant) and the pocket as a sorted multiset. The move
+ * counters are left out: the arena sends a FEN only, and its counters need
+ * not be the ones the tree's board kept.
+ */
+struct FenParts {
+    std::string position;
+    std::string pocket;
+};
+
+FenParts split_fen(const std::string& fen) {
+    std::istringstream fields(fen);
+    std::string placement, side, castling, enPassant;
+    fields >> placement >> side >> castling >> enPassant;
+    FenParts parts;
+    const size_t open = placement.find('[');
+    if (open != std::string::npos) {
+        const size_t close = placement.find(']', open);
+        parts.pocket = placement.substr(
+            open + 1, close == std::string::npos ? std::string::npos : close - open - 1);
+        placement.erase(open, close == std::string::npos ? std::string::npos : close - open + 1);
+    }
+    std::erase(parts.pocket, '-');
+    std::sort(parts.pocket.begin(), parts.pocket.end());
+    parts.position = placement + " " + side + " " + castling + " " + enPassant;
+    return parts;
+}
+
+/** Whether pocket @p part is a sub-multiset of pocket @p whole (both sorted). */
+bool pocket_within(const std::string& part, const std::string& whole) {
+    return std::includes(whole.begin(), whole.end(), part.begin(), part.end());
+}
+
+}  // namespace
+
+/**
+ * @brief Fix 1: the node of this team's retained tree that the game has
+ * reached, if one may be adopted at @p live.
+ *
+ * The moves that landed since the last search are exactly the difference
+ * between its boards and @p board, so the walk follows them: an edge is
+ * followed only while no board has moved more often along the path than in
+ * the game (game_ply, as offsets from the old root), and a board that has
+ * moved as often already shows the live position, with a pocket that is at
+ * most the live one (it only grows until that seat moves). Wait and pass
+ * edges move nothing and are followed. Each node's time is the durative
+ * charge the search used (after_action), not v3's advance().
+ *
+ * A node with the live boards and our team to play is adopted when it is
+ * expanded and unsolved, in the live turn state (same_turn_state), within
+ * @p toleranceMs of the live clocks (clock_distance) and expanded as the
+ * live root would be (its expansion key under @p live: at the root our team
+ * decides on every board it is on turn). Among several, the smallest clock
+ * difference wins, then the most visits. Depth-first with make/unmake; the
+ * board test leaves only the played line and its wait nodes, so the caps
+ * (TEAM_TREE_MAX_PLIES, TEAM_TREE_MAX_VISITED) rarely bind.
+ */
+Agent::TeamTreeMatch Agent::find_team_tree_node(Board& board, Stockfish::Color team,
+                                                const TimeState& live, int toleranceMs) {
+    TeamTreeMatch match;
+    if (!teamTree_ || !teamTree_->root || !teamTree_->board || teamTree_->team != team
+        || !teamTree_->rootTime.is_durative() || !live.is_durative()) {
+        match.reason = "no tree";
+        return match;
+    }
+    const TeamTree& tree = *teamTree_;
+    const std::array<FenParts, 2> liveFen = {split_fen(board.fen(BOARD_A)),
+                                             split_fen(board.fen(BOARD_B))};
+    const std::array<int, 2> liveOffset = {board.game_ply(BOARD_A) - tree.plies[BOARD_A],
+                                           board.game_ply(BOARD_B) - tree.plies[BOARD_B]};
+    if (liveOffset[BOARD_A] < 0 || liveOffset[BOARD_B] < 0) {
+        return match;
+    }
+
+    Board path(*tree.board);
+    std::unordered_set<const Node*> seen;
+    // How far the best refusal got: solved < turn state < clock < expansion.
+    int bestRefusal = -1;
+    int bestClockDiff = std::numeric_limits<int>::max();
+    int adoptedDiff = std::numeric_limits<int>::max();
+    int adoptedVisits = -1;
+
+    const auto consider = [&](Node* node, const TimeState& time) {
+        ++match.boardMatches;
+        const int diff = time.clock_distance(live);
+        bestClockDiff = std::min(bestClockDiff, diff);
+        int refusal = -1;
+        const char* reason = nullptr;
+        if (!node->is_expanded() || node->get_node_type() != NodeType::UNSOLVED) {
+            refusal = 0;
+            reason = "solved";
+        } else if (!time.same_turn_state(live)) {
+            refusal = 1;
+            reason = "shape";
+        } else if (diff > toleranceMs) {
+            refusal = 2;
+            reason = "clock";
+        } else if (node->expansion_key() != durative_expansion_key(path, team, live)) {
+            // At the live root our team acts on every board it is on turn;
+            // a node where one of those seats was not ready acted on one.
+            refusal = 3;
+            reason = "shape";
+        }
+        if (reason) {
+            if (refusal > bestRefusal) {
+                bestRefusal = refusal;
+                match.reason = reason;
+            }
+            return;
+        }
+        const int visits = node->get_visits();
+        if (diff < adoptedDiff || (diff == adoptedDiff && visits > adoptedVisits)) {
+            adoptedDiff = diff;
+            adoptedVisits = visits;
+            match.node = node->shared_from_this();
+        }
+    };
+
+    std::function<void(Node*, const TimeState&, std::array<int, 2>, int)> descend =
+        [&](Node* node, const TimeState& time, std::array<int, 2> plies, int depth) {
+            if (seen.size() >= SearchParams::TEAM_TREE_MAX_VISITED
+                || !seen.insert(node).second) {
+                return;
+            }
+            if (node->get_team_to_play() == team && plies == liveOffset) {
+                const FenParts nowA = split_fen(path.fen(BOARD_A));
+                const FenParts nowB = split_fen(path.fen(BOARD_B));
+                if (nowA.position == liveFen[BOARD_A].position
+                    && nowB.position == liveFen[BOARD_B].position
+                    && nowA.pocket == liveFen[BOARD_A].pocket
+                    && nowB.pocket == liveFen[BOARD_B].pocket) {
+                    consider(node, time);
+                }
+            }
+            if (depth >= SearchParams::TEAM_TREE_MAX_PLIES || !node->is_expanded()) {
+                return;
+            }
+            const Stockfish::Color acting = node->get_team_to_play();
+            const std::vector<std::shared_ptr<Node>> children = node->get_children();
+            for (size_t index = 0; index < children.size(); ++index) {
+                if (!children[index]) {
+                    continue;
+                }
+                const JointActionCandidate action =
+                    node->get_joint_action(static_cast<int>(index));
+                std::array<int, 2> next = plies;
+                next[BOARD_A] += action.moveA != Stockfish::MOVE_NONE ? 1 : 0;
+                next[BOARD_B] += action.moveB != Stockfish::MOVE_NONE ? 1 : 0;
+                if (next[BOARD_A] > liveOffset[BOARD_A] || next[BOARD_B] > liveOffset[BOARD_B]) {
+                    continue;
+                }
+                const TimeState childTime = time.after_action(
+                    acting, action.moveA != Stockfish::MOVE_NONE,
+                    action.moveB != Stockfish::MOVE_NONE,
+                    path.hand_piece_type(BOARD_A, action.moveA),
+                    path.hand_piece_type(BOARD_B, action.moveB));
+                path.make_moves(action.moveA, action.moveB);
+                bool follows = true;
+                for (int boardNumber : {BOARD_A, BOARD_B}) {
+                    if (next[boardNumber] != liveOffset[boardNumber]) {
+                        continue;
+                    }
+                    // This board has moved as often as in the game: it must
+                    // show the live position, its pocket at most the live one.
+                    const FenParts now = split_fen(path.fen(boardNumber));
+                    follows = follows && now.position == liveFen[boardNumber].position
+                        && pocket_within(now.pocket, liveFen[boardNumber].pocket);
+                }
+                if (follows) {
+                    descend(children[index].get(), childTime, next, depth + 1);
+                }
+                path.unmake_moves(action.moveA, action.moveB);
+            }
+        };
+    descend(tree.root.get(), tree.rootTime, {0, 0}, 0);
+
+    if (match.node) {
+        match.clockDiffMs = adoptedDiff;
+        match.reason.clear();
+    } else if (match.boardMatches > 0) {
+        match.clockDiffMs = bestClockDiff;
+    }
+    return match;
+}
+
+/**
+ * @brief Fix 1: re-time an adopted subtree to the clock @p rootTime.
+ *
+ * Nodes store no time, only what was derived from it: their hash, their
+ * expansion (expansionKey_), solver verdicts and their transposition entry.
+ * A breadth-first count keeps the shallowest TEAM_TREE_MAX_RETAINED nodes;
+ * a depth-first walk with make/unmake then carries each path's time down
+ * from @p rootTime as the search charges it, and for each child:
+ *   - beyond the cap: replaced by a fresh node;
+ *   - reached before through another parent (the tree is an MCGS graph)
+ *     with another recomputed hash: this edge gets a fresh node (a split);
+ *     with the same hash it stays shared and is not walked again;
+ *   - solved, with a recomputed hash other than its old one (the hash holds
+ *     the whole durative state, so its time changed): replaced, its proof
+ *     is re-found under these clocks if it still holds;
+ *   - expanded with another expansion key under the new time: replaced.
+ * A replaced child's edge forgets its statistics (Node::reset_edge_for_reuse),
+ * so a dropped proof does not live on as a soft one. Every node kept, and
+ * every fresh node, gets its path's recomputed hash and is listed in
+ * `walked` for the new transposition table; @p board is the live position
+ * and is restored.
+ */
+Agent::TeamTreeRetime Agent::retime_team_tree(const std::shared_ptr<Node>& root,
+                                              Board& board, const TimeState& rootTime,
+                                              bool background, size_t maxRetained) {
+    TeamTreeRetime out;
+    if (!root) {
+        return out;
+    }
+    std::unordered_set<const Node*> kept;
+    {
+        std::deque<Node*> queue = {root.get()};
+        kept.insert(root.get());
+        while (!queue.empty() && kept.size() < maxRetained) {
+            Node* node = queue.front();
+            queue.pop_front();
+            if (!node->is_expanded()) {
+                continue;
+            }
+            for (const std::shared_ptr<Node>& child : node->get_children()) {
+                if (kept.size() >= maxRetained) {
+                    break;
+                }
+                if (child && kept.insert(child.get()).second) {
+                    queue.push_back(child.get());
+                }
+            }
+        }
+    }
+
+    std::unordered_map<const Node*, uint64_t> hashes;
+    std::vector<std::shared_ptr<Node>> replaced;
+    // The fresh node takes its path's hash and goes into the table, as the
+    // search's own canonicalize_child would do at its first visit.
+    const auto replace = [&](Node& parent, int childIdx, uint64_t childHash) {
+        parent.reset_edge_for_reuse(childIdx);
+        auto fresh = std::make_shared<Node>(~parent.get_team_to_play(), childHash);
+        fresh->set_depth(parent.get_depth() + 1);
+        replaced.push_back(parent.get_child(childIdx));
+        parent.replace_child(childIdx, fresh);
+        out.walked.push_back(std::move(fresh));
+        ++out.pruned;
+    };
+
+    std::function<void(Node&, const TimeState&)> walk =
+        [&](Node& node, const TimeState& time) {
+            const uint64_t hash = board.search_hash_key(node.get_team_to_play(), time);
+            node.set_hash(hash);
+            hashes.emplace(&node, hash);
+            out.walked.push_back(node.shared_from_this());
+            if (!node.is_expanded()) {
+                return;
+            }
+            const Stockfish::Color acting = node.get_team_to_play();
+            const std::vector<std::shared_ptr<Node>> children = node.get_children();
+            for (size_t index = 0; index < children.size(); ++index) {
+                const std::shared_ptr<Node>& child = children[index];
+                if (!child) {
+                    continue;
+                }
+                const int childIdx = static_cast<int>(index);
+                const JointActionCandidate action = node.get_joint_action(childIdx);
+                const TimeState childTime = time.after_action(
+                    acting, action.moveA != Stockfish::MOVE_NONE,
+                    action.moveB != Stockfish::MOVE_NONE,
+                    board.hand_piece_type(BOARD_A, action.moveA),
+                    board.hand_piece_type(BOARD_B, action.moveB));
+                board.make_moves(action.moveA, action.moveB);
+                const Stockfish::Color childTeam = child->get_team_to_play();
+                const uint64_t childHash = board.search_hash_key(childTeam, childTime);
+                if (const auto known = hashes.find(child.get()); known != hashes.end()) {
+                    if (known->second != childHash) {
+                        replace(node, childIdx, childHash);
+                    }
+                } else if (!kept.contains(child.get())) {
+                    replace(node, childIdx, childHash);
+                } else if (child->get_node_type() != NodeType::UNSOLVED
+                           && child->get_hash() != childHash) {
+                    replace(node, childIdx, childHash);
+                } else if (child->is_expanded()
+                           && child->expansion_key()
+                               != durative_expansion_key(board, childTeam, childTime)) {
+                    replace(node, childIdx, childHash);
+                } else {
+                    walk(*child, childTime);
+                }
+                board.unmake_moves(action.moveA, action.moveB);
+            }
+        };
+    walk(*root, rootTime);
+    for (std::shared_ptr<Node>& node : replaced) {
+        discard(std::move(node), background);
+    }
+    return out;
+}
+
+/**
+ * @brief Fix 1 at the start of a search: adopt the node the game reached in
+ * this team's last tree, re-timed to searchTime_, or nothing. Either way the
+ * rest of the old tree goes to the GC thread and the retained tree is gone;
+ * lastTeamTreeReuse_ says what happened, teamTreeWalked_ holds the re-timed
+ * nodes for the fresh transposition table.
+ */
+std::shared_ptr<Node> Agent::adopt_team_tree(Board& board, Stockfish::Color team,
+                                             const SearchOptions& options) {
+    TeamTreeReuseReport& report = lastTeamTreeReuse_;
+    report = {};
+    report.attempted = true;
+    teamTreeWalked_.clear();
+    const TeamTreeMatch match = find_team_tree_node(
+        board, team, searchTime_, std::max(0, options.teamTreeReuseToleranceMs));
+    report.reason = match.reason;
+    report.clockDiffMs = match.clockDiffMs;
+    report.boardMatches = match.boardMatches;
+    std::shared_ptr<Node> adopted = match.node;
+    std::shared_ptr<Node> oldRoot = teamTree_ ? std::move(teamTree_->root) : nullptr;
+    teamTree_.reset();
+    if (adopted) {
+        Board walkBoard(board);
+        TeamTreeRetime retimed = retime_team_tree(adopted, walkBoard, searchTime_, false);
+        // A proof found in the new search stops at its root.
+        adopted->clear_parent_edges();
+        report.adopted = true;
+        report.visits = adopted->get_visits();
+        report.pruned = retimed.pruned;
+        teamTreeWalked_ = std::move(retimed.walked);
+    }
+    if (rootNode && rootNode != adopted && rootNode != oldRoot) {
+        discard(rootNode, false);
+    }
+    rootNode.reset();
+    if (oldRoot && oldRoot != adopted) {
+        discard(std::move(oldRoot), false);
+    }
+    return adopted;
+}
+
+/** Fix 1 at the end of a search: keep its whole tree for this team's next one. */
+void Agent::store_team_tree(Board& board, Stockfish::Color team) {
+    drop_team_tree(false);
+    if (!rootNode || !rootNode->is_expanded()) {
+        return;
+    }
+    TeamTree tree;
+    tree.root = rootNode;
+    tree.board = std::make_shared<Board>(board);
+    tree.boardA = board.fen(BOARD_A);
+    tree.boardB = board.fen(BOARD_B);
+    tree.plies = {board.game_ply(BOARD_A), board.game_ply(BOARD_B)};
+    tree.rootTime = searchTime_;
+    tree.team = team;
+    teamTree_ = std::move(tree);
+}
+
+void Agent::drop_team_tree(bool background) {
+    if (!teamTree_) {
+        return;
+    }
+    if (teamTree_->root) {
+        discard(std::move(teamTree_->root), background);
+    }
+    teamTree_.reset();
 }
 
 int Agent::retain_played_line(const Board& board,

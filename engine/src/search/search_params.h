@@ -262,6 +262,16 @@ constexpr size_t TREE_REUSE_MAX_CANDIDATES = 4096;
 constexpr size_t TREE_REUSE_REINDEX_MAX_NODES = 100000;
 
 /**
+ * Wave 2c, fix 1 (TeamTreeReuse): the search for the node the game reached
+ * in the last search's tree follows at most this many joint plies (wait
+ * nodes count) and visits at most this many nodes; the re-timed tree keeps
+ * at most TEAM_TREE_MAX_RETAINED nodes, the shallowest first.
+ */
+constexpr int TEAM_TREE_MAX_PLIES = 8;
+constexpr size_t TEAM_TREE_MAX_VISITED = 20000;
+constexpr size_t TEAM_TREE_MAX_RETAINED = TREE_REUSE_REINDEX_MAX_NODES;
+
+/**
  * Permanent brain: keep searching between moves instead of sitting idle.
  *
  * Ponder only fires when the GUI sends "go ponder" for the exact predicted
