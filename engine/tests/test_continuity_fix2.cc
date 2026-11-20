@@ -1013,6 +1013,140 @@ TEST_F(JointPlansSearch, TeamTreeReuseRefusesCommittedCandidate) {
               });
     EXPECT_GT(opponentCommitted, 0);
 }
+
+// ---- 2.4a, 2.4b: coordination with a real network --------------------------
+
+class JointPlansIt13 : public ::testing::Test {
+public:
+    static void SetUpTestSuite() {
+        init_fairy_stockfish();
+        init_policy_index();
+    }
+
+    void SetUp() override {
+        const auto model = std::filesystem::path(__FILE__).parent_path().parent_path()
+            / "models" / "twin-s-clock-it13.onnx";
+        if (!std::filesystem::exists(model)) {
+            GTEST_SKIP() << "needs engine/models/twin-s-clock-it13.onnx";
+        }
+        engine = std::make_unique<Engine>(0, 1);
+        ASSERT_TRUE(engine->loadNetwork(model.string(), ""));
+    }
+
+    /** The most visited root edge of a @p nodes search, as text, and its child's Q. */
+    struct Choice {
+        JointActionCandidate action;
+        std::string text;
+        int visits = 0;
+        float q = 0.0f;
+        NodeType childType = NodeType::UNSOLVED;
+    };
+    Choice choose(Board& board, Stockfish::Color team, const TimeState& clock, size_t nodes,
+                  bool provers = true) {
+        Agent agent(1);
+        SearchOptions opts;
+        opts.targetNodes = nodes;
+        opts.enablePonder = false;
+        opts.clock = clock;
+        if (!provers) {
+            opts.search.enableRootMateSearch = false;
+            opts.search.certifySelectedMove = false;
+            opts.search.enableMateProbe = false;
+        }
+        testing::internal::CaptureStdout();
+        const JointActionCandidate chosen = agent.run_search(board, {engine.get()}, team, false, opts);
+        testing::internal::GetCapturedStdout();
+        lastRootType = static_cast<int>(agent.root_type());
+        Choice best;
+        best.action = chosen;
+        for (const RootEdgeStats& edge : agent.root_edge_stats()) {
+            if (edge.action.same_moves(chosen)) {
+                best.visits = edge.visits;
+                best.q = edge.q;
+                best.childType = edge.childType;
+            }
+        }
+        const auto uci = [&board](int b, Stockfish::Move move) {
+            return move == MOVE_NONE ? std::string("pass") : board.uci_move(b, move);
+        };
+        const int plannedBoard = AgentContinuityFix2Peer::root(agent)->planned_board();
+        best.text = "(" + uci(BOARD_A, best.action.moveA) + "," + uci(BOARD_B, best.action.moveB)
+            + ")";
+        if (best.action.planned != MOVE_NONE && plannedBoard >= 0) {
+            best.text += " planned " + uci(plannedBoard, best.action.planned);
+        }
+        return best;
+    }
+
+    std::unique_ptr<Engine> engine;
+    int lastRootType = 0;
+};
+
+/**
+ * Spec 2.4a: our team white; B: Bw's king on h1 smothered (Rg1, g2, h2, f2
+ * unguarded), Bb (black) to move with an empty pocket, so N@f2# needs a
+ * knight; A: Aw's queen takes a knight on f6 that a pawn recaptures. Ab's
+ * root move has just landed: Aw is ready at 100 ms, Ab replies after 50, Bb
+ * is on turn and ready at 400. InstantTransfer, FlagLoss, no SitGate.
+ *
+ * As measured (docs/wave2_engine.md, Wave 2c fix 2): the tree without fix 2
+ * finds Qxf6 too, at every budget from 64 nodes, with or without the root
+ * mate provers, and proves it within a few root visits: after the capture
+ * black is on turn on one board while N@f2# waits on the other and survives
+ * every reply, which the waiting-board mate rule
+ * (has_unavoidable_waiting_board_mate) proves. With fix 2 the tree proves
+ * the same move through its "decide later" pair. A harder position that the
+ * old tree misses would no longer be a mate that survives every reply, so
+ * not the forced win this test needs. The test records that both trees
+ * choose and prove the capture.
+ */
+TEST_F(JointPlansIt13, FindsCaptureFeedingAMatingDropAtLowNodes) {
+    struct Case {
+        Stockfish::Color team;
+        std::string fenA, fenB, capture;
+    };
+    const std::vector<Case> cases = {
+        {WHITE, "4k3/4ppp1/5n2/8/8/5Q2/5PPP/4K3[] w - - 0 1", "k7/8/8/8/8/8/6PP/6RK[] b - - 0 1",
+         "f3f6"},
+        // The mirror: our team black (Ab, Bw), Bb's king smothered on h8.
+        {BLACK, "4k3/5ppp/5q2/8/8/5N2/4PPP1/4K3[] b - - 0 1", "6rk/6pp/8/8/8/8/8/K7[] w - - 0 1",
+         "f6f3"},
+    };
+    for (const Case& c : cases) {
+        Board board = boards(c.fenA, c.fenB);
+        const Stockfish::Move capture = find_move(board, BOARD_A, c.capture);
+        ASSERT_NE(capture, MOVE_NONE);
+        for (bool plans : {true, false}) {
+            Rules r;
+            r.jointPlans = plans;
+            r.instantTransfer = true;
+            r.flagLoss = true;
+            r.rootMoveMs = 50;
+            TimeState clock;
+            if (c.team == WHITE) {
+                r.paces = {100, 50, 100, 500};
+                r.elapsed = {0, 0, 0, 50};
+                clock = durative_root(BLACK, BLACK, BLACK, r);
+            } else {
+                r.paces = {50, 100, 500, 100};
+                r.elapsed = {0, 0, 50, 0};
+                clock = durative_root(WHITE, WHITE, WHITE, r);
+            }
+            clock.advance_action(~c.team, true, false);
+            ASSERT_EQ(clock.planned_boards(c.team),
+                      plans ? (std::array<bool, 2>{false, true}) : (std::array<bool, 2>{false, false}));
+            for (bool provers : {true, false}) {
+                const Choice choice = choose(board, c.team, clock, 64, provers);
+                SCOPED_TRACE(std::string(c.team == WHITE ? "white" : "black")
+                             + (plans ? " fix 2" : " old tree") + (provers ? " provers" : " tree only")
+                             + " chose " + choice.text);
+                EXPECT_EQ(choice.action.moveA, capture);
+                EXPECT_EQ(choice.childType, NodeType::LOSS);
+                EXPECT_EQ(lastRootType, static_cast<int>(NodeType::WIN));
+            }
+        }
+    }
+}
 #endif
 
 }  // namespace
