@@ -68,12 +68,15 @@ struct Wave2GameOptions {
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
-    /** Whether any search option differs from stock. */
+    /**
+     * Whether any search option differs from stock. A wave 2c knob only
+     * counts with its switch (validate() refuses it without), so a knob
+     * alone never moves a stock run onto the clock time model.
+     */
     bool changes_search() const {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
-            || mateRaceByLanding || passCapK != 8 || teamTreeReuse
-            || teamTreeReuseToleranceMs != 250 || jointPlans
-            || jointPlanFreePermille != 500 || planCarry || planCarryPermille != 300;
+            || mateRaceByLanding || passCapK != 8 || teamTreeReuse || jointPlans
+            || planCarry;
     }
 
     void validate() const {
@@ -88,6 +91,18 @@ struct Wave2GameOptions {
         }
         if (planCarryPermille < 0 || planCarryPermille > 1000) {
             throw std::invalid_argument("--plan-carry-permille must be in 0..1000");
+        }
+        // A knob without its switch does nothing: refuse it rather than run
+        // a setting the caller believes is on.
+        if (!teamTreeReuse && teamTreeReuseToleranceMs != 250) {
+            throw std::invalid_argument(
+                "--team-tree-reuse-tolerance-ms needs --team-tree-reuse true");
+        }
+        if (!jointPlans && jointPlanFreePermille != 500) {
+            throw std::invalid_argument("--joint-plan-free-permille needs --joint-plans true");
+        }
+        if (!planCarry && planCarryPermille != 300) {
+            throw std::invalid_argument("--plan-carry-permille needs --plan-carry true");
         }
         if (planCarry && (!durativeTree || baseMix.empty())) {
             // Only the seat-clock loops play one seat's half and keep the

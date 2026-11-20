@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -225,6 +226,32 @@ TEST_F(SelfPlayWave2Test, TeamTreeReuseNeedsDurativeSeatClocks) {
     EXPECT_TRUE(parsed.changes_search());
 }
 
+TEST_F(SelfPlayWave2Test, ContinuityKnobsNeedTheirSwitches) {
+    // A knob alone does nothing, so it must neither count as a search change
+    // (main.cc would move a stock run onto the clock time model) nor pass.
+    Wave2GameOptions tolerance;
+    tolerance.teamTreeReuseToleranceMs = 400;
+    Wave2GameOptions free;
+    free.jointPlanFreePermille = 400;
+    Wave2GameOptions carry;
+    carry.planCarryPermille = 200;
+    for (const Wave2GameOptions* options : {&tolerance, &free, &carry}) {
+        EXPECT_FALSE(options->changes_search());
+        EXPECT_THROW(options->validate(), std::invalid_argument);
+    }
+    Wave2GameOptions parsed;
+    EXPECT_TRUE(parse_wave2_option("--plan-carry-permille", "200", parsed));
+    EXPECT_THROW(parsed.validate(), std::invalid_argument);
+    // With the switches (here the preset) the knobs are accepted.
+    EXPECT_TRUE(parse_wave2_option("--durative-tree", "true", parsed));
+    EXPECT_TRUE(parse_wave2_option("--base-mix", "4000:1", parsed));
+    EXPECT_TRUE(parse_wave2_option("--continuity", "true", parsed));
+    EXPECT_TRUE(parse_wave2_option("--joint-plan-free-permille", "400", parsed));
+    EXPECT_TRUE(parse_wave2_option("--team-tree-reuse-tolerance-ms", "400", parsed));
+    EXPECT_NO_THROW(parsed.validate());
+    EXPECT_TRUE(parsed.changes_search());
+}
+
 TEST_F(SelfPlayWave2Test, TreeOptionsAloneKeepTheLeadOnlyGame) {
     SelfPlayConfig config = wave2_config(1);
     config.wave2.baseMix.clear();
@@ -323,29 +350,88 @@ TEST_F(SelfPlayWave2Test, PlanCarryNeedsDurativeSeatClocks) {
     EXPECT_FALSE(preset.teamTreeReuse || preset.jointPlans || preset.planCarry);
 }
 
+/** The numbers after each label in a tournament's per-game continuity lines, summed. */
+std::map<std::string, uint64_t> tournament_continuity(const std::string& stdoutText, size_t games,
+                                                      const std::vector<std::string>& labels) {
+    std::map<std::string, uint64_t> sums;
+    for (size_t game = 1; game <= games; ++game) {
+        const std::string key = "tournament continuity game " + std::to_string(game) + "/"
+            + std::to_string(games) + ": ";
+        const size_t at = stdoutText.find(key);
+        EXPECT_NE(at, std::string::npos) << stdoutText;
+        if (at == std::string::npos) {
+            continue;
+        }
+        const std::string line = stdoutText.substr(at, stdoutText.find('\n', at) - at);
+        for (const std::string& label : labels) {
+            const size_t named = line.find(label);
+            EXPECT_NE(named, std::string::npos) << label << " in " << line;
+            if (named != std::string::npos) {
+                sums[label] += std::stoull(line.substr(named + label.size()));
+            }
+        }
+        // Both agents start every game with no tree and no plan.
+        EXPECT_NE(line.find(", left at start 0"), std::string::npos) << line;
+    }
+    return sums;
+}
+
 TEST_F(SelfPlayWave2Test, TournamentWithContinuity) {
     // Spec v5 3.8: contender and baseline swap teams between the pair's two
     // games; each game starts with both agents' trees and plans cleared.
-    TournamentConfig config;
-    config.games = 2;
-    config.nodes = 32;
-    config.maxMacroPlies = 400;
-    config.contenderBatchSize = 1;
-    config.baselineBatchSize = 1;
-    config.seed = 9;
-    config.outputDirectory = output;
-    config.clockModel = true;
-    config.clock.moveTimeMinMs = 200;
-    config.clock.moveTimeMaxMs = 2000;
-    config.wave2 = wave2_config(1).wave2;
-    config.wave2.teamTreeReuse = true;
-    config.wave2.jointPlans = true;
-    config.wave2.planCarry = true;
-    config.wave2.validate();
-    testing::internal::CaptureStdout();
-    ASSERT_EQ(run_tournament(engine.get(), engine.get(), "uniform-a", "uniform-b", config), 0);
-    const std::string stdoutText = testing::internal::GetCapturedStdout();
-    EXPECT_NE(stdoutText.find("tournament game 2/2"), std::string::npos) << stdoutText;
+    // The per-game continuity line says what was left after the clear and
+    // whether fix 1 and fix 3 fired. The games start from a position with
+    // few moves on each board, so seats sit (fix 3 remembers a sitting
+    // seat's half) and trees hold the lines played.
+    const std::filesystem::path positions = output.string() + "_positions.tsv";
+    {
+        std::ofstream file(positions);
+        file << "4k3/p7/8/8/8/8/P7/4K3[] w - - 0 1|4k3/p7/8/8/8/8/P7/4K3[] w - - 0 1\twhite\n";
+    }
+    const auto run = [&](bool teamTree, bool plans, const std::filesystem::path& directory) {
+        TournamentConfig config;
+        config.games = 2;
+        config.nodes = 64;
+        config.maxMacroPlies = 400;
+        config.contenderBatchSize = 1;
+        config.baselineBatchSize = 1;
+        config.seed = 9;
+        config.outputDirectory = directory;
+        config.positionsFile = positions;
+        config.clockModel = true;
+        config.clock.moveTimeMinMs = 200;
+        config.clock.moveTimeMaxMs = 2000;
+        config.wave2 = wave2_config(1).wave2;
+        config.wave2.baseMix = {{20000, 1.0}};
+        config.wave2.teamTreeReuse = teamTree;
+        config.wave2.teamTreeReuseToleranceMs = teamTree ? 5000 : 250;
+        config.wave2.jointPlans = teamTree && plans;
+        config.wave2.planCarry = plans;
+        config.wave2.validate();
+        testing::internal::CaptureStdout();
+        EXPECT_EQ(run_tournament(engine.get(), engine.get(), "uniform-a", "uniform-b", config), 0);
+        const std::string stdoutText = testing::internal::GetCapturedStdout();
+        EXPECT_NE(stdoutText.find("tournament game 2/2"), std::string::npos) << stdoutText;
+        return stdoutText;
+    };
+    // All three fixes: trees are adopted (the old root among them, when the
+    // partner decides before anything lands) and halves are remembered.
+    // With fix 1 on, the next search of the team mostly re-adopts the old
+    // root, whose own visits carry the half, so it is not mixed in again.
+    const std::string all = run(true, true, output / "continuity");
+    const auto sums = tournament_continuity(all, 2, {"team tree adopted ", "plans recorded ",
+                                                     " other team "});
+    EXPECT_GT(sums.at("team tree adopted "), 0u) << all;
+    EXPECT_GT(sums.at("plans recorded "), 0u) << all;
+    // A plan never reaches the other team (the sides swap teams).
+    EXPECT_EQ(sums.at(" other team "), 0u) << all;
+    // Fix 3 alone: the remembered halves are mixed into the next search.
+    const std::string carry = run(false, true, output / "carry");
+    const auto carried = tournament_continuity(carry, 2, {"plans recorded ", " applied "});
+    EXPECT_GT(carried.at("plans recorded "), 0u) << carry;
+    EXPECT_GT(carried.at(" applied "), 0u) << carry;
+    std::error_code ignored;
+    std::filesystem::remove(positions, ignored);
 }
 
 }  // namespace

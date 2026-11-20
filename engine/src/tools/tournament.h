@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -192,6 +193,27 @@ struct TournamentBreakdown {
     size_t draws = 0;
 
     size_t games() const;
+};
+
+/**
+ * @brief Wave 2c telemetry of one tournament game, both sides together
+ * (seat-clock games with TeamTreeReuse or PlanCarry only; printed, never
+ * written to the records or the summary, so those stay as before).
+ */
+struct TournamentContinuity {
+    uint64_t searches = 0;
+    // Fix 1: searches that adopted a node of their team's retained tree.
+    uint64_t treeAdopted = 0;
+    // ... of them the old root itself (no move landed since).
+    uint64_t treeOldRoot = 0;
+    std::map<std::string, uint64_t> treeRefusals;
+    // Fix 3: halves remembered by a decision, searches that mixed one in,
+    // and slots dropped as the other team's (never, with the game-start clear).
+    uint64_t plansRecorded = 0;
+    uint64_t plansApplied = 0;
+    uint64_t otherTeamPlans = 0;
+    // Agents still holding a team tree or a plan after the game-start clear.
+    uint64_t leftAtStart = 0;
 };
 
 struct TournamentResult {

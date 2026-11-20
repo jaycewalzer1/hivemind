@@ -466,7 +466,8 @@ void print_final_summary(
  * with the seat clocks, observed paces and the other team's elapsed time;
  * only the deciding seats' boards are played, when they land. Fills
  * @p actions (one per landing), @p winner, @p termination and @p time (v3's
- * clock at the final lead, for the PGN).
+ * clock at the final lead, for the PGN), and @p continuity with what the
+ * wave 2c fixes did in this game.
  */
 void play_seat_clock_match(const TournamentConfig& config,
                            const SeatClockGame::Start& start,
@@ -481,7 +482,8 @@ void play_seat_clock_match(const TournamentConfig& config,
                            std::vector<std::string>& actions,
                            int& winner,
                            std::string& termination,
-                           TimeState& time) {
+                           TimeState& time,
+                           TournamentContinuity& continuity) {
     std::array<Stockfish::Color, 2> sides{board.side_to_move(BOARD_A),
                                           board.side_to_move(BOARD_B)};
     SeatClockGame game(config.wave2, start, sides);
@@ -496,6 +498,14 @@ void play_seat_clock_match(const TournamentConfig& config,
     // Fix 3's plans live outside the tree, and the sides swap teams.
     contenderAgent.clear_plans();
     baselineAgent.clear_plans();
+    continuity = {};
+    for (const Agent* side : {&contenderAgent, &baselineAgent}) {
+        const std::array<CarriedPlan, 2>& plans = side->carried_plans();
+        if (side->has_team_tree() || plans[BOARD_A].move != Stockfish::MOVE_NONE
+            || plans[BOARD_B].move != Stockfish::MOVE_NONE) {
+            ++continuity.leftAtStart;
+        }
+    }
     for (;;) {
         sides = {board.side_to_move(BOARD_A), board.side_to_move(BOARD_B)};
         const SeatClockGame::Event event = game.next(sides);
@@ -598,6 +608,23 @@ void play_seat_clock_match(const TournamentConfig& config,
         const uint64_t searchNanos = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - searchStart).count());
+        ++continuity.searches;
+        if (config.wave2.teamTreeReuse) {
+            const TeamTreeReuseReport& reuse = agent.team_tree_reuse();
+            if (reuse.adopted) {
+                ++continuity.treeAdopted;
+                continuity.treeOldRoot += reuse.oldRoot ? 1 : 0;
+            } else {
+                ++continuity.treeRefusals[reuse.reason];
+            }
+        }
+        if (config.wave2.planCarry) {
+            const PlanCarryReport& carry = agent.plan_carry();
+            continuity.plansApplied += carry.any_applied() ? 1 : 0;
+            for (int boardNumber : {BOARD_A, BOARD_B}) {
+                continuity.otherTeamPlans += carry.reason[boardNumber] == "other team" ? 1 : 0;
+            }
+        }
         const std::vector<RootEdgeStats> edges = agent.root_edge_stats();
         TournamentPerformance& performance = contenderActing
             ? result.contenderPerformance : result.baselinePerformance;
@@ -624,6 +651,9 @@ void play_seat_clock_match(const TournamentConfig& config,
                     && !event.seats[seat] && !game.in_flight(seat);
             }
             agent.record_plans(board, team, action, undecided);
+            for (const CarriedPlan& plan : agent.carried_plans()) {
+                continuity.plansRecorded += plan.move != Stockfish::MOVE_NONE ? 1 : 0;
+            }
         }
         ++decisions;
         for (int seat = 0; seat < 4; ++seat) {
@@ -1020,12 +1050,13 @@ int run_tournament(
         int winner = -1;
         std::string termination = "macro-ply limit";
         std::vector<std::string> actions;
+        TournamentContinuity continuity;
 
         if (seatGame) {
             play_seat_clock_match(
                 config, seatStart, board, contenderTeam, *contender, *baseline,
                 contenderAgent, baselineAgent, result, pairIndex, actions, winner,
-                termination, time);
+                termination, time, continuity);
         }
 
         for (size_t macroPly = 0; !seatGame && macroPly < config.maxMacroPlies; ++macroPly) {
@@ -1129,6 +1160,23 @@ int run_tournament(
                   << " baseline " << result.baselineWins
                   << " draws " << result.draws
                   << " termination " << termination << '\n';
+        if (seatGame && (config.wave2.teamTreeReuse || config.wave2.planCarry)) {
+            // Wave 2c: what the fixes did in this game, both sides together.
+            std::cout << "tournament continuity game " << (gameIndex + 1) << '/' << config.games
+                      << ": " << continuity.searches << " searches";
+            if (config.wave2.teamTreeReuse) {
+                std::cout << ", team tree adopted " << continuity.treeAdopted << " (old root "
+                          << continuity.treeOldRoot << "), refused";
+                for (const auto& [reason, count] : continuity.treeRefusals) {
+                    std::cout << ' ' << reason << ' ' << count;
+                }
+            }
+            if (config.wave2.planCarry) {
+                std::cout << ", plans recorded " << continuity.plansRecorded << " applied "
+                          << continuity.plansApplied << " other team " << continuity.otherTeamPlans;
+            }
+            std::cout << ", left at start " << continuity.leftAtStart << '\n';
+        }
         if (gameIndex % 2 == 1
             && result.sprt.decision != SprtState::Decision::CONTINUE) {
             std::cout << "SPRT stopped after " << result.pairScores.size()
