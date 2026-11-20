@@ -391,8 +391,7 @@ Checks run 2026-11-19 (ONNX Runtime on the Mac):
 
 Spec: talisman `docs/custom_engine_spec_v5_continuity.md`. Three fixes, each a UCI option and a self-play flag, off
 by default; with them off the engine is bit for bit the `261081b` one (`engine/tests/stock_parity.sh` and
-`engine/tests/wave2_parity.sh`, 8/8 each). Fixes 1 and 2 are built; fix 3 (plan carry) and the `Continuity` preset
-are not yet.
+`engine/tests/wave2_parity.sh`, 8/8 each). All three are built, with the `Continuity` preset.
 
 ### Fix 1: team tree reuse (`TeamTreeReuse`, `TeamTreeReuseToleranceMs`)
 
@@ -554,6 +553,93 @@ compare shares (for example 500 against 200) before a PACE row is read.
 
 Tests: `engine/tests/test_continuity_fix2.cc` (spec v5 0.2, 0.3, 1.16, 2.1-2.3, 2.4a as measured, 2.5-2.9, 4.2, and
 v4 acceptance test 4 with plans), `engine/tests/durative_key_lines.h` with
-`engine/tests/data/durative_keys_261081b.txt` (0.3). Not built: 2.4b (above), 4.1 (it needs the `Continuity` preset,
-which comes with fix 3; its fix-2 parts are `ContinuityRules.*` and the rules tests), 4.3 (`tools/regression.py` with
-the new flags, after the arena plumbing).
+`engine/tests/data/durative_keys_261081b.txt` (0.3). Not built: 2.4b (above), 4.3 (`tools/regression.py` with the new flags, after
+the arena plumbing). 4.1 came with fix 3 (below).
+
+### Fix 3: plan carry (`PlanCarry`, `PlanCarryPermille`) and the `Continuity` preset
+
+| UCI option | Self-play / tournament flag | Default |
+|---|---|---|
+| `PlanCarry` (check) | `--plan-carry <bool>` | false |
+| `PlanCarryPermille` (spin 0..1000) | `--plan-carry-permille <n>` | 300 |
+| `Continuity` (check, preset) | `--continuity <bool>` | false |
+
+`Continuity true` sets `TeamTreeReuse`, `JointPlans` and `PlanCarry` on, `false` sets them off; the three knobs keep
+their values and the last write wins. Only under a durative clock; with `DurativeTree` off `setoption` says it does
+nothing. The self-play and tournament flag needs `--durative-tree true` and `--base-mix`, as fix 1 does: only the
+seat-clock loops play one seat's half and keep the agent until the partner decides. Python:
+`hivemind.wave2.Options.plan_carry`, `plan_carry_permille`; `rl-loop --continuity` sets the three switches (an
+explicit `--joint-plans false` and the like still overrides it), and the engine gets the three flags.
+
+What it does (`Agent::run_search`, `agent.cc`):
+
+* **Record.** At the end of a durative search with the option, both slots (`Agent::plans_`, one `CarriedPlan` per
+  board: move, that board's FEN, team, and the edge's Q and visit share for telemetry) are replaced by the chosen
+  pair's halves on the boards our team is on turn on. A pass is not carried; an empty half clears its slot. Self-play
+  and tournament matches play another action than the search's (self-play samples) or only some halves, so they call
+  `Agent::record_plans` after choosing, for the team's on-turn seat that is not deciding now and has no move in
+  flight (`SeatClockGame::in_flight`); the deciding seats' slots are cleared, their halves land. In these games the
+  undecided seat is a sitting one: a seat that comes on turn decides at once.
+* **Second source (fix 2).** When fix 1 refused a board-matching node only for a commitment (`committed`), the
+  commitment of one of our seats fills that board's slot if it is empty (`PlanCarryReport::fromTree`); the slot the
+  last search wrote wins, the other team's commitments are never used.
+* **Validity** at the start of the team's next search (`resolve_plans`): the same team, our team on turn on that
+  board, its position, side to move, castling and en passant as recorded (counters left out, as in fix 1), our
+  seat's pocket at least what it held, the move legal and one of the root's actions there (`leaf_board_actions`).
+  Anything else drops the slot with a reason: `other team`, `not on turn`, `board changed`, `pocket`, `illegal`, `not
+  a root action`, `weight 0`. A half that was played changed its board and is never carried.
+* **Bias.** `p(move) <- (1 - w) p + w`, every other action on that board `(1 - w) p`, `w = PlanCarryPermille / 1000`,
+  after the root noise, on both boards when both slots hold. The moves and `w` travel in the workers' copy of the
+  search config (`RuntimeConfig::rootPlanMove`, `rootPlanWeight`), which only depth 0 reads. A fresh root mixes them in
+  `Node::try_init_and_expand` beside the noise, and promotes the best legal pair holding the move(s)
+  (`JointCandidateGenerator::promoteCarried`) after the frontier is built and before the first child is taken, so
+  that pair is the root's first child. An adopted root (fix 1) gets `Node::apply_root_plan` after
+  `refresh_root_noise`, then `configure_root_search` (which rescores the expanded edges and rebuilds the frontier,
+  dropping any promotion), then `Node::promote_carried_plan`. No promotion when an expanded pair already holds the
+  move.
+* **State.** The slots live outside the tree: `reset_search_state()` keeps them; `clear_plans()` empties them, from
+  `ucinewgame` and at each self-play and tournament game start (the tournament sides swap teams; the `team` check
+  backs that up). With `PlanCarry` on and `TeamTreeReuse` off a durative search also drops the retained root, the
+  exact-hash candidates and the mate continuations, so the plan is the only thing it inherits; UCI then does not
+  start the permanent brain either.
+* **Telemetry.** Verbose UCI prints `info string Plan carry: <A|B> <move> weight <w>` or `info string Plan carry:
+  <A|B> <move> dropped (<reason>)` for each slot that held a move. Self-play prints `selfplay plan carry: <recorded>
+  recorded, <applied> applied in <searches> searches, dropped <reason> <count> ...`.
+
+`sizeof(Node)` is unchanged (no new field; `get_child_prior`, `board_priors`, `promoted_candidate` are accessors).
+
+Checks run (Mac, `build-ninja` 4 workers, `build-sp1` 1 worker, 2 jobs):
+
+| Check | Result |
+|---|---|
+| C++ suite `build-ninja/tests/hivemind_tests` | 581 passed, 1 skipped (`MateRaceTest.MeasureFrozenRaceOnTheGame`, as before) |
+| `engine/tests/stock_parity.sh`, `engine/tests/wave2_parity.sh` | 8/8 identical each |
+| wave2-hivemind Python (`uv run pytest`) | 201 passed, 8 failed (the same bsdtar `tar --compare` failures) |
+| Self-play, it13 fp32 (`twin-s-clock-it13-fp32.onnx`), 200 nodes, 30 s, `--durative-tree true --base-mix 30000:1 --plan-carry true`, 2 games (`build-sp1`) | 2 resignations, no error; plan carry 6 recorded, 6 applied in 90 searches, nothing dropped |
+| The same with all wave 2 flags and `--continuity true`, 2 games | a flag and a resignation, no error; 147 MB peak; reuse 26.8% (64/239), refused `shape` 69, `no node` 61, `clock` 27, `no tree` 8, `committed` 7, `solved` 3; plan carry 6 recorded, 6 applied in 239 searches |
+
+Plans fire rarely in self-play (about 3-7% of searches): only a sitting seat is ever undecided beside a decision
+of its partner, and it13 sits little. In the arena every search records both on-turn halves, so the partner's next
+search can carry its half whenever its board has not moved.
+
+**Test 3.1 (it13).** Board A at the start, board B after 1.e4, white to play on both. Search 1 (200 nodes) chooses
+`(d2d4, e7e5)`; after d2d4 and black's 64-node reply d7d5 (B unchanged), the 64-node search with plan carry chooses
+`e7e5` on B, and without it (fresh agent, same position) `b8c6`. The root prior of e7e5 is `0.7 p + 0.3` and its pair
+is the first root child.
+
+Tests: `engine/tests/test_continuity_fix3.cc` (spec v5 0.1 for the new options, 3.1-3.5, 3.7, 3.9, the fix-3 half of
+1.17, 3.8 at the agent level, the fix-2 source of a plan, and 4.1 as two sequenced searches: v4 test 1 after a fix-1
+adoption, v4 test 6 with a carried plan) and in `test_selfplay_wave2.cc` `SelfPlayWave2Test.PlanCarryInSeatClockGames`
+(3.6), `PlanCarryNeedsDurativeSeatClocks`, `TournamentWithContinuity` (3.8 smoke).
+
+Not as specified:
+* **3.7's held-back drop cannot happen at a root.** `TimeState::durative` holds landed pieces back only for the other
+  team's seats; the root team decides anew there. A plan to drop a piece that landed mid-decision is applied; the
+  `not a root action` check stays as a guard (tested at the node level). Note: so under InstantTransfer false the
+  root may choose a drop of a piece that, by the game's rule, is still held back for that seat's current decision.
+  That is v4's root model, not fix 3; what the arena does with such a drop was not checked here.
+* **3.8** is checked at the agent level (a plan of the other team is dropped, `reset_search_state` keeps plans,
+  `clear_plans` empties them) plus self-play and tournament runs on the same agents; the game loops' clears are not
+  observed directly.
+* **4.1** covers v4 tests 1 and 6 sequenced (each asserts that fix 1 or fix 3 fired). Tests 3 and 4 are rules tests
+  (fix 2's `ContinuityRules.*` cover them with plans); the mate race (test 5) is not rerun sequenced.
