@@ -18,6 +18,7 @@
 class UCI {
 private:
     friend class UCIOpeningNoiseTestPeer;
+    friend class UCIContinuityPeer;
 
     std::thread* mainSearchThread;
     std::unique_ptr<Agent> agent;
@@ -53,6 +54,12 @@ private:
     // FlagLoss, InstantTransfer, MateRaceByLanding, PassCapK and the three
     // per-seat strings; RootMoveTimeMs is filled in from rootMoveTimeMs.
     DurativeConfig durativeConfig;
+    // Wave 2c, fix 1 (docs/custom_engine_spec_v5_continuity.md): keep the
+    // team's tree between searches and adopt the node the game reached,
+    // re-timed (TeamTreeReuse), within this clock tolerance. Only under
+    // DurativeTree; off by default.
+    bool teamTreeReuse = false;
+    int teamTreeReuseToleranceMs = 250;
     // Ceiling for a `go movetime` search extended in a critical position;
     // 0, or anything at or below the movetime, keeps the movetime exact.
     int maxMoveTimeMs = 0;

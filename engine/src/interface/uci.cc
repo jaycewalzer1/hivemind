@@ -261,6 +261,12 @@ void UCI::go(std::istringstream& is) {
     opts.reportIntervalMs = reportIntervalMs;
     opts.search = current_search_config();
     opts.clock = current_clock();
+    opts.teamTreeReuse = teamTreeReuse;
+    opts.teamTreeReuseToleranceMs = teamTreeReuseToleranceMs;
+    // Fix 1 keeps the team's whole tree for the next search. The permanent
+    // brain charges our action with v3's advance() and re-roots, which would
+    // throw that tree away, so it does not run then.
+    const bool keepsTeamTree = teamTreeReuse && opts.clock && opts.clock->is_durative();
 
     // "go background": the opponents are to move at the current position, so
     // this is the permanent brain, rooted at the position the front end
@@ -291,11 +297,11 @@ void UCI::go(std::istringstream& is) {
     }
     
     // Launch the search thread
-    mainSearchThread = new std::thread([this, enginePtrs, opts]() {
+    mainSearchThread = new std::thread([this, enginePtrs, opts, keepsTeamTree]() {
         try {
             const JointActionCandidate played = agent->run_search(
                 board, enginePtrs, teamSide, teamHasTimeAdvantage, opts);
-            if (!opts.isPonder) {
+            if (!opts.isPonder && !keepsTeamTree) {
                 // Nothing else runs between moves. Keep thinking from the
                 // position our own move creates, so whichever reply the four
                 // asynchronous players produce lands on a subtree that already
@@ -685,6 +691,19 @@ void UCI::setoption(std::istringstream& is) {
             else durativeConfig.mateRaceByLanding = on;
             std::cout << "info string " << name << " set to " << value << std::endl;
         }
+    } else if (name == "TeamTreeReuse") {
+        if (value == "true" || value == "false") {
+            teamTreeReuse = value == "true";
+            std::cout << "info string TeamTreeReuse set to " << value << std::endl;
+            if (teamTreeReuse && !durativeTree) {
+                std::cout << "info string TeamTreeReuse acts only with DurativeTree true"
+                          << std::endl;
+            }
+        }
+    } else if (name == "TeamTreeReuseToleranceMs") {
+        teamTreeReuseToleranceMs = std::clamp(std::stoi(value), 0, 5000);
+        std::cout << "info string TeamTreeReuseToleranceMs set to "
+                  << teamTreeReuseToleranceMs << std::endl;
     } else if (name == "PassCapK") {
         durativeConfig.passCapK = std::clamp(std::stoi(value), 1, 64);
         std::cout << "info string PassCapK set to " << durativeConfig.passCapK << std::endl;
@@ -888,6 +907,9 @@ void UCI::send_uci_response() {
     cout << "option name SeatElapsedMs type string default <empty>" << endl;
     cout << "option name SeatSitting type string default <empty>" << endl;
     cout << "option name SeatArrivalsMs type string default <empty>" << endl;
+    // Wave 2c (docs/custom_engine_spec_v5_continuity.md); off by default.
+    cout << "option name TeamTreeReuse type check default false" << endl;
+    cout << "option name TeamTreeReuseToleranceMs type spin default 250 min 0 max 5000" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;
