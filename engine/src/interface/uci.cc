@@ -110,6 +110,8 @@ void UCI::new_game() {
     stop();
     if (agent) {
         agent->reset_search_state();
+        // Fix 3's plans live outside the tree; a new game starts without.
+        agent->clear_plans();
     }
 }
 
@@ -263,10 +265,15 @@ void UCI::go(std::istringstream& is) {
     opts.clock = current_clock();
     opts.teamTreeReuse = teamTreeReuse;
     opts.teamTreeReuseToleranceMs = teamTreeReuseToleranceMs;
+    opts.planCarry = planCarry;
+    opts.planCarryPermille = planCarryPermille;
     // Fix 1 keeps the team's whole tree for the next search. The permanent
     // brain charges our action with v3's advance() and re-roots, which would
-    // throw that tree away, so it does not run then.
-    const bool keepsTeamTree = teamTreeReuse && opts.clock && opts.clock->is_durative();
+    // throw that tree away, so it does not run then. Under fix 3 alone the
+    // next durative search drops whatever it retained, so it would be work
+    // for nothing.
+    const bool keepsTeamTree = (teamTreeReuse || planCarry) && opts.clock
+        && opts.clock->is_durative();
 
     // "go background": the opponents are to move at the current position, so
     // this is the permanent brain, rooted at the position the front end
@@ -709,6 +716,32 @@ void UCI::setoption(std::istringstream& is) {
                           << std::endl;
             }
         }
+    } else if (name == "PlanCarry") {
+        if (value == "true" || value == "false") {
+            planCarry = value == "true";
+            std::cout << "info string PlanCarry set to " << value << std::endl;
+            if (planCarry && !durativeTree) {
+                std::cout << "info string PlanCarry acts only with DurativeTree true"
+                          << std::endl;
+            }
+        }
+    } else if (name == "PlanCarryPermille") {
+        planCarryPermille = std::clamp(std::stoi(value), 0, 1000);
+        std::cout << "info string PlanCarryPermille set to " << planCarryPermille << std::endl;
+    } else if (name == "Continuity") {
+        // Preset: the three switches together; the knobs keep their values.
+        if (value == "true" || value == "false") {
+            const bool on = value == "true";
+            teamTreeReuse = on;
+            durativeConfig.jointPlans = on;
+            planCarry = on;
+            std::cout << "info string Continuity set to " << value
+                      << " (TeamTreeReuse, JointPlans, PlanCarry " << value << ")" << std::endl;
+            if (on && !durativeTree) {
+                std::cout << "info string Continuity acts only with DurativeTree true"
+                          << std::endl;
+            }
+        }
     } else if (name == "JointPlanFreePermille") {
         durativeConfig.jointPlanFreePermille = std::clamp(std::stoi(value), 0, 1000);
         std::cout << "info string JointPlanFreePermille set to "
@@ -925,6 +958,9 @@ void UCI::send_uci_response() {
     cout << "option name TeamTreeReuseToleranceMs type spin default 250 min 0 max 5000" << endl;
     cout << "option name JointPlans type check default false" << endl;
     cout << "option name JointPlanFreePermille type spin default 500 min 0 max 1000" << endl;
+    cout << "option name PlanCarry type check default false" << endl;
+    cout << "option name PlanCarryPermille type spin default 300 min 0 max 1000" << endl;
+    cout << "option name Continuity type check default false" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

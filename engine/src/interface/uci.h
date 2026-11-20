@@ -19,6 +19,7 @@ class UCI {
 private:
     friend class UCIOpeningNoiseTestPeer;
     friend class UCIContinuityPeer;
+    friend class UCIContinuityFix3Peer;
 
     std::thread* mainSearchThread;
     std::unique_ptr<Agent> agent;
@@ -61,6 +62,12 @@ private:
     // DurativeTree; off by default.
     bool teamTreeReuse = false;
     int teamTreeReuseToleranceMs = 250;
+    // Wave 2c, fix 3: carry the unplayed half of the chosen pair to the
+    // partner's next search, mixed in at this weight (PlanCarry,
+    // PlanCarryPermille). Only under DurativeTree; off by default. The
+    // Continuity preset sets TeamTreeReuse, JointPlans and PlanCarry at once.
+    bool planCarry = false;
+    int planCarryPermille = 300;
     // Ceiling for a `go movetime` search extended in a critical position;
     // 0, or anything at or below the movetime, keeps the movetime exact.
     int maxMoveTimeMs = 0;
