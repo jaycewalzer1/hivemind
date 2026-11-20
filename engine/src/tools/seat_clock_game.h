@@ -48,18 +48,32 @@ struct Wave2GameOptions {
     int32_t sitoffMs = 5000;
     // Weight of the newest landing in each seat's observed pace (SeatPaceMs).
     double paceEmaAlpha = 0.3;
+    // Wave 2c, fix 1 (UCI TeamTreeReuse, docs/custom_engine_spec_v5_continuity.md):
+    // each team's agent keeps its tree between its decisions and adopts the
+    // node the game reached, re-timed, within this clock tolerance.
+    // Seat-clock games with the durative tree only.
+    bool teamTreeReuse = false;
+    int32_t teamTreeReuseToleranceMs = 250;
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
     /** Whether any search option differs from stock. */
     bool changes_search() const {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
-            || mateRaceByLanding || passCapK != 8;
+            || mateRaceByLanding || passCapK != 8 || teamTreeReuse
+            || teamTreeReuseToleranceMs != 250;
     }
 
     void validate() const {
         if (passCapK < 1 || passCapK > 64) {
             throw std::invalid_argument("--pass-cap-k must be in 1..64");
+        }
+        if (teamTreeReuseToleranceMs < 0 || teamTreeReuseToleranceMs > 5000) {
+            throw std::invalid_argument("--team-tree-reuse-tolerance-ms must be in 0..5000");
+        }
+        if (teamTreeReuse && (!durativeTree || baseMix.empty())) {
+            throw std::invalid_argument(
+                "--team-tree-reuse needs --durative-tree true and seat clocks (--base-mix)");
         }
         for (const auto& [base, weight] : baseMix) {
             if (base < 1 || !(weight > 0.0)) {
@@ -124,6 +138,8 @@ inline bool parse_wave2_option(const std::string& option, const std::string& val
     else if (option == "--pace-jitter") options.paceJitter = std::stod(value);
     else if (option == "--sitoff-ms") options.sitoffMs = std::stoi(value);
     else if (option == "--pace-ema-alpha") options.paceEmaAlpha = std::stod(value);
+    else if (option == "--team-tree-reuse") options.teamTreeReuse = boolean();
+    else if (option == "--team-tree-reuse-tolerance-ms") options.teamTreeReuseToleranceMs = std::stoi(value);
     else return false;
     return true;
 }

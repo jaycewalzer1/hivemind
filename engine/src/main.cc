@@ -150,6 +150,10 @@ void printUsage(const char* progName) {
     cout << "      options then give time odds) --seat-move-times <bool> (a move time per seat)" << endl;
     cout << "    --min-move-ms <ms> --lag-max-ms <ms> --pace-jitter <x> --sitoff-ms <ms>" << endl;
     cout << "      --pace-ema-alpha <x> (seat-clock games; defaults 100, 150, 0.25, 5000, 0.3)" << endl;
+    cout << "    Wave 2c (docs/custom_engine_spec_v5_continuity.md; seat-clock games, --durative-tree true):" << endl;
+    cout << "    --team-tree-reuse <bool> (each team keeps its tree between decisions and adopts the" << endl;
+    cout << "      node the game reached, re-timed; self-play tops the root up to its budget)" << endl;
+    cout << "    --team-tree-reuse-tolerance-ms <0..5000> (largest clock difference adopted; default 250)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;
@@ -363,7 +367,10 @@ int main(int argc, char* argv[]) {
                 config.clockModel = true;
             }
             if (config.wave2.seat_clocks() && config.treeReuse) {
-                throw invalid_argument("--tree-reuse does not apply to seat-clock games (--base-mix)");
+                // The exact-hash reuse never matches a seat clock; wave 2c's
+                // --team-tree-reuse is the one for these games.
+                throw invalid_argument("--tree-reuse does not apply to seat-clock games (--base-mix);"
+                                       " see --team-tree-reuse");
             }
         } catch (const exception& error) {
             cerr << "Invalid selfplay arguments: " << error.what() << endl;

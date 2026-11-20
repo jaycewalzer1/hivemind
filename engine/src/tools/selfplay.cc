@@ -889,6 +889,14 @@ struct SeatClockGameResult {
     size_t rawPolicyEvents = 0;
     int wouldResignTeam = -1;
     SeatClockSummary seats;
+    // Fix 1 (--team-tree-reuse): searches, those that adopted a retained
+    // node, the visits they recovered, and adoptions per deciding seat.
+    uint64_t teamTreeSearches = 0;
+    uint64_t teamTreeHits = 0;
+    uint64_t teamTreeVisits = 0;
+    std::array<uint64_t, 4> teamTreeSeatHits{};
+    // Why the other searches adopted nothing (TeamTreeReuseReport::reason).
+    std::map<std::string, uint64_t> teamTreeRefusals;
 };
 
 /**
@@ -900,7 +908,12 @@ struct SeatClockGameResult {
  * options; only the deciding seats' boards of the chosen action are played,
  * when they land. A flag (FlagLoss), a double flag, a sit-off, a mate or a
  * draw on landing ends the game; config.maxMacroPlies caps the decisions.
- * Tree reuse is not used: durative trees do not transpose across searches.
+ * The exact-hash tree reuse (--tree-reuse) is not used: a durative tree's
+ * keys hold the seat clocks, which never repeat. With --team-tree-reuse
+ * (wave 2c, fix 1) each team's agent instead keeps its whole tree between
+ * its decisions, whichever of its seats decides, and adopts the node the
+ * game reached, re-timed to the real clocks; the search then tops the root
+ * up to its budget.
  */
 SeatClockGameResult play_seat_clock_game(
     const SelfPlayConfig& config,
@@ -1042,10 +1055,23 @@ SeatClockGameResult play_seat_clock_game(
             }
             const size_t teamIndex = team == Stockfish::WHITE ? 0 : 1;
             Agent& agent = agents[teamIndex];
-            agent.reset_search_state();
+            const bool teamTreeReuse = config.wave2.teamTreeReuse;
+            if (!teamTreeReuse) {
+                agent.reset_search_state();
+            }
             SearchOptions searchOptions;
             searchOptions.targetNodes = randomized_node_budget(config, randomEngine);
             searchOptions.retainForReuse = false;
+            if (teamTreeReuse) {
+                // Fix 1: the adopted visits count toward the budget, as
+                // --tree-reuse's do; at least a share is searched anew.
+                searchOptions.teamTreeReuse = true;
+                searchOptions.teamTreeReuseToleranceMs = config.wave2.teamTreeReuseToleranceMs;
+                searchOptions.reusedVisitsCount = true;
+                searchOptions.minNewNodes = std::max<size_t>(1, static_cast<size_t>(std::ceil(
+                    config.treeReuseMinNewFraction
+                    * static_cast<double>(searchOptions.targetNodes))));
+            }
             searchOptions.search.enableMateProbe = config.fairyStockfishMateNodes > 0;
             searchOptions.mateProbeNodes = config.fairyStockfishMateNodes;
             searchOptions.completeMateProbe = config.fairyStockfishMateNodes > 0;
@@ -1061,6 +1087,19 @@ SeatClockGameResult play_seat_clock_game(
             searchOptions.clock = clock;
             const JointActionCandidate choice = agent.run_search(
                 board, threadEngines, team, hasTimeAdvantage, searchOptions);
+            if (teamTreeReuse && agent.team_tree_reuse().attempted) {
+                ++result.teamTreeSearches;
+                if (agent.team_tree_reuse().adopted) {
+                    ++result.teamTreeHits;
+                    result.teamTreeVisits += static_cast<uint64_t>(
+                        std::max(0, agent.team_tree_reuse().visits));
+                    for (int seat = 0; seat < 4; ++seat) {
+                        result.teamTreeSeatHits[seat] += event.seats[seat] ? 1 : 0;
+                    }
+                } else {
+                    ++result.teamTreeRefusals[agent.team_tree_reuse().reason];
+                }
+            }
             if (agent.search_status() != GameStatus::ONGOING) {
                 result.winner = adjudicated_winner(agent.search_status(), team);
                 result.termination = adjudicated_termination(agent.search_status());
@@ -1320,6 +1359,12 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     std::atomic<uint64_t> searches{0};
     std::atomic<uint64_t> retainedVisits{0};
     std::atomic<uint64_t> searchedVisits{0};
+    // Fix 1 (--team-tree-reuse), summed over the seat-clock games.
+    std::atomic<uint64_t> teamTreeSearches{0};
+    std::atomic<uint64_t> teamTreeHits{0};
+    std::atomic<uint64_t> teamTreeVisits{0};
+    std::array<std::atomic<uint64_t>, 4> teamTreeSeatHits{};
+    std::map<std::string, uint64_t> teamTreeRefusals;  // guarded by outputMutex
     const auto writeGame = [&](size_t gameNumber, FinishedGame& game) {
         if (distillWriter) {
             // Finished games give WDL (loss, draw, win) and moves-left targets
@@ -1484,6 +1529,19 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 rawPolicyEvents = played.rawPolicyEvents;
                 wouldResignTeam = played.wouldResignTeam;
                 searches.fetch_add(samples.size(), std::memory_order_relaxed);
+                teamTreeSearches.fetch_add(played.teamTreeSearches, std::memory_order_relaxed);
+                teamTreeHits.fetch_add(played.teamTreeHits, std::memory_order_relaxed);
+                teamTreeVisits.fetch_add(played.teamTreeVisits, std::memory_order_relaxed);
+                for (int seat = 0; seat < 4; ++seat) {
+                    teamTreeSeatHits[seat].fetch_add(played.teamTreeSeatHits[seat],
+                                                     std::memory_order_relaxed);
+                }
+                if (!played.teamTreeRefusals.empty()) {
+                    std::lock_guard lock(outputMutex);
+                    for (const auto& [reason, count] : played.teamTreeRefusals) {
+                        teamTreeRefusals[reason] += count;
+                    }
+                }
                 seats = std::move(played.seats);
             }
 
@@ -1746,6 +1804,28 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                   << 100.0 * static_cast<double>(retainedVisits)
                          / static_cast<double>(searchedVisits)
                   << "% of root visits carried over, " << searches << " searches" << '\n';
+    }
+    if (config.wave2.teamTreeReuse) {
+        // Fix 1: how often a search started from the team's retained tree,
+        // the mean visits it recovered then, and the adoptions per deciding
+        // seat (both seats of a team share its tree).
+        const uint64_t hits = teamTreeHits.load();
+        const uint64_t total = teamTreeSearches.load();
+        std::cout << "selfplay team tree reuse: " << std::fixed << std::setprecision(1)
+                  << (total > 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(total)
+                                : 0.0)
+                  << "% of searches (" << hits << "/" << total << "), "
+                  << (hits > 0 ? static_cast<double>(teamTreeVisits.load())
+                                     / static_cast<double>(hits) : 0.0)
+                  << " mean visits recovered, by seat";
+        for (int seat = 0; seat < 4; ++seat) {
+            std::cout << ' ' << seat_name(seat) << ' ' << teamTreeSeatHits[seat].load();
+        }
+        std::cout << ", refused";
+        for (const auto& [reason, count] : teamTreeRefusals) {
+            std::cout << ' ' << reason << ' ' << count;
+        }
+        std::cout << '\n';
     }
     if (resignChecks > 0) {
         std::cout << "selfplay resign check: " << resignChecks

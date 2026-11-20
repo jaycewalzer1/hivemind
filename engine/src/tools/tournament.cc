@@ -489,6 +489,10 @@ void play_seat_clock_match(const TournamentConfig& config,
     std::mt19937_64 paceRandom(tournament_seed(config.seed ^ 0x50414345ULL, pairIndex));
     std::array<Stockfish::Move, 4> committed{};
     size_t decisions = 0;
+    // Nothing either side kept from the last game (the sides swap teams
+    // between games) reaches this one.
+    contenderAgent.reset_search_state();
+    baselineAgent.reset_search_state();
     for (;;) {
         sides = {board.side_to_move(BOARD_A), board.side_to_move(BOARD_B)};
         const SeatClockGame::Event event = game.next(sides);
@@ -561,10 +565,19 @@ void play_seat_clock_match(const TournamentConfig& config,
         Engine& actingEngine = contenderActing ? contender : baseline;
         Agent& agent = contenderActing ? contenderAgent : baselineAgent;
         std::vector<Engine*> engines = {&actingEngine};
-        agent.reset_search_state();
         SearchOptions options;
         options.targetNodes = config.nodes;
         options.moveTimeMs = config.moveTimeMs;
+        if (config.wave2.teamTreeReuse) {
+            // Wave 2c, fix 1: each side keeps its team's tree between its
+            // decisions; adopted visits count toward the node budget.
+            options.teamTreeReuse = true;
+            options.teamTreeReuseToleranceMs = config.wave2.teamTreeReuseToleranceMs;
+            options.reusedVisitsCount = config.nodes > 0;
+            options.minNewNodes = std::max<size_t>(1, config.nodes / 4);
+        } else {
+            agent.reset_search_state();
+        }
         options.search = config.searchConfigFor(contenderActing);
         options.search.rootDirichletAlpha = config.dirichletAlpha;
         options.search.rootDirichletEpsilon = config.dirichletEpsilon;
