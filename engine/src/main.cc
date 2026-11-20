@@ -157,6 +157,10 @@ void printUsage(const char* progName) {
     cout << "    --joint-plans <bool> (below the root a team that acts plans its other on-turn seat's" << endl;
     cout << "      move in the same joint action; needs --durative-tree true only)" << endl;
     cout << "    --joint-plan-free-permille <0..1000> (prior share of decide-later; default 500)" << endl;
+    cout << "    --plan-carry <bool> (the half of the chosen action for the team's on-turn seat that" << endl;
+    cout << "      is not deciding is mixed into that seat's next search; needs --base-mix)" << endl;
+    cout << "    --plan-carry-permille <0..1000> (prior weight of the carried move; default 300)" << endl;
+    cout << "    --continuity <bool> (--team-tree-reuse, --joint-plans and --plan-carry together)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;

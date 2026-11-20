@@ -59,6 +59,12 @@ struct Wave2GameOptions {
     // share of "decide later". Durative tree only; inside each search.
     bool jointPlans = false;
     int32_t jointPlanFreePermille = 500;
+    // Wave 2c, fix 3 (UCI PlanCarry): the half of a team's chosen action for
+    // its on-turn seat that is not deciding (and has no move in flight) is
+    // remembered and mixed into that seat's next search at this weight.
+    // Seat-clock games with the durative tree only.
+    bool planCarry = false;
+    int32_t planCarryPermille = 300;
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
@@ -67,7 +73,7 @@ struct Wave2GameOptions {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
             || mateRaceByLanding || passCapK != 8 || teamTreeReuse
             || teamTreeReuseToleranceMs != 250 || jointPlans
-            || jointPlanFreePermille != 500;
+            || jointPlanFreePermille != 500 || planCarry || planCarryPermille != 300;
     }
 
     void validate() const {
@@ -79,6 +85,15 @@ struct Wave2GameOptions {
         }
         if (jointPlanFreePermille < 0 || jointPlanFreePermille > 1000) {
             throw std::invalid_argument("--joint-plan-free-permille must be in 0..1000");
+        }
+        if (planCarryPermille < 0 || planCarryPermille > 1000) {
+            throw std::invalid_argument("--plan-carry-permille must be in 0..1000");
+        }
+        if (planCarry && (!durativeTree || baseMix.empty())) {
+            // Only the seat-clock loops play one seat's half and keep the
+            // agent until the partner decides.
+            throw std::invalid_argument(
+                "--plan-carry needs --durative-tree true and seat clocks (--base-mix)");
         }
         if (jointPlans && !durativeTree) {
             throw std::invalid_argument("--joint-plans needs --durative-tree true");
@@ -156,6 +171,15 @@ inline bool parse_wave2_option(const std::string& option, const std::string& val
     else if (option == "--team-tree-reuse-tolerance-ms") options.teamTreeReuseToleranceMs = std::stoi(value);
     else if (option == "--joint-plans") options.jointPlans = boolean();
     else if (option == "--joint-plan-free-permille") options.jointPlanFreePermille = std::stoi(value);
+    else if (option == "--plan-carry") options.planCarry = boolean();
+    else if (option == "--plan-carry-permille") options.planCarryPermille = std::stoi(value);
+    else if (option == "--continuity") {
+        // Preset: the three wave 2c switches; the knobs keep their values.
+        const bool on = boolean();
+        options.teamTreeReuse = on;
+        options.jointPlans = on;
+        options.planCarry = on;
+    }
     else return false;
     return true;
 }
@@ -502,6 +526,8 @@ public:
     }
     bool sitting(int seat) const { return sitting_[seat]; }
     int64_t event_at_ms(int seat) const { return eventAt_[seat]; }
+    /** Whether @p seat (on turn) has a committed move that has not landed yet. */
+    bool in_flight(int seat) const { return kind_[seat] == EventType::LAND; }
     const Start& start() const { return start_; }
     /** The white team's lead, as v3 reads it off four clocks. */
     int32_t white_lead_ms() const {

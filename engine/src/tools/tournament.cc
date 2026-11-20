@@ -493,6 +493,9 @@ void play_seat_clock_match(const TournamentConfig& config,
     // between games) reaches this one.
     contenderAgent.reset_search_state();
     baselineAgent.reset_search_state();
+    // Fix 3's plans live outside the tree, and the sides swap teams.
+    contenderAgent.clear_plans();
+    baselineAgent.clear_plans();
     for (;;) {
         sides = {board.side_to_move(BOARD_A), board.side_to_move(BOARD_B)};
         const SeatClockGame::Event event = game.next(sides);
@@ -578,6 +581,11 @@ void play_seat_clock_match(const TournamentConfig& config,
         } else {
             agent.reset_search_state();
         }
+        if (config.wave2.planCarry) {
+            // Wave 2c, fix 3: the partner's remembered half biases this root.
+            options.planCarry = true;
+            options.planCarryPermille = config.wave2.planCarryPermille;
+        }
         options.search = config.searchConfigFor(contenderActing);
         options.search.rootDirichletAlpha = config.dirichletAlpha;
         options.search.rootDirichletEpsilon = config.dirichletEpsilon;
@@ -605,6 +613,17 @@ void play_seat_clock_match(const TournamentConfig& config,
         }
         if (edges.empty()) {
             throw std::runtime_error("Ongoing search returned no root edges");
+        }
+        if (config.wave2.planCarry) {
+            // Fix 3, as in self-play: remember the half of the team's other
+            // on-turn seat that is not deciding and has no move in flight.
+            std::array<bool, 2> undecided{false, false};
+            for (int boardNumber : {BOARD_A, BOARD_B}) {
+                const int seat = TimeState::seat_of(boardNumber, sides[boardNumber]);
+                undecided[boardNumber] = TimeState::team_of_seat(seat) == team
+                    && !event.seats[seat] && !game.in_flight(seat);
+            }
+            agent.record_plans(board, team, action, undecided);
         }
         ++decisions;
         for (int seat = 0; seat < 4; ++seat) {

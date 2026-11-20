@@ -897,6 +897,13 @@ struct SeatClockGameResult {
     std::array<uint64_t, 4> teamTreeSeatHits{};
     // Why the other searches adopted nothing (TeamTreeReuseReport::reason).
     std::map<std::string, uint64_t> teamTreeRefusals;
+    // Fix 3 (--plan-carry): searches, those that mixed a carried move into
+    // their root, decisions that recorded a plan for a seat still to
+    // decide, and why carried plans were dropped (PlanCarryReport::reason).
+    uint64_t planCarrySearches = 0;
+    uint64_t planCarryApplied = 0;
+    uint64_t planCarryRecorded = 0;
+    std::map<std::string, uint64_t> planCarryDrops;
 };
 
 /**
@@ -944,6 +951,8 @@ SeatClockGameResult play_seat_clock_game(
     size_t decisions = 0;
     for (Agent& teamAgent : agents) {
         teamAgent.reset_search_state();
+        // Fix 3's plans live outside the tree: the last game's go too.
+        teamAgent.clear_plans();
     }
 
     auto sides_now = [&board]() {
@@ -1072,6 +1081,11 @@ SeatClockGameResult play_seat_clock_game(
                     config.treeReuseMinNewFraction
                     * static_cast<double>(searchOptions.targetNodes))));
             }
+            if (config.wave2.planCarry) {
+                // Fix 3: the partner's remembered half biases this root.
+                searchOptions.planCarry = true;
+                searchOptions.planCarryPermille = config.wave2.planCarryPermille;
+            }
             searchOptions.search.enableMateProbe = config.fairyStockfishMateNodes > 0;
             searchOptions.mateProbeNodes = config.fairyStockfishMateNodes;
             searchOptions.completeMateProbe = config.fairyStockfishMateNodes > 0;
@@ -1098,6 +1112,17 @@ SeatClockGameResult play_seat_clock_game(
                     }
                 } else {
                     ++result.teamTreeRefusals[agent.team_tree_reuse().reason];
+                }
+            }
+            if (config.wave2.planCarry && agent.plan_carry().attempted) {
+                const PlanCarryReport& carry = agent.plan_carry();
+                ++result.planCarrySearches;
+                result.planCarryApplied += carry.any_applied() ? 1 : 0;
+                for (int boardNumber : {BOARD_A, BOARD_B}) {
+                    if (carry.move[boardNumber] != Stockfish::MOVE_NONE
+                        && !carry.applied[boardNumber]) {
+                        ++result.planCarryDrops[carry.reason[boardNumber]];
+                    }
                 }
             }
             if (agent.search_status() != GameStatus::ONGOING) {
@@ -1174,6 +1199,24 @@ SeatClockGameResult play_seat_clock_game(
             }
             action = select_action(edges, mcts_temperature(config, decisions), randomEngine);
             searched = true;
+            if (config.wave2.planCarry) {
+                // Fix 3: only the deciding seats' halves are played. The
+                // half for the team's other on-turn seat is remembered for
+                // that seat's own decision, unless its move is already in
+                // flight (it lands and changes the board: the plan is moot).
+                // The deciding seats' slots are cleared: their halves land.
+                std::array<bool, 2> undecided{false, false};
+                for (int boardNumber : {BOARD_A, BOARD_B}) {
+                    const int seat = TimeState::seat_of(boardNumber, sides[boardNumber]);
+                    undecided[boardNumber] = TimeState::team_of_seat(seat) == team
+                        && !event.seats[seat] && !game.in_flight(seat);
+                }
+                agent.record_plans(board, team, action, undecided);
+                const std::array<CarriedPlan, 2>& plans = agent.carried_plans();
+                result.planCarryRecorded += plans[BOARD_A].move != Stockfish::MOVE_NONE
+                        || plans[BOARD_B].move != Stockfish::MOVE_NONE
+                    ? 1 : 0;
+            }
         }
         (void)searched;
         ++decisions;
@@ -1365,6 +1408,11 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     std::atomic<uint64_t> teamTreeVisits{0};
     std::array<std::atomic<uint64_t>, 4> teamTreeSeatHits{};
     std::map<std::string, uint64_t> teamTreeRefusals;  // guarded by outputMutex
+    // Fix 3 (--plan-carry), summed over the seat-clock games.
+    std::atomic<uint64_t> planCarrySearches{0};
+    std::atomic<uint64_t> planCarryApplied{0};
+    std::atomic<uint64_t> planCarryRecorded{0};
+    std::map<std::string, uint64_t> planCarryDrops;  // guarded by outputMutex
     const auto writeGame = [&](size_t gameNumber, FinishedGame& game) {
         if (distillWriter) {
             // Finished games give WDL (loss, draw, win) and moves-left targets
@@ -1540,6 +1588,15 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                     std::lock_guard lock(outputMutex);
                     for (const auto& [reason, count] : played.teamTreeRefusals) {
                         teamTreeRefusals[reason] += count;
+                    }
+                }
+                planCarrySearches.fetch_add(played.planCarrySearches, std::memory_order_relaxed);
+                planCarryApplied.fetch_add(played.planCarryApplied, std::memory_order_relaxed);
+                planCarryRecorded.fetch_add(played.planCarryRecorded, std::memory_order_relaxed);
+                if (!played.planCarryDrops.empty()) {
+                    std::lock_guard lock(outputMutex);
+                    for (const auto& [reason, count] : played.planCarryDrops) {
+                        planCarryDrops[reason] += count;
                     }
                 }
                 seats = std::move(played.seats);
@@ -1823,6 +1880,18 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         }
         std::cout << ", refused";
         for (const auto& [reason, count] : teamTreeRefusals) {
+            std::cout << ' ' << reason << ' ' << count;
+        }
+        std::cout << '\n';
+    }
+    if (config.wave2.planCarry) {
+        // Fix 3: how many decisions remembered a half for a seat still to
+        // decide, how many searches mixed one in, and why the rest were
+        // dropped (mostly "board changed": the seat's board moved first).
+        std::cout << "selfplay plan carry: " << planCarryRecorded.load() << " recorded, "
+                  << planCarryApplied.load() << " applied in " << planCarrySearches.load()
+                  << " searches, dropped";
+        for (const auto& [reason, count] : planCarryDrops) {
             std::cout << ' ' << reason << ' ' << count;
         }
         std::cout << '\n';
