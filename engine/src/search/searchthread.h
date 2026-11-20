@@ -120,6 +120,41 @@ int frozen_race_board(Board& board, Stockfish::Color& outAttackers,
 bool frozen_board_loss(Board& board, Stockfish::Color teamToPlay, const TimeState& time);
 
 /**
+ * @brief Which boards a leaf of @p team acts on, as collect_batch expands it:
+ * the boards it is on turn on, under a durative clock only those whose seat
+ * lands now; neither is a forced wait (the single action pass, pass).
+ */
+struct LeafTurn {
+    bool boardAOnTurn = false;
+    bool boardBOnTurn = false;
+    bool forcedWait = false;
+};
+LeafTurn leaf_turn(Board& board, Stockfish::Color team, const TimeState& time);
+
+/**
+ * @brief The actions a leaf gets on one board, as collect_batch expands it:
+ * the representable legal moves when @p onTurn, without the drops of pieces
+ * that landed during the seat's current decision (InstantTransfer off), and
+ * always a trailing pass (MOVE_NONE).
+ */
+vector<Stockfish::Move> leaf_board_actions(Board& board, int boardNumber, bool onTurn,
+                                           const TimeState& time);
+
+/**
+ * @brief Wave 2c, fix 1 (TeamTreeReuse): a hash of everything besides the
+ * board that fixed a durative node's expansion, so a retained node re-timed
+ * to new clocks can tell whether it would still be expanded the same way:
+ * the acting boards after the durative filter, a forced wait, whether the
+ * team may sit (the generator's pass rule), the drops held back on the
+ * acting boards (InstantTransfer off), and the time inputs of the terminal
+ * check (the other team's sit right, a clock result, and with
+ * MateRaceByLanding the landing order and early landings). Never 0 for a
+ * durative state, so a node expanded without a key (0) never matches; 0
+ * outside a durative clock.
+ */
+uint32_t durative_expansion_key(Board& board, Stockfish::Color team, const TimeState& time);
+
+/**
  * @brief Entry in an MCTS selection trajectory.
  * 
  * Stores the node, action taken, and selected child index for backup.
@@ -159,6 +194,9 @@ struct LeafContext {
     // Durative clock: the other team's seat lands first, so this team only
     // waits; its node gets the single action (pass, pass).
     bool forcedWait = false;
+    // Wave 2c, fix 1: durative_expansion_key() of this leaf (0 outside a
+    // durative clock), stored in the node at its expansion.
+    uint32_t expansionKey = 0;
     bool isTerminal;     // True if this is a terminal node (draw/checkmate)
     bool hasEvaluationReservation;
     float terminalValue; // Value to use for terminal nodes
@@ -300,7 +338,8 @@ public:
                           const vector<float>& jointFactorsA = {},
                           const vector<float>& jointFactorsB = {},
                           size_t jointFactorRank = 0,
-                          uint64_t positionHash = 0);
+                          uint64_t positionHash = 0,
+                          uint32_t expansionKey = 0);
     void backup(vector<TrajectoryEntry>& trajectory, float value);
     void cancel_virtual_losses(const vector<TrajectoryEntry>& trajectory);
     

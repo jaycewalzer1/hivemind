@@ -959,6 +959,14 @@ public:
         return generatedCandidates.size();
     }
 
+    /** The actions of one board in prior order, as initialize() sorted them. */
+    const std::vector<Stockfish::Move>& sortedActions(int boardNum) const {
+        return boardNum == 0 ? sortedActionsA : sortedActionsB;
+    }
+
+    /** The turn and pass rules initialize() was given. */
+    const JointActionRules& actionRules() const { return rules; }
+
     /**
      * @brief Get total possible candidates (N * M).
      */

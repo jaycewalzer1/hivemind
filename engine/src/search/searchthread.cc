@@ -518,6 +518,104 @@ bool frozen_board_loss(Board& board,
     return false;
 }
 
+LeafTurn leaf_turn(Board& board, Stockfish::Color team, const TimeState& time) {
+    LeafTurn turn;
+    turn.boardAOnTurn = board.side_to_move(BOARD_A) == team;
+    turn.boardBOnTurn = board.side_to_move(BOARD_B) == ~team;
+    if (time.is_durative()) {
+        // Only the boards whose seat lands now are this team's to act on.
+        const std::array<bool, 2> acting = time.acting_boards(team);
+        turn.boardAOnTurn = turn.boardAOnTurn && acting[BOARD_A];
+        turn.boardBOnTurn = turn.boardBOnTurn && acting[BOARD_B];
+        turn.forcedWait = !turn.boardAOnTurn && !turn.boardBOnTurn;
+    }
+    return turn;
+}
+
+vector<Stockfish::Move> leaf_board_actions(Board& board, int boardNumber, bool onTurn,
+                                           const TimeState& time) {
+    vector<Stockfish::Move> actions;
+    if (onTurn) {
+        actions = board.legal_moves(boardNumber);
+        std::erase_if(actions, [&](Stockfish::Move move) {
+            return !is_policy_move_representable(board, boardNumber, move);
+        });
+        if (!time.instant_transfer()) {
+            // InstantTransfer off: a piece that reached the pocket during
+            // this seat's current decision is not droppable.
+            const Stockfish::Color side = board.side_to_move(boardNumber);
+            const int seat = TimeState::seat_of(boardNumber, side);
+            std::erase_if(actions, [&](Stockfish::Move move) {
+                if (type_of(move) != Stockfish::DROP) {
+                    return false;
+                }
+                const Stockfish::PieceType type = Stockfish::in_hand_piece_type(move);
+                const int pending = time.pending_in_hand(seat, type);
+                return pending > 0
+                    && board.count_in_hand(boardNumber, side, type) <= pending;
+            });
+        }
+    }
+    actions.push_back(Stockfish::MOVE_NONE);
+    return actions;
+}
+
+uint32_t durative_expansion_key(Board& board, Stockfish::Color team, const TimeState& time) {
+    if (!time.is_durative()) {
+        return 0;
+    }
+    uint64_t h = 0x45585041ULL;
+    auto mix = [&h](uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h *= 0xbf58476d1ce4e5b9ULL;
+    };
+    const LeafTurn turn = leaf_turn(board, team, time);
+    // The generator's inputs besides the board (process_batch).
+    const bool maySit = turn.forcedWait || time.can_sit(team);
+    mix(uint64_t(turn.boardAOnTurn) | (uint64_t(turn.boardBOnTurn) << 1)
+        | (uint64_t(turn.forcedWait) << 2) | (uint64_t(maySit) << 3)
+        // The terminal check's time inputs (classify_terminal_position).
+        | (uint64_t(time.can_sit(~team)) << 4)
+        | (uint64_t(time.outcome()) << 8));
+    if (!time.instant_transfer()) {
+        // The held-back drops prepare_actions removes on the acting boards.
+        for (int boardNumber : {BOARD_A, BOARD_B}) {
+            if (!(boardNumber == BOARD_A ? turn.boardAOnTurn : turn.boardBOnTurn)) {
+                continue;
+            }
+            const Stockfish::Color side = board.side_to_move(boardNumber);
+            const int seat = TimeState::seat_of(boardNumber, side);
+            uint64_t held = 0;
+            for (int type = Stockfish::PAWN; type <= Stockfish::QUEEN; ++type) {
+                const Stockfish::PieceType piece = static_cast<Stockfish::PieceType>(type);
+                const int pending = time.pending_in_hand(seat, piece);
+                if (pending > 0 && board.count_in_hand(boardNumber, side, piece) <= pending) {
+                    held |= uint64_t{1} << type;
+                }
+            }
+            mix((uint64_t(boardNumber) << 32) | held);
+        }
+    }
+    if (time.mate_race_by_landing()) {
+        // Waiting-board and early mate races read the landing order of the
+        // seats on turn, the early landings and the last capturer.
+        const int seatA = TimeState::seat_of(BOARD_A, board.side_to_move(BOARD_A));
+        const int seatB = TimeState::seat_of(BOARD_B, board.side_to_move(BOARD_B));
+        const int32_t readyA = time.seat_ready_ms(seatA);
+        const int32_t readyB = time.seat_ready_ms(seatB);
+        uint64_t race = readyA < readyB ? 1 : readyA > readyB ? 2 : 3;
+        for (int seat = 0; seat < 4; ++seat) {
+            const int32_t early = time.mate_race_early_ms(seat);
+            race |= uint64_t(early < 0 ? 0 : early == 0 ? 1 : 2) << (4 + 2 * seat);
+        }
+        const std::optional<Stockfish::Color> last = time.last_capture_team();
+        race |= uint64_t(last ? 1 + static_cast<int>(*last) : 0) << 16;
+        mix(race);
+    }
+    const uint32_t key = static_cast<uint32_t>(h ^ (h >> 32));
+    return key == 0 ? 1u : key;
+}
+
 SearchThread::SearchThread()
         : transpositionTable(nullptr), mateCandidateTable(nullptr),
             currentBatchSize(0) {
@@ -909,42 +1007,21 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
         }
         ctx.leafHash = board.search_hash_key(ctx.teamToPlay, ctx.time);
 
-        ctx.boardAOnTurn = board.side_to_move(BOARD_A) == ctx.teamToPlay;
-        ctx.boardBOnTurn = board.side_to_move(BOARD_B) == ~ctx.teamToPlay;
-        if (ctx.time.is_durative()) {
-            // Only the boards whose seat lands now are this team's to act on.
-            const std::array<bool, 2> acting = ctx.time.acting_boards(ctx.teamToPlay);
-            ctx.boardAOnTurn = ctx.boardAOnTurn && acting[BOARD_A];
-            ctx.boardBOnTurn = ctx.boardBOnTurn && acting[BOARD_B];
-            ctx.forcedWait = !ctx.boardAOnTurn && !ctx.boardBOnTurn;
-        }
+        // Only the boards whose seat lands now are this team's to act on
+        // under a durative clock (leaf_turn).
+        const LeafTurn turn = leaf_turn(board, ctx.teamToPlay, ctx.time);
+        ctx.boardAOnTurn = turn.boardAOnTurn;
+        ctx.boardBOnTurn = turn.boardBOnTurn;
+        ctx.forcedWait = turn.forcedWait;
+        // Wave 2c, fix 1: what besides the board fixed this expansion, so a
+        // retained node re-timed to other clocks can be checked against it.
+        ctx.expansionKey = durative_expansion_key(board, ctx.teamToPlay, ctx.time);
         auto prepare_actions = [&](int boardNumber, bool onTurn,
                                    vector<Stockfish::Move>& actions,
                                    vector<uint8_t>& captures,
                                    vector<int>& policyIndices) {
-            if (onTurn) {
-                actions = board.legal_moves(boardNumber);
-                std::erase_if(actions, [&](Stockfish::Move move) {
-                    return !is_policy_move_representable(
-                        board, boardNumber, move);
-                });
-                if (!ctx.time.instant_transfer()) {
-                    // InstantTransfer off: a piece that reached the pocket
-                    // during this seat's current decision is not droppable.
-                    const Stockfish::Color side = board.side_to_move(boardNumber);
-                    const int seat = TimeState::seat_of(boardNumber, side);
-                    std::erase_if(actions, [&](Stockfish::Move move) {
-                        if (type_of(move) != Stockfish::DROP) {
-                            return false;
-                        }
-                        const Stockfish::PieceType type = Stockfish::in_hand_piece_type(move);
-                        const int pending = ctx.time.pending_in_hand(seat, type);
-                        return pending > 0
-                            && board.count_in_hand(boardNumber, side, type) <= pending;
-                    });
-                }
-            }
-            actions.push_back(Stockfish::MOVE_NONE);
+            // Legal moves, held-back drops removed, and a trailing pass.
+            actions = leaf_board_actions(board, boardNumber, onTurn, ctx.time);
             captures.reserve(actions.size());
             policyIndices.reserve(actions.size());
             const Stockfish::Color side = board.side_to_move(boardNumber);
@@ -1115,7 +1192,7 @@ void SearchThread::process_batch(
                              ctx.boardAOnTurn, ctx.boardBOnTurn,
                              ctx.capturesA, ctx.capturesB,
                              jointFactorsA, jointFactorsB,
-                             jointFactorRank, ctx.leafHash);
+                             jointFactorRank, ctx.leafHash, ctx.expansionKey);
             ctx.leaf->release_evaluation_reservation();
                 
             // Backup value with WDL and moves-left shaping
@@ -1624,7 +1701,8 @@ void SearchThread::expand_leaf_node(Node* leaf,
                                     const vector<float>& jointFactorsA,
                                     const vector<float>& jointFactorsB,
                                     size_t jointFactorRank,
-                                    uint64_t positionHash) {
+                                    uint64_t positionHash,
+                                    uint32_t expansionKey) {
     // Store the position hash in the node for MCGS
     if (positionHash != 0) {
         leaf->set_hash(positionHash);
@@ -1635,7 +1713,8 @@ void SearchThread::expand_leaf_node(Node* leaf,
     leaf->try_init_and_expand(actionsA, actionsB, priorsA, priorsB,
                               teamHasTimeAdvantage, boardAOnTurn, boardBOnTurn,
                               runtimeConfig, capturesA, capturesB,
-                              jointFactorsA, jointFactorsB, jointFactorRank);
+                              jointFactorsA, jointFactorsB, jointFactorRank,
+                              expansionKey);
     
     // Note: The first child created during try_init_and_expand doesn't have its
     // hash computed yet (would require board access). However, when that child

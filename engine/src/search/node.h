@@ -181,7 +181,12 @@ private:
     std::atomic<bool> m_is_expanded{false};
 
     Stockfish::Color teamToPlay;
-    
+    // Wave 2c, fix 1 (TeamTreeReuse): durative_expansion_key() of the
+    // position this node was expanded at (0: not durative, or expanded
+    // outside the search). Written once under nodeMutex at expansion; read
+    // only by the re-timing walk, with no worker running.
+    uint32_t expansionKey_ = 0;
+
     // MCGS (Monte Carlo Graph Search) support
     std::atomic<uint64_t> positionHash{0};  // Zobrist hash for transposition detection
     // MCTS Solver support
@@ -706,13 +711,15 @@ public:
                              const std::vector<uint8_t>& capturesB = {},
                              const std::vector<float>& jointFactorsA = {},
                              const std::vector<float>& jointFactorsB = {},
-                             size_t jointFactorRank = 0) {
+                             size_t jointFactorRank = 0,
+                             uint32_t expansionKey = 0) {
         std::unique_lock<std::shared_mutex> guard(nodeMutex);
         
         // Already expanded by another thread
         if (m_is_expanded.load(std::memory_order_relaxed)) {
             return false;
         }
+        expansionKey_ = expansionKey;
         
         std::vector<float> rootPriorsA = priorsA;
         std::vector<float> rootPriorsB = priorsB;
@@ -823,6 +830,72 @@ public:
                 output.push_back(child.get());
             }
         }
+    }
+
+    /** Fix 1: the key this node was expanded with (see expansionKey_). */
+    uint32_t expansion_key() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return expansionKey_;
+    }
+
+    /**
+     * @brief Wave 2c, fix 1: forget what one edge learnt, before its child
+     * is replaced by a fresh node in a re-timed retained tree.
+     *
+     * The edge goes back to a new edge's state (no visits, the Q_INIT seed)
+     * and its visits and value sum come off this node's own totals, as
+     * backup added them (both are from this node's view). An edge seeded
+     * with a transposition's pseudo-visit takes one visit more off than
+     * this node counted for it; the totals stay at least 0. Ancestors keep
+     * theirs. No worker may be running.
+     * @return The visits removed.
+     */
+    int reset_edge_for_reuse(int childIdx) {
+        std::unique_lock<std::shared_mutex> guard(nodeMutex);
+        if (childIdx < 0 || static_cast<size_t>(childIdx) >= edges.size()) {
+            return 0;
+        }
+        EdgeStats& edge = edges[childIdx];
+        const int visits = edge.visits.load(std::memory_order_relaxed);
+        const float sum = edge.valueSum.load(std::memory_order_relaxed);
+        if (visits > 0) {
+            const int left = std::max(0, m_visits.load(std::memory_order_relaxed) - visits);
+            m_visits.store(left, std::memory_order_relaxed);
+            valueSum.store(left > 0 ? valueSum.load(std::memory_order_relaxed) - sum : 0.0f,
+                           std::memory_order_relaxed);
+        }
+        edge.visits.store(0, std::memory_order_relaxed);
+        edge.virtualLoss.store(0, std::memory_order_relaxed);
+        edge.q.store(SearchParams::Q_INIT, std::memory_order_relaxed);
+        edge.valueSum.store(SearchParams::Q_INIT, std::memory_order_relaxed);
+        if (visitedEdgePositions[childIdx] >= 0) {
+            mark_edge_unvisited_locked(static_cast<size_t>(childIdx));
+        }
+        return std::max(0, visits);
+    }
+
+    /**
+     * @brief Fix 1: drop the reverse edges to this node's parents, so a
+     * proof found below an adopted root stops there instead of reaching
+     * into the discarded old tree.
+     */
+    void clear_parent_edges() {
+        std::lock_guard<std::mutex> guard(parentEdgesMutex);
+        parentEdges.clear();
+    }
+
+    /**
+     * @brief The action lists this node was expanded with, per board (in
+     * prior order), and the pass rules the generator applies; for checking
+     * a retained expansion against a fresh one.
+     */
+    std::vector<Stockfish::Move> expanded_actions(int boardNum) const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return candidateGenerator.sortedActions(boardNum);
+    }
+    JointActionRules expanded_rules() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return candidateGenerator.actionRules();
     }
 
     void replace_child(int childIdx, const std::shared_ptr<Node>& child) {

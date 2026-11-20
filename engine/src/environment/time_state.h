@@ -700,6 +700,60 @@ public:
             ? durative_.rootMoveMs : durative_.paceMs[seat];
     }
 
+    /**
+     * @brief Wave 2c, fix 1 (TeamTreeReuse): how far this state, a node's
+     * path time in a retained tree, is from @p live, the clock the new
+     * search is rooted at: the largest difference of any seat's clock and
+     * of the ready time of each seat of the other team on turn (ms). Both
+     * must be durative; otherwise MAX_LEAD_MS.
+     */
+    int32_t clock_distance(const TimeState& live) const {
+        const Durative& d = durative_;
+        const Durative& l = live.durative_;
+        if (!d.active || !l.active) {
+            return MAX_LEAD_MS;
+        }
+        int64_t worst = 0;
+        for (int seat = 0; seat < 4; ++seat) {
+            worst = std::max<int64_t>(
+                worst, std::abs(static_cast<int64_t>(d.clockMs[seat]) - l.clockMs[seat]));
+        }
+        for (int board = 0; board < 2; ++board) {
+            const int seat = seat_of(board, l.side[board]);
+            if (team_of_seat(seat) != l.rootTeam) {
+                worst = std::max<int64_t>(
+                    worst, std::abs(static_cast<int64_t>(d.readyMs[seat]) - l.readyMs[seat]));
+            }
+        }
+        return static_cast<int32_t>(std::min<int64_t>(worst, MAX_LEAD_MS));
+    }
+
+    /**
+     * @brief Fix 1: whether a retained node's path time is in the same turn
+     * state as @p live, apart from its clocks: the same sides to move, the
+     * same sitting seats and held-back pieces on turn, no result yet, and
+     * the same tree rules. (With MateRaceByLanding also the last capturer,
+     * which settles exact landing ties.) Its clocks are clock_distance's.
+     */
+    bool same_turn_state(const TimeState& live) const {
+        const Durative& d = durative_;
+        const Durative& l = live.durative_;
+        if (!d.active || !l.active || d.outcome != Outcome::NONE
+            || l.outcome != Outcome::NONE || d.side != l.side
+            || d.flagLoss != l.flagLoss || d.instantTransfer != l.instantTransfer
+            || d.mateRaceByLanding != l.mateRaceByLanding || d.passCapK != l.passCapK
+            || d.wide != l.wide || sitGate_ != live.sitGate_) {
+            return false;
+        }
+        for (int board = 0; board < 2; ++board) {
+            const int seat = seat_of(board, l.side[board]);
+            if (d.sitting[seat] != l.sitting[seat] || d.pending[seat] != l.pending[seat]) {
+                return false;
+            }
+        }
+        return !l.mateRaceByLanding || d.lastCapture == l.lastCapture;
+    }
+
     /** Exact identity of a clocked state: the lead, both move times and any next-move time. */
     uint64_t exact_key() const {
         const uint64_t lead = static_cast<uint32_t>(whiteLeadMs_);
