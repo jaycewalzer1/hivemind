@@ -391,7 +391,8 @@ Checks run 2026-11-19 (ONNX Runtime on the Mac):
 
 Spec: talisman `docs/custom_engine_spec_v5_continuity.md`. Three fixes, each a UCI option and a self-play flag, off
 by default; with them off the engine is bit for bit the `261081b` one (`engine/tests/stock_parity.sh` and
-`engine/tests/wave2_parity.sh`, 8/8 each). Fix 1 is built; fixes 2 (joint plans) and 3 (plan carry) are not yet.
+`engine/tests/wave2_parity.sh`, 8/8 each). Fixes 1 and 2 are built; fix 3 (plan carry) and the `Continuity` preset
+are not yet.
 
 ### Fix 1: team tree reuse (`TeamTreeReuse`, `TeamTreeReuseToleranceMs`)
 
@@ -442,7 +443,7 @@ What it does (`Agent::run_search`, `agent.cc`):
 * **UCI** does not start the permanent brain after a search that keeps a team tree (it would re-root with v3's
   `advance()`). Opening noise still resets the agent before the search, so it drops the tree.
 * **Telemetry.** Verbose UCI prints `info string Team tree reuse: <visits> visits recovered, clock diff <ms> ms,
-  <pruned> pruned`, or `... none (<reason>)` with `no tree`, `no node`, `clock`, `shape`, `solved` (followed by
+  <pruned> pruned`, or `... none (<reason>)` with `no tree`, `no node`, `clock`, `shape`, `committed` (fix 2), `solved` (followed by
   `, clock diff <ms> ms` when some node had the live boards). The exact path's `Tree reuse:` line is never printed
   under the option. Self-play prints `selfplay team tree reuse: <hit %> of searches (<hits>/<searches>), <mean>
   mean visits recovered, by seat Aw .. Bb .., refused <reason> <count> ...`.
@@ -462,5 +463,97 @@ has the live boards; and in self-play a seat of ours whose move is in flight act
 on every board our team is on turn), so the tree's line on that board is not the game's.
 
 Tests: `engine/tests/test_continuity_fix1.cc` (spec v5 0.1 and 1.1-1.7, 1.9-1.15, 1.17, plus UCI `ucinewgame` and
-option-off cases) and `SelfPlayWave2Test.TeamTreeReuse*` in `test_selfplay_wave2.cc` (1.8). Not yet: 1.16 (needs
-fix 2's committed moves).
+option-off cases) and `SelfPlayWave2Test.TeamTreeReuse*` in `test_selfplay_wave2.cc` (1.8); 1.16 is in
+`test_continuity_fix2.cc` (`JointPlansSearch.TeamTreeReuseRefusesCommittedCandidate`).
+
+### Fix 2: joint team actions in the durative tree (`JointPlans`, `JointPlanFreePermille`)
+
+| UCI option | Self-play / tournament flag | Default |
+|---|---|---|
+| `JointPlans` (check) | `--joint-plans <bool>` | false |
+| `JointPlanFreePermille` (spin 0..1000) | `--joint-plan-free-permille <n>` | 500 |
+
+Only under a durative clock; with `DurativeTree` off `setoption` says it does nothing. The flag needs `--durative-tree
+true` only (it acts inside each search, so no seat clocks are needed). Both travel in `DurativeConfig` (UCI keeps them
+in its `durativeConfig`, `current_clock()` copies them). Python: `hivemind.wave2.Options.joint_plans`,
+`joint_plan_free_permille`.
+
+What it does. Below the root, at a node where a team acts on one board while its seat on the other board is on turn
+but not ready (`TimeState::planned_boards`), that team chooses one joint action: the acting seat's move or pass
+(**immediate half**, as before) and, for the other seat, a **planned** move or "decide later". The root keeps v4's
+meaning (both our on-turn seats decide there; root edges never carry a plan, so `bestmove`, policy targets and
+records are unchanged).
+
+* **Rules** (`time_state.h`). A planned move is stored as the seat's committed move (`Durative::committed`, keyed only
+  with `jointPlans`, so keys with the option off are v4's: test 0.3 compares 2000 random lines against keys recorded
+  from `261081b`) and changes no ready time. When the seat's ready time comes it acts with that move and nothing
+  else (**forced half**), which clears the commitment. A committed seat that is sitting keeps its pass timing: it is
+  woken 1 ms after a landing on the other board, and a pass beside it on the other board (its own team's or the
+  opponent's) sends its wake-up, and so its landing, on to its cap, as v4's leapfrog rule does for any sitting seat.
+  A pass beside a committed seat waits for its landing (it counts as deciding). Both sit-off rules skip committed
+  seats: no sit-off `DRAW`, and a committed seat is no sitter that forces the other team to move. A committed seat
+  that flags before landing loses as before.
+* **Planned half** (`leaf_planned_half`, `searchthread.cc`): the seat's legal moves (held-back drops removed as on an
+  acting board), then drops of every type one of the immediate half's captures would send it and it cannot drop now,
+  each tagged with that type (only with InstantTransfer, or for a sitting seat, which decides anew when it wakes),
+  then "decide later". A pair with a supplied drop is legal only beside a half that captures that type. Priors: the
+  network's policy for that board (supplied drops at their raw logits), "decide later" at least
+  `JointPlanFreePermille / 1000`, the moves sharing the rest in proportion; a move that mates as it lands (tested on
+  checking moves only, the victims allowed to wait for a blocker) is raised to at least `JOINT_PLAN_MATE_PRIOR` (0.25)
+  and the half renormalised. The legal prior mass is summed by (category, supplied type) x needed type, so widening
+  by mass stays exact (test 2.3 compares it with the sum over all pairs).
+* **Representation.** `JointActionCandidate::planned` sits in the padding after `gumbelScore` (`static_assert`: still
+  48 bytes); `moveA`/`moveB` stay the halves made on the board, so every existing make/unmake site is unchanged. The
+  generator keeps the planned board's list in that board's slot and its index (`Node::planned_board()`, an `int8_t`
+  in the generator's padding); the needed/supplied types are packed into bits 1-3 of the per-action capture bytes.
+  `sizeof(Node)` is 1040 before and after (an early version with two extra vectors had 1088). `TimeState` grows from
+  280 to 300 bytes (a value per path step, not stored per node).
+* **Lookups.** Every comparison of a below-root action by its moves goes through `JointActionCandidate::same_moves`
+  (moves and plan): `promote`, the mate-hint match, `child_for_action`, `retain_played_line` and the proof lists. The
+  proof-number root prover keeps its own move pairs (no plans there).
+* **Time.** `durative_time_after()` charges an action with its plan; selection, fix 1's descent and re-timing and the
+  tests use it. The expansion key also holds the planned board and every commitment. Fix 1 refuses a board match
+  holding any commitment (`committed`); it is checked after the clock and before the expansion key, and ranks above
+  `shape`, so a match refused only for its commitment reports `committed` and its commitments
+  (`TeamTreeMatch::committed`, for fix 3).
+* **Terminal check.** A seat with a committed move is credited with a waiting-board mate only if its commitment is
+  that mate.
+* **Invariant.** At every leaf of a durative search `board.side_to_move(b) == time.side_on(b)` (asserted in debug
+  builds; `SearchThread::checkDurativeSides` counts violations for tests: 0 in a 4000-node search with fix 1 on top).
+
+Checks run (Mac, `build-ninja` 4 workers, `build-sp1` 1 worker, 2 jobs):
+
+| Check | Result |
+|---|---|
+| C++ suite `build-ninja/tests/hivemind_tests` | 560 passed, 1 skipped (`MateRaceTest.MeasureFrozenRaceOnTheGame`, as before) |
+| `engine/tests/stock_parity.sh`, `engine/tests/wave2_parity.sh` | 8/8 identical each |
+| wave2-hivemind Python (`uv run pytest`) | 198 passed, 8 failed (the same bsdtar `tar --compare` failures) |
+| Self-play, it13 fp32, 200 nodes, 30 s base, wave 2 flags + `--joint-plans true`, 2 games (`build-sp1`) | 218 samples, a resignation and a flag, no error; 285 s; 227 MB peak |
+| The same + `--team-tree-reuse true`, 1 game | 90 samples, flag; reuse 12.2% of searches (11/90), refused `committed` 6, `shape` 28, `no node` 22, `clock` 15, `no tree` 6, `solved` 2 |
+
+**Test 2.4a (it13) does not separate the trees.** Position as the spec builds it: B with Bw's king smothered on h1
+and Bb's pocket empty, A with Aw's queen able to take a pawn-defended knight on f6, Aw ready at 100 ms, Ab's reply at
+150, Bb ready at 400 (and the colour mirror). At 64, 128, 256, 512 and 2048 nodes, with and without the root mate
+provers, **both** trees choose `Qxf6` and prove it a win within 7 (old) or 9 (fix 2) root visits. The old tree proves
+it with the waiting-board mate rule: after the capture black is on turn on one board while `N@f2#` waits on the other
+and survives every reply. With fix 2 the proven edge is the same move with "decide later". A harder version that the
+old tree misses would have to stop being a mate that survives every reply, and then it is no longer the forced win the
+test needs. The test records that both choose and prove the capture.
+
+**Test 2.4b (headline flags) is not built, and no such position was found.** Under InstantTransfer false the
+transfer runs from the planned half (Bb's capture at 400) to Aw's next decision, which starts when Ab's reply lands.
+Ab can always use that reply to defuse a drop mate (a pawn move or a rook move gives the king a square), or sit on A
+(SitGate off), and Aw cannot act on A until Ab has moved. So the line is never forced, and nothing in it is a win that
+fix 2 proves and the old tree does not. So far fix 2 has **no tested benefit under the headline flags**; the arena rows
+(`c_joint_120`) are the test.
+
+**Planned pairs need visits.** At the default share (500) "decide later" holds half of the planned seat's prior, so a
+planned pair's joint prior is at most half its immediate move's; at a 400-node UCI root search the tree had planning
+nodes below the root but had expanded no planned pair yet (test 2.6). The `continuity_probe.py scaling` run should
+compare shares (for example 500 against 200) before a PACE row is read.
+
+Tests: `engine/tests/test_continuity_fix2.cc` (spec v5 0.2, 0.3, 1.16, 2.1-2.3, 2.4a as measured, 2.5-2.9, 4.2, and
+v4 acceptance test 4 with plans), `engine/tests/durative_key_lines.h` with
+`engine/tests/data/durative_keys_261081b.txt` (0.3). Not built: 2.4b (above), 4.1 (it needs the `Continuity` preset,
+which comes with fix 3; its fix-2 parts are `ContinuityRules.*` and the rules tests), 4.3 (`tools/regression.py` with
+the new flags, after the arena plumbing).
