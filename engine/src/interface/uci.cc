@@ -700,6 +700,19 @@ void UCI::setoption(std::istringstream& is) {
                           << std::endl;
             }
         }
+    } else if (name == "JointPlans") {
+        if (value == "true" || value == "false") {
+            durativeConfig.jointPlans = value == "true";
+            std::cout << "info string JointPlans set to " << value << std::endl;
+            if (durativeConfig.jointPlans && !durativeTree) {
+                std::cout << "info string JointPlans acts only with DurativeTree true"
+                          << std::endl;
+            }
+        }
+    } else if (name == "JointPlanFreePermille") {
+        durativeConfig.jointPlanFreePermille = std::clamp(std::stoi(value), 0, 1000);
+        std::cout << "info string JointPlanFreePermille set to "
+                  << durativeConfig.jointPlanFreePermille << std::endl;
     } else if (name == "TeamTreeReuseToleranceMs") {
         teamTreeReuseToleranceMs = std::clamp(std::stoi(value), 0, 5000);
         std::cout << "info string TeamTreeReuseToleranceMs set to "
@@ -910,6 +923,8 @@ void UCI::send_uci_response() {
     // Wave 2c (docs/custom_engine_spec_v5_continuity.md); off by default.
     cout << "option name TeamTreeReuse type check default false" << endl;
     cout << "option name TeamTreeReuseToleranceMs type spin default 250 min 0 max 5000" << endl;
+    cout << "option name JointPlans type check default false" << endl;
+    cout << "option name JointPlanFreePermille type spin default 500 min 0 max 1000" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

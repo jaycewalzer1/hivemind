@@ -53,6 +53,7 @@ private:
     bool sitGate = true;
     // FlagLoss, InstantTransfer, MateRaceByLanding, PassCapK and the three
     // per-seat strings; RootMoveTimeMs is filled in from rootMoveTimeMs.
+    // Wave 2c, fix 2: JointPlans and JointPlanFreePermille live here too.
     DurativeConfig durativeConfig;
     // Wave 2c, fix 1 (docs/custom_engine_spec_v5_continuity.md): keep the
     // team's tree between searches and adopt the node the game reached,
