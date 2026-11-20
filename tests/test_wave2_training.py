@@ -162,6 +162,27 @@ def test_continuity_sets_the_three_switches():
     assert wave2.from_args(parser.parse_args(["--wave2"])) == wave2.WAVE2
 
 
+def test_continuity_knob_needs_its_switch():
+    """A wave 2c knob without its switch does nothing, and the engine would
+    still take it as a search change and switch a stock run to the clock time
+    model: it is refused (the engine's validate() refuses it too)."""
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    for flag, value in (("--team-tree-reuse-tolerance-ms", "400"),
+                        ("--joint-plan-free-permille", "400"),
+                        ("--plan-carry-permille", "200")):
+        with pytest.raises(ValueError):
+            wave2.from_args(parser.parse_args([flag, value]))
+        with pytest.raises(ValueError):
+            wave2.from_args(parser.parse_args(["--wave2", flag, value]))
+    with pytest.raises(ValueError):
+        wave2.Options(plan_carry_permille=200)
+    # With the switch (or the preset) the knob is sent; at its default it is fine alone.
+    options = wave2.from_args(parser.parse_args(["--wave2", "--continuity", "--plan-carry-permille", "200"]))
+    assert "--plan-carry-permille" in options.engine_args()
+    assert wave2.Options(plan_carry_permille=300).is_stock
+
+
 def test_continuity_flags_are_in_the_engine_help():
     """missing_engine_options is empty against the built engine's --help (spec v5 5.2)."""
     import shutil

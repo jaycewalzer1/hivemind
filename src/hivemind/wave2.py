@@ -94,6 +94,14 @@ class Options:
             raise ValueError("joint_plan_free_permille must be in 0..1000")
         if not 0 <= self.plan_carry_permille <= 1000:
             raise ValueError("plan_carry_permille must be in 0..1000")
+        # A knob without its switch does nothing; the engine refuses it too, so it never
+        # silently moves a stock run onto the clock time model.
+        defaults = {field.name: field.default for field in fields(self)}
+        for switch, knob in (("team_tree_reuse", "team_tree_reuse_tolerance_ms"),
+                             ("joint_plans", "joint_plan_free_permille"),
+                             ("plan_carry", "plan_carry_permille")):
+            if not getattr(self, switch) and getattr(self, knob) != defaults[knob]:
+                raise ValueError(f"{knob} needs {switch}")
         if self.plan_carry and not (self.durative_tree and self.base_mix):
             # The engine refuses it too: only seat-clock games play one seat's
             # half and keep the agent until the partner decides.
