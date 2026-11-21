@@ -643,3 +643,43 @@ Not as specified:
   observed directly.
 * **4.1** covers v4 tests 1 and 6 sequenced (each asserts that fix 1 or fix 3 fired). Tests 3 and 4 are rules tests
   (fix 2's `ContinuityRules.*` cover them with plans); the mate race (test 5) is not rerun sequenced.
+
+### Review fixes (2026-11-20)
+
+Confirmed findings of the review of fixes 1-3, each fixed with a regression test (talisman spec v5, "Build corrections
+(review fixes)"):
+
+* **Old root (fix 1).** When no move landed since the last search, the match is the old root itself, whose priors
+  already hold that search's noise and plan mix. It is adopted (`TeamTreeReuseReport::oldRoot`) without
+  `refresh_root_noise` or `apply_root_plan`; carried halves report `old root`. In self-play this case is most of the
+  adoptions (2 seat-clock games, 256 nodes, tolerance 5000: 8 old-root matches beside 3 deeper ones), so it is kept
+  rather than refused. `TeamTreeReuse.OldRootReadoptedWithoutASecondNoiseMix`, `PlanCarry.OldRootGetsNoSecondPlanMix`.
+* **Refusal ties** go to the node with more visits: a `committed` refusal carries the most visited line's plan.
+  `JointPlansSearch.CommittedRefusalCarriesTheMostVisitedPlan`.
+* **Proven returns** (`return_proven_mate`, `return_proven_loss`) record the returned pair and keep the tree
+  (`keep_continuity`, shared with the normal end). `PlanCarry.ProvenMateRecordsItsPairAndKeepsTheTree`.
+* **Missed ponders** record no plan. `PlanCarry.MissedPonderKeepsTheRealPlan`.
+* **Knobs need their switch** (`Wave2GameOptions::validate`, `changes_search`, Python `Options`).
+  `SelfPlayWave2Test.ContinuityKnobsNeedTheirSwitches`, `test_continuity_knob_needs_its_switch`.
+* **Tournament telemetry**: a per-game `tournament continuity game i/N` line (adoptions with old roots, refusals,
+  plans recorded/applied/other team, state left after the game-start clear). `TournamentWithContinuity` now checks the
+  clears and that fixes 1 and 3 fire, from a small start position so seats sit. With fix 1 on, the carried halves are
+  almost always met by an old-root re-adoption (recorded 4-5 per game, applied 0); fix 3 alone applies them.
+* **Planned pairs get visits**: `JointPlansSearch.PlannedPairsGetVisits` (over a tenth of the root visits, forced
+  landings searched). 2.4b stays unbuilt; a behavioural benefit of fix 2 is still only measurable in the arena.
+* **Test 0.6**: `engine/tests/wave2_game_parity.sh`, 2 self-play games, 2 tournament games and a 10-search UCI
+  session in one process vs `261081b`, one worker: 5/5 identical. Self-play is compared on games.pgn and
+  seat_clocks.tsv less `nodes`, mate probe off: on `261081b` itself, run to run, a search can overshoot its node
+  target by a visit and the probe's proofs land at wall-clock times (measured: two base runs differ in `nodes` and,
+  with the probe on, in moves).
+
+Checks run (Mac, `build-ninja` 4 workers, `build-parity` 1 worker, 2 jobs):
+
+| Check | Result |
+|---|---|
+| C++ suite `build-ninja/tests/hivemind_tests` | 589 tests: 588 passed, 1 skipped (`MateRaceTest.MeasureFrozenRaceOnTheGame`, as before); the 8 new tests 5 times each, no failure |
+| `engine/tests/stock_parity.sh` | 8/8 identical |
+| `engine/tests/wave2_parity.sh` | 8/8 in 3 of 5 runs, 7/8 in 2: position 8 (a mate-in-2 loss at 100 nodes) differs by two nodes; in one of those runs the `261081b` binary's own output changed, so it is run-to-run timing, not the change |
+| `engine/tests/wave2_game_parity.sh` (0.6) | 5/5 identical |
+| wave2-hivemind Python (`uv run pytest`) | 183 passed, 8 failed (the same bsdtar `tar --compare` failures) with `tests/distill` left out. `tests/distill/test_distill.py::test_a_training_step_reduces_the_loss` ran over 30 minutes inside torch's backward pass (load average 15-24 on the Mac at the time) and was stopped; the distill tests were not rerun, and nothing in them changed |
+| Main repo `arena/tests` | 305 passed |
