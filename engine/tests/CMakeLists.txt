@@ -36,6 +36,7 @@ add_executable(
   test_continuity_fix1.cc
   test_continuity_fix2.cc
   test_continuity_fix3.cc
+  test_diag_fixes.cc
 )
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
 
