@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "environment/board.h"
 #include "environment/time_state.h"
 #include "tools/clock_sampling.h"
 
@@ -65,18 +66,33 @@ struct Wave2GameOptions {
     // Seat-clock games with the durative tree only.
     bool planCarry = false;
     int32_t planCarryPermille = 300;
+    // Diagnosis fixes (docs/wave2_engine.md, "Diagnosis fixes"). D1 (UCI
+    // OwnPaceBelowRoot): below the root our seats act at their own pace.
+    // D3 (UCI WaitNodeActingEval): forced waits evaluated from the acting
+    // team. Both durative tree only. D5 (UCI BlockableCheckNotMate): a
+    // drop-blockable check is never mate, in the game's own end check as in
+    // every search (the arena's rule); any tree.
+    bool ownPaceBelowRoot = false;
+    bool waitNodeActingEval = false;
+    bool blockableCheckNotMate = false;
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
     /**
      * Whether any search option differs from stock. A wave 2c knob only
      * counts with its switch (validate() refuses it without), so a knob
-     * alone never moves a stock run onto the clock time model.
+     * alone never moves a stock run onto the clock time model. D5 is a board
+     * rule, not a clock option: alone it does not count either.
      */
     bool changes_search() const {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
             || mateRaceByLanding || passCapK != 8 || teamTreeReuse || jointPlans
-            || planCarry;
+            || planCarry || ownPaceBelowRoot || waitNodeActingEval;
+    }
+
+    /** D5: the game's board (and so every search's copy) plays the arena's mate rule. */
+    void apply_board_rules(Board& board) const {
+        board.set_blockable_check_not_mate(blockableCheckNotMate);
     }
 
     void validate() const {
@@ -113,6 +129,12 @@ struct Wave2GameOptions {
         if (jointPlans && !durativeTree) {
             throw std::invalid_argument("--joint-plans needs --durative-tree true");
         }
+        if (ownPaceBelowRoot && !durativeTree) {
+            throw std::invalid_argument("--own-pace-below-root needs --durative-tree true");
+        }
+        if (waitNodeActingEval && !durativeTree) {
+            throw std::invalid_argument("--wait-node-acting-eval needs --durative-tree true");
+        }
         if (teamTreeReuse && (!durativeTree || baseMix.empty())) {
             throw std::invalid_argument(
                 "--team-tree-reuse needs --durative-tree true and seat clocks (--base-mix)");
@@ -137,6 +159,8 @@ struct Wave2GameOptions {
         config.passCapK = passCapK;
         config.jointPlans = jointPlans;
         config.jointPlanFreePermille = jointPlanFreePermille;
+        config.ownPaceBelowRoot = ownPaceBelowRoot;
+        config.waitNodeActingEval = waitNodeActingEval;
         return config;
     }
 };
@@ -188,12 +212,18 @@ inline bool parse_wave2_option(const std::string& option, const std::string& val
     else if (option == "--joint-plan-free-permille") options.jointPlanFreePermille = std::stoi(value);
     else if (option == "--plan-carry") options.planCarry = boolean();
     else if (option == "--plan-carry-permille") options.planCarryPermille = std::stoi(value);
+    else if (option == "--own-pace-below-root") options.ownPaceBelowRoot = boolean();
+    else if (option == "--wait-node-acting-eval") options.waitNodeActingEval = boolean();
+    else if (option == "--blockable-check-not-mate") options.blockableCheckNotMate = boolean();
     else if (option == "--continuity") {
-        // Preset: the three wave 2c switches; the knobs keep their values.
+        // Preset: the three wave 2c switches with the diagnosis fixes D1 and
+        // D5; the knobs keep their values.
         const bool on = boolean();
         options.teamTreeReuse = on;
         options.jointPlans = on;
         options.planCarry = on;
+        options.ownPaceBelowRoot = on;
+        options.blockableCheckNotMate = on;
     }
     else return false;
     return true;

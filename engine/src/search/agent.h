@@ -447,6 +447,7 @@ private:
     friend class AgentContinuityPeer;
     friend class AgentContinuityFix2Peer;
     friend class AgentContinuityFix3Peer;
+    friend class AgentDiagFixesPeer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);

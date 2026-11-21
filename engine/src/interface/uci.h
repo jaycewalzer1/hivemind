@@ -20,6 +20,7 @@ private:
     friend class UCIOpeningNoiseTestPeer;
     friend class UCIContinuityPeer;
     friend class UCIContinuityFix3Peer;
+    friend class UCIDiagFixesPeer;
 
     std::thread* mainSearchThread;
     std::unique_ptr<Agent> agent;
@@ -54,7 +55,9 @@ private:
     bool sitGate = true;
     // FlagLoss, InstantTransfer, MateRaceByLanding, PassCapK and the three
     // per-seat strings; RootMoveTimeMs is filled in from rootMoveTimeMs.
-    // Wave 2c, fix 2: JointPlans and JointPlanFreePermille live here too.
+    // Wave 2c, fix 2: JointPlans and JointPlanFreePermille live here too, and
+    // the diagnosis fixes OwnPaceBelowRoot (D1) and WaitNodeActingEval (D3).
+    // BlockableCheckNotMate (D5) is a rule of `board`.
     DurativeConfig durativeConfig;
     // Wave 2c, fix 1 (docs/custom_engine_spec_v5_continuity.md): keep the
     // team's tree between searches and adopt the node the game reached,
@@ -65,7 +68,8 @@ private:
     // Wave 2c, fix 3: carry the unplayed half of the chosen pair to the
     // partner's next search, mixed in at this weight (PlanCarry,
     // PlanCarryPermille). Only under DurativeTree; off by default. The
-    // Continuity preset sets TeamTreeReuse, JointPlans and PlanCarry at once.
+    // Continuity preset sets TeamTreeReuse, JointPlans and PlanCarry at once,
+    // with OwnPaceBelowRoot and BlockableCheckNotMate.
     bool planCarry = false;
     int planCarryPermille = 300;
     // Ceiling for a `go movetime` search extended in a critical position;

@@ -1007,6 +1007,7 @@ int run_tournament(
         const TournamentPerformance contenderBefore = result.contenderPerformance;
         const TournamentPerformance baselineBefore = result.baselinePerformance;
         Board board;
+        config.wave2.apply_board_rules(board);
         const size_t pairIndex = gameIndex / 2;
         if (!startPositions.empty()) {
             board.set(startPositions[pairIndex % startPositions.size()].dualFen);

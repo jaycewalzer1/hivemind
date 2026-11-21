@@ -935,6 +935,7 @@ SeatClockGameResult play_seat_clock_game(
     SeatClockGameResult result;
     Engine& rawPolicyEngine = *threadEngines.front();
     Board board;
+    config.wave2.apply_board_rules(board);
     SeatClockGame game(config.wave2,
                        SeatClockGame::sample_start(config.wave2, config.clock, randomEngine));
     result.seats.start = game.start();
@@ -1525,6 +1526,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             }
             std::mt19937_64 randomEngine(selfplay_seed(runId, gameIndex));
             Board board;
+            config.wave2.apply_board_rules(board);
             // Per team: the position its last search was rooted at and the
             // moves played since (its own, then the reply).
             std::array<std::optional<Board>, 2> lineRoots;

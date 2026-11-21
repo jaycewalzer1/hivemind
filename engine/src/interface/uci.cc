@@ -728,15 +728,37 @@ void UCI::setoption(std::istringstream& is) {
     } else if (name == "PlanCarryPermille") {
         planCarryPermille = std::clamp(std::stoi(value), 0, 1000);
         std::cout << "info string PlanCarryPermille set to " << planCarryPermille << std::endl;
+    } else if (name == "OwnPaceBelowRoot" || name == "WaitNodeActingEval") {
+        // Diagnosis fixes D1 and D3 (docs/wave2_engine.md, "Diagnosis fixes").
+        if (value == "true" || value == "false") {
+            const bool on = value == "true";
+            if (name == "OwnPaceBelowRoot") durativeConfig.ownPaceBelowRoot = on;
+            else durativeConfig.waitNodeActingEval = on;
+            std::cout << "info string " << name << " set to " << value << std::endl;
+            if (on && !durativeTree) {
+                std::cout << "info string " << name << " acts only with DurativeTree true"
+                          << std::endl;
+            }
+        }
+    } else if (name == "BlockableCheckNotMate") {
+        // Diagnosis fix D5: the arena's mate rule, in either tree.
+        if (value == "true" || value == "false") {
+            board.set_blockable_check_not_mate(value == "true");
+            std::cout << "info string BlockableCheckNotMate set to " << value << std::endl;
+        }
     } else if (name == "Continuity") {
-        // Preset: the three switches together; the knobs keep their values.
+        // Preset: the three switches together, with the diagnosis fixes D1
+        // and D5; the knobs keep their values.
         if (value == "true" || value == "false") {
             const bool on = value == "true";
             teamTreeReuse = on;
             durativeConfig.jointPlans = on;
             planCarry = on;
+            durativeConfig.ownPaceBelowRoot = on;
+            board.set_blockable_check_not_mate(on);
             std::cout << "info string Continuity set to " << value
-                      << " (TeamTreeReuse, JointPlans, PlanCarry " << value << ")" << std::endl;
+                      << " (TeamTreeReuse, JointPlans, PlanCarry, OwnPaceBelowRoot,"
+                      << " BlockableCheckNotMate " << value << ")" << std::endl;
             if (on && !durativeTree) {
                 std::cout << "info string Continuity acts only with DurativeTree true"
                           << std::endl;
@@ -961,6 +983,10 @@ void UCI::send_uci_response() {
     cout << "option name PlanCarry type check default false" << endl;
     cout << "option name PlanCarryPermille type spin default 300 min 0 max 1000" << endl;
     cout << "option name Continuity type check default false" << endl;
+    // Diagnosis fixes (docs/wave2_engine.md); off by default.
+    cout << "option name OwnPaceBelowRoot type check default false" << endl;
+    cout << "option name WaitNodeActingEval type check default false" << endl;
+    cout << "option name BlockableCheckNotMate type check default false" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;

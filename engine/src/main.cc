@@ -160,7 +160,15 @@ void printUsage(const char* progName) {
     cout << "    --plan-carry <bool> (the half of the chosen action for the team's on-turn seat that" << endl;
     cout << "      is not deciding is mixed into that seat's next search; needs --base-mix)" << endl;
     cout << "    --plan-carry-permille <0..1000> (prior weight of the carried move; default 300)" << endl;
-    cout << "    --continuity <bool> (--team-tree-reuse, --joint-plans and --plan-carry together)" << endl;
+    cout << "    --continuity <bool> (--team-tree-reuse, --joint-plans and --plan-carry together, with" << endl;
+    cout << "      --own-pace-below-root and --blockable-check-not-mate)" << endl;
+    cout << "    Diagnosis fixes (docs/wave2_engine.md, \"Diagnosis fixes\"; all off by default):" << endl;
+    cout << "    --own-pace-below-root <bool> (below the root our seats act at their own SeatPaceMs, not" << endl;
+    cout << "      the root budget; needs --durative-tree true)" << endl;
+    cout << "    --wait-node-acting-eval <bool> (forced waits evaluated from the team that acts next, value" << endl;
+    cout << "      negated; needs --durative-tree true)" << endl;
+    cout << "    --blockable-check-not-mate <bool> (a check a drop could block is never mate, as in the" << endl;
+    cout << "      arena; any tree, also the game's own end check)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;
