@@ -83,10 +83,13 @@ class StageFailed(Exception):
 
 def next_iteration(runs):
     """The first iteration without stages/iteration.done (the pilot, rl-it1,
-    has no stages and counts as finished once it has trained)."""
+    has no stages and counts as finished once it has trained). An rl-it1 with
+    stages is a staged iteration like any other: its arms/C/last.pt appears at
+    training, before the matches, so a job cut off in the matches must resume it."""
     n = 1
     while ((runs / f"rl-it{n}" / "stages" / "iteration.done").is_file()
-           or (n == 1 and (runs / "rl-it1" / "arms" / "C" / "last.pt").is_file())):
+           or (n == 1 and not (runs / "rl-it1" / "stages").exists()
+               and (runs / "rl-it1" / "arms" / "C" / "last.pt").is_file())):
         n += 1
     return n
 

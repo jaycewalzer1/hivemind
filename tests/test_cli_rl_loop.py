@@ -23,6 +23,18 @@ def test_next_iteration_resumes_after_the_last_finished_one(tmp_path):
     assert rl_loop.next_iteration(tmp_path) == 3
 
 
+def test_next_iteration_resumes_a_staged_first_iteration_cut_off_in_its_matches(tmp_path):
+    # wave2 ab2 narrow arm: rl-it1 trained (arms/C/last.pt) but its job hit the time limit in the gate matches.
+    it1 = tmp_path / "rl-it1"
+    (it1 / "arms" / "C").mkdir(parents=True)
+    (it1 / "arms" / "C" / "last.pt").touch()
+    (it1 / "stages").mkdir()
+    (it1 / "stages" / "train.done").write_text("{}\n")
+    assert rl_loop.next_iteration(tmp_path) == 1
+    (it1 / "stages" / "iteration.done").write_text("{}\n")
+    assert rl_loop.next_iteration(tmp_path) == 2
+
+
 def test_train_dirs_cover_both_layouts_and_only_finished_segments(tmp_path):
     pilot = tmp_path / "rl-it1" / "search" / "train"
     pilot.mkdir(parents=True)
