@@ -683,3 +683,109 @@ Checks run (Mac, `build-ninja` 4 workers, `build-parity` 1 worker, 2 jobs):
 | `engine/tests/wave2_game_parity.sh` (0.6) | 5/5 identical |
 | wave2-hivemind Python (`uv run pytest`) | 183 passed, 8 failed (the same bsdtar `tar --compare` failures) with `tests/distill` left out. `tests/distill/test_distill.py::test_a_training_step_reduces_the_loss` ran over 30 minutes inside torch's backward pass (load average 15-24 on the Mac at the time) and was stopped; the distill tests were not rerun, and nothing in them changed |
 | Main repo `arena/tests` | 305 passed |
+
+## Diagnosis fixes (2026-11-21)
+
+From the read-only diagnosis of the durative tree at `261081b` (talisman `docs/durative_diagnosis.md`, findings D1-D7).
+Each engine change is a UCI option and a self-play/tournament flag, off by default, so wave 2 defaults, `stock_parity.sh`,
+`wave2_parity.sh` and `wave2_game_parity.sh` stay bit for bit. D1 and D5 are correctness fixes and join the
+`Continuity` preset; D3 showed no gain in the diagnosis and does not.
+
+| UCI option | Flag (`selfplay`, `tournament`, `hivemind rl-loop`) | Preset | Meaning |
+|---|---|---|---|
+| `OwnPaceBelowRoot` (check, false) | `--own-pace-below-root` (needs `--durative-tree`) | `Continuity` | D1: below the root each seat of our team acts at its own `SeatPaceMs`; the root action keeps `RootMoveTimeMs` |
+| `WaitNodeActingEval` (check, false) | `--wait-node-acting-eval` (needs `--durative-tree`) | no | D3: a forced-wait node is evaluated from the team that acts next and the value negated |
+| `BlockableCheckNotMate` (check, false) | `--blockable-check-not-mate` (any tree) | `Continuity` | D5: a check a dropped piece could block is never mate, as in the arena |
+
+`Continuity true` now sets TeamTreeReuse, JointPlans, PlanCarry, OwnPaceBelowRoot and BlockableCheckNotMate; `false`
+clears all five. Its reply names them. Python: `hivemind.wave2.Options` gains `own_pace_below_root`,
+`wait_node_acting_eval`, `blockable_check_not_mate`, and `CONTINUITY_FIELDS` gains D1 and D5. The arena's own expansion
+of `continuity: true` (talisman `arena/players/upstream.py`) still names the three v5 switches only; the raw UCI
+`Continuity` gets all five.
+
+**D1 (`time_state.h`).** `TimeState::action_time_ms(seat, rootAction)`: other team, its pace (unchanged); root team,
+`rootMoveMs`, or with the option its own `paceMs` below the root where `SeatPaceMs` gave one. `durative()` marks those
+seats in `Durative::ownPaceSeats` (a bitmask). No pace of ours given means mask 0, which is exactly the option off (so the
+fallback is `RootMoveTimeMs`, not the team's v3 move time). The mask enters `Durative::key()` only when it is non-zero.
+The root action is unchanged: our root ready time is still the budget, and a pass made *at* the root still caps at
+`PassCapK x RootMoveTimeMs` (`advance_action` passes `rootAction`). Below the root our seats coming on turn, and our
+passes, use the pace. How it composes with the v5 fixes:
+* **Fix 1.** Re-timing recomputes every path time with `durative_time_after`, so retained nodes get the D1 ready times
+  and hashes. Verdicts are kept only on equal hashes, and the mask is in the key.
+  `DiagFixesSearch.OwnPaceTreeReusedAndRetimedConsistently` adopts a tree after a landing under D1 and checks every
+  retained hash against its new path time.
+* **Fix 2.** A planned seat lands at its ready time, which D1 set when the seat came on turn.
+  `OwnPaceBelowRoot.PlannedHalfLandsAtTheSeatsOwnPace`.
+* **Expansion keys** read the path time, so they follow.
+
+**D3 (`searchthread.h/.cc`).** `wait_node_planes_team(team, forcedWait, time)` returns `~team` at a forced wait under
+the option. `collect_batch` builds the planes (narrow and wide) from that team. `process_batch` negates the scalar value
+and reads the WDL head the other way round (loss and win swapped). The switch travels in `DurativeConfig` /
+`Durative::waitNodeActingEval`, unkeyed (an evaluation choice, not a time; like `jointPlanFreePermille`).
+`WaitNodeActingEvalIt13.WaitLeafValueComesFromTheActingTeamNegated` (it13, WDL off): at every one-visit wait leaf the
+node's value is the waiting team's network value with the option off, and minus the acting team's with it on, within
+0.02. The test asserts that the two differ at some leaf. No strength claim: the diagnosis measured no agreement gain
+(18-19/40 against 20-23/40).
+
+**D5 (`board.h/.cc`).** Confirmed first. Position: A `k7/pp6/8/8/8/8/8/4K2R[] w`, B `4k3/8/8/8/8/8/8/4K3[] w`, white
+team to play. After Aw's Rh1-h8, Ab is in check from a rook with six empty squares between them, has no legal move and
+an empty pocket, and its partner Bw has no capture.
+* The arena (`arena/state.py` `is_bughouse_mate`, `BughouseState.apply_move`) keeps the game going: `result None`, Ab
+  waits.
+* The engine at `8fe9b37` answered `score mate 1 ... pv (h1h8,pass)` with both `DurativeTree false` and `true`
+  (it13 fp32, `go nodes 64`).
+
+Fix: `Board::set_blockable_check_not_mate`, a flag that copies keep (copy constructor). With the flag,
+`can_partner_provide_blocking_piece` answers from the check's geometry alone, as `assumePartnerCanBlock` does. So
+`is_checkmate` and every direct caller (the root scans' mate ranks) agree with the arena's test: a single slider with an
+empty square between it and the king is not mate; a contact, knight, pawn or double check still is. The rule belongs
+to the board, so it reaches every search's copy, the provers' lines and the game's own end check. UCI sets it on its
+board (kept across `position`). Self-play and tournament set it on each game's board (`Wave2GameOptions::
+apply_board_rules`). It does not count as a clock option: alone it does not move a stock run onto `TimeModel clock`.
+
+**D5 residuals (not changed, pinned by `DiagFixesSearch.SitRightResidualsStayLosses`).** The same position is still
+scored as a loss where the engine denies the checked team the right to sit. The cause is not the check rule but the
+stuck rule of `is_checkmate`: a team on turn on both boards that may not sit and has no move on one of them has no
+legal action. The arena has no sit right at all.
+* **v3 tree** (`DurativeTree false`) at a lead of 0 or less. A v3 state always gates sitting on the lead
+  (`TimeState::can_sit`).
+* **Durative tree with the root provers on**, whatever the lead. `search_single_board_forced_mate` (sat-partner
+  proofs) models the defenders as never allowed to sit while the attacker's partner sits. `search_reduced_partner_mate`
+  runs on the v3 clock (see "What still reasons in v3 alternation"; once the durative block is dropped, `can_sit` is
+  the lead gate whatever `SitGate` says). So in the arena's headline setting, with the provers on, the root still
+  answers `mate 1` here. The tree itself does not prove it (`DiagFixesSearch.SearchNoLongerProvesTheRookCheck`, provers
+  off), and neither does the v3 tree with its provers when black leads. Closing this means giving the provers a free
+  sit under `SitGate false`, which changes every prover verdict in that setting, not only D5's; not done.
+
+**D6 (Python).** `tests/test_cli_rl_loop.py`: the `distill_command` mock takes `**kwargs` (wave 2's `lr=`, `trunk_lr=`,
+`extra=`). With a GNU-tar shim on PATH the two archive files pass 32/32. Without the fix,
+`test_training_downloads_its_games_and_deletes_them_again` fails on the `TypeError`. With macOS bsdtar that test still
+fails, but earlier, at `tar --compare`, like the other 7. So locally there are 8 environment-only failures, all bsdtar.
+
+**D2.** No new work (v5 fix 2 targets it). From the continuity round's scaling rows (`runs/continuity_v5/scaling.jsonl`,
+it13 fp32, `build-sp1`, 1 worker, fresh trees, so fix 2 is the only fix acting), agreement with it13 at 64k on the 25
+positions where we are on turn on one board only:
+
+| Nodes | durative on | off | continuity |
+|---|---|---|---|
+| 1k | 15/25 | 15/25 | 12/25 |
+| 4k | 13/25 | 17/25 | 14/25 |
+| 16k | 13/25 | 17/25 | 17/25 |
+
+On the other 15 positions (both boards on turn) the three columns read 8-10 of 15 throughout. JointPlans closes the
+one-board gap at 16k (17 = off), not at 1k or 4k. With 25 positions a difference of 3-4 is within noise.
+
+Tests: `engine/tests/test_diag_fixes.cc`, 17 tests: defaults and plumbing, D1 rules and composition, D3 unit and it13,
+D5 board, search and residuals. Python: `test_diagnosis_fix_options`, and `test_continuity_flags_are_in_the_engine_help`
+now also checks the new flags.
+
+Checks run (Mac, `build-ninja` 4 workers and `build-sp1` 1 worker, 2 jobs):
+
+| Check | Result |
+|---|---|
+| C++ suite `build-ninja/tests/hivemind_tests` | 606 tests. First run: 604 passed, 1 skipped (`MateRaceTest.MeasureFrozenRaceOnTheGame`, as before), 1 failed: `SelectedMoveCertTest.JointFallbackVetoesACrossBoardMate`, a wall-clock-budgeted certification test. It passed 5 of 5 alone and in a second full run (605 passed, 1 skipped) |
+| `engine/tests/stock_parity.sh` | 8/8 identical |
+| `engine/tests/wave2_parity.sh` | 8/8 identical |
+| `engine/tests/wave2_game_parity.sh` (0.6) | 5/5 identical |
+| wave2-hivemind Python (`uv run pytest tests`) | 203 passed, 8 failed, all bsdtar `tar --compare` (see D6) |
+| Smoke: `selfplay` 1 game, wave 2 flags, `--continuity true --wait-node-acting-eval true`; `tournament` 2 games with D1 and D5 (it13 fp32, 64 nodes) | no error; team tree reuse 17.6% of searches |
