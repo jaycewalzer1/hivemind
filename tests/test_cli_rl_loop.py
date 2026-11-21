@@ -541,7 +541,7 @@ def test_training_downloads_its_games_and_deletes_them_again(tmp_path, archive_h
     loop.generator = tmp_path / "models" / "twin.onnx"
     monkeypatch.setattr(archive, "hub_download", archive_hub.download)
     monkeypatch.setattr(rl_loop.train, "positions", lambda dirs: 16 * sum(len(list(d.glob("*.dst"))) for d in dirs))
-    monkeypatch.setattr(rl_loop.train, "distill_command", lambda init, new, val, old, *args: [
+    monkeypatch.setattr(rl_loop.train, "distill_command", lambda init, new, val, old, *args, **kwargs: [
         sys.executable, "-c", TRAINER, str(args[-2]), *map(str, [*new, *val, *old, *args[-1]])])
 
     loop.train()
