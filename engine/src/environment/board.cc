@@ -183,7 +183,8 @@ bool Board::single_board_terminal_value(float& value) {
 }
 
 // Copy constructor: copies state history and reinitializes positions from the provided board.
-Board::Board(const Board& board) : variant(board.variant) {
+Board::Board(const Board& board)
+    : variant(board.variant), blockableCheckNotMate_(board.blockableCheckNotMate_) {
     pos[0] = std::unique_ptr<Stockfish::Position>(new Stockfish::Position);
     pos[1] = std::unique_ptr<Stockfish::Position>(new Stockfish::Position);
 
@@ -480,6 +481,8 @@ bool Board::can_partner_provide_blocking_piece(int board_in_check, Stockfish::Co
     if (is_single_board()) {
         return false;
     }
+    // D5: under the arena's rule every interposable check is blockable.
+    assumePartnerCanBlock = assumePartnerCanBlock || blockableCheckNotMate_;
     int partner_board = (board_in_check == BOARD_A) ? BOARD_B : BOARD_A;
     Stockfish::Color partner_side = ~checked_side;  // Partner plays opposite color
     

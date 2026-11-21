@@ -65,6 +65,18 @@ class Board {
         Board(const Board& board);
 
         /**
+         * @brief Diagnosis fix D5 (UCI BlockableCheckNotMate): a check that a
+         * dropped piece could block (one sliding checker with an empty square
+         * between it and the king) is never mate, whatever the partner board
+         * holds, as in the arena (arena/RULES.md "Game end"). The checked
+         * side then waits. Off (stock): such a check is mate unless the
+         * partner can win a piece to block with. Copies keep the rule.
+         */
+        void set_blockable_check_not_mate(bool on) { blockableCheckNotMate_ = on; }
+        bool blockable_check_not_mate() const { return blockableCheckNotMate_; }
+        bool blockableCheckNotMate_ = false;
+
+        /**
         * @brief Generates a hash key for the board.
         * @param teamHasTimeAdvantage Whether the team to move has time advantage (affects sitting rules)
         * @return long unsigned int Combined hash of the positions.
