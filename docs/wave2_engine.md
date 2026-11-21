@@ -699,9 +699,8 @@ Each engine change is a UCI option and a self-play/tournament flag, off by defau
 
 `Continuity true` now sets TeamTreeReuse, JointPlans, PlanCarry, OwnPaceBelowRoot and BlockableCheckNotMate; `false`
 clears all five. Its reply names them. Python: `hivemind.wave2.Options` gains `own_pace_below_root`,
-`wait_node_acting_eval`, `blockable_check_not_mate`, and `CONTINUITY_FIELDS` gains D1 and D5. The arena's own expansion
-of `continuity: true` (talisman `arena/players/upstream.py`) still names the three v5 switches only; the raw UCI
-`Continuity` gets all five.
+`wait_node_acting_eval`, `blockable_check_not_mate`, and `CONTINUITY_FIELDS` gains D1 and D5. The arena expands
+`continuity: true` to the same five (talisman `a9419ed`, `arena/players/upstream.py` `WAVE2_PRESETS`).
 
 **D1 (`time_state.h`).** `TimeState::action_time_ms(seat, rootAction)`: other team, its pace (unchanged); root team,
 `rootMoveMs`, or with the option its own `paceMs` below the root where `SeatPaceMs` gave one. `durative()` marks those
