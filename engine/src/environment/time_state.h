@@ -40,7 +40,8 @@ struct DurativeConfig {
     bool instantTransfer = true;
     bool mateRaceByLanding = false;
     int32_t passCapK = 8;
-    // This search's budget: what every action of the root team costs.
+    // This search's budget: what every action of the root team costs (below
+    // the root only where ownPaceBelowRoot gives it no pace of its own).
     // 0 = the root team's usual move time.
     int32_t rootMoveTimeMs = 0;
     // Remaining clock per seat; all 0 = derive from the lead as v3 does.
@@ -68,6 +69,16 @@ struct DurativeConfig {
     // Fix 2 (UCI JointPlanFreePermille): the prior share of "decide later"
     // (no plan) for the planned seat.
     int32_t jointPlanFreePermille = 500;
+    // Diagnosis fix D1 (UCI OwnPaceBelowRoot): below the root each seat of
+    // the root team acts at its own seatPaceMs, as the other team's seats
+    // do (rootMoveTimeMs where no pace is given); the root action keeps the
+    // budget. Off: every action of the root team costs rootMoveTimeMs.
+    bool ownPaceBelowRoot = false;
+    // Diagnosis fix D3 (UCI WaitNodeActingEval): a forced-wait node is
+    // evaluated from the team that acts next and its value negated, instead
+    // of from the waiting team (the network's value carries a tempo bonus
+    // for the team to play). Read by the search, not by the clock.
+    bool waitNodeActingEval = false;
 };
 
 /**
@@ -217,6 +228,16 @@ public:
         d.jointPlans = config.jointPlans;
         d.jointPlanFreePermille = static_cast<int16_t>(
             std::clamp<int32_t>(config.jointPlanFreePermille, 0, 1000));
+        if (config.ownPaceBelowRoot) {
+            // D1: our seats with a pace of their own act at it below the
+            // root; a seat without one keeps the budget.
+            for (int seat = 0; seat < 4; ++seat) {
+                if (team_of_seat(seat) == rootTeam && config.seatPaceMs[seat] > 0) {
+                    d.ownPaceSeats |= static_cast<uint8_t>(1u << seat);
+                }
+            }
+        }
+        d.waitNodeActingEval = config.waitNodeActingEval;
         for (int board = 0; board < 2; ++board) {
             const int seat = seat_of(board, d.side[board]);
             if (team_of_seat(seat) == rootTeam) {
@@ -407,7 +428,7 @@ public:
      *        hands the board to its opponent (ready after its own action
      *        time), a passing seat waits until just after the next landing
      *        on the other board, its flag, or PassCapK x its own action time
-     *        (the root budget for the root team, its pace otherwise),
+     *        (action_time_ms(); the budget for a pass at the root),
      *        whichever is first. At the root, the other team's seat that
      *        lands before our budget is charged only up to its landing; its
      *        action is dated back that far. A team that does not act here
@@ -431,6 +452,8 @@ public:
             && team_of_seat(turn.seat[BOARD_A_IDX]) == actingTeam;
         const bool actB = turn.acts[BOARD_B_IDX]
             && team_of_seat(turn.seat[BOARD_B_IDX]) == actingTeam;
+        // The action charged at the root (its pass cap is the budget's).
+        const bool rootAction = d.atRoot;
         d.atRoot = false;
         if (!actA && !actB) {
             return;
@@ -607,7 +630,8 @@ public:
             }
             const int seat = turn.seat[board];
             const int other = seat_of(1 - board, d.side[1 - board]);
-            int64_t cap = static_cast<int64_t>(d.passCapK) * action_time_ms(seat) - early[board];
+            int64_t cap = static_cast<int64_t>(d.passCapK) * action_time_ms(seat, rootAction)
+                - early[board];
             if (d.clockMs[seat] > 0) {
                 cap = std::min<int64_t>(cap, d.clockMs[seat]);
             }
@@ -798,10 +822,24 @@ public:
         return durative_.landings;
     }
 
-    /** What one action of @p seat costs in this tree. */
-    int32_t action_time_ms(int seat) const {
-        return team_of_seat(seat) == durative_.rootTeam
-            ? durative_.rootMoveMs : durative_.paceMs[seat];
+    /**
+     * @brief What one action of @p seat costs in this tree: its pace for
+     * the other team; for the root team the root budget, or with
+     * OwnPaceBelowRoot (D1) its own pace below the root where one was given.
+     * @p rootAction: the action charged at the root, which always costs the
+     * budget.
+     */
+    int32_t action_time_ms(int seat, bool rootAction = false) const {
+        const Durative& d = durative_;
+        if (team_of_seat(seat) != d.rootTeam) {
+            return d.paceMs[seat];
+        }
+        return !rootAction && ((d.ownPaceSeats >> seat) & 1u) ? d.paceMs[seat] : d.rootMoveMs;
+    }
+
+    /** D3 (WaitNodeActingEval): evaluate forced-wait nodes from the acting team. */
+    bool wait_node_acting_eval() const {
+        return durative_.active && durative_.waitNodeActingEval;
     }
 
     /**
@@ -958,6 +996,12 @@ private:
         int16_t jointPlanFreePermille = 500;
         std::array<Stockfish::Move, 4> committed{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE,
                                                  Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
+        // Diagnosis fix D1 (DurativeConfig::ownPaceBelowRoot; else 0): bit s
+        // set = root-team seat s acts at paceMs[s] below the root.
+        uint8_t ownPaceSeats = 0;
+        // Diagnosis fix D3 (DurativeConfig::waitNodeActingEval): how the
+        // search evaluates forced waits; not a time, so not in the key.
+        bool waitNodeActingEval = false;
 
         bool operator==(const Durative&) const = default;
 
@@ -999,6 +1043,11 @@ private:
                         | (uint64_t(static_cast<uint8_t>(landing.type)) << 32)
                         | static_cast<uint32_t>(landing.agoMs));
                 }
+            }
+            if (ownPaceSeats != 0) {
+                // D1 changes our ready times below the root; off (or with
+                // no pace of ours given) the keys are exactly as before.
+                mix(0x4f574e50414345ULL ^ (uint64_t(ownPaceSeats) << 56));
             }
             if (jointPlans) {
                 // Only a planning tree keys on commitments; with fix 2 off

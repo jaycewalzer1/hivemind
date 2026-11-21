@@ -132,6 +132,18 @@ struct LeafTurn {
 LeafTurn leaf_turn(Board& board, Stockfish::Color team, const TimeState& time);
 
 /**
+ * @brief Diagnosis fix D3 (WaitNodeActingEval): the team whose planes a leaf
+ * of @p team is evaluated from. The network's value says "the team to play
+ * acts next", but at a forced wait the other team does; with the option a
+ * wait leaf is evaluated from that team (~@p team) and the value negated
+ * (process_batch). Otherwise, and off a durative clock, @p team.
+ */
+inline Stockfish::Color wait_node_planes_team(Stockfish::Color team, bool forcedWait,
+                                              const TimeState& time) {
+    return forcedWait && time.wait_node_acting_eval() ? ~team : team;
+}
+
+/**
  * @brief The actions a leaf gets on one board, as collect_batch expands it:
  * the representable legal moves when @p onTurn, without the drops of pieces
  * that landed during the seat's current decision (InstantTransfer off), and

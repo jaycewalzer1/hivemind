@@ -1261,11 +1261,14 @@ void SearchThread::collect_batch(SearchBatch& batch, Board& board,
             ctx.boardAOnTurn = true;
         }
 
-        // Convert board to planes for this batch slot
+        // Convert board to planes for this batch slot; D3: a forced wait
+        // from the team that acts next (its value is negated in process_batch).
+        const Stockfish::Color planesTeam =
+            wait_node_planes_team(ctx.teamToPlay, ctx.forcedWait, ctx.time);
         board_to_planes(board, obs + validInferenceCount * NB_INPUT_VALUES(),
-                        ctx.teamToPlay, ctx.time);
+                        planesTeam, ctx.time);
         if (wideInputs) {
-            wide_extra_planes(board, ctx.teamToPlay, ctx.time,
+            wide_extra_planes(board, planesTeam, ctx.time,
                               batch.wideExtras.data()
                                   + static_cast<size_t>(validInferenceCount) * NB_WIDE_EXTRA_VALUES);
         }
@@ -1427,12 +1430,20 @@ void SearchThread::process_batch(
             float scalarValue = std::isfinite(batchValueFloat)
                 ? std::clamp(batchValueFloat, -1.0f, 1.0f)
                 : 0.0f;
+            // D3: a wait leaf evaluated from the other team (collect_batch)
+            // is that team's value: negate it, and read its WDL the other
+            // way round.
+            const bool otherTeamsValue =
+                wait_node_planes_team(ctx.teamToPlay, ctx.forcedWait, ctx.time) != ctx.teamToPlay;
+            if (otherTeamsValue) {
+                scalarValue = -scalarValue;
+            }
 
             float neuralValue = scalarValue;
             if (runtimeConfig.enableWdlEval && batchWdl) {
-                const float lossLogit = __half2float(batchWdl[0]);
+                const float lossLogit = __half2float(batchWdl[otherTeamsValue ? 2 : 0]);
                 const float drawLogit = __half2float(batchWdl[1]);
-                const float winLogit  = __half2float(batchWdl[2]);
+                const float winLogit  = __half2float(batchWdl[otherTeamsValue ? 0 : 2]);
 
                 if (std::isfinite(lossLogit) &&
                     std::isfinite(drawLogit) &&
