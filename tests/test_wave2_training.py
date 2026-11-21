@@ -162,6 +162,39 @@ def test_continuity_sets_the_three_switches():
     assert wave2.from_args(parser.parse_args(["--wave2"])) == wave2.WAVE2
 
 
+def test_diagnosis_fix_options():
+    """The diagnosis fixes D1 (own pace below the root), D3 (wait nodes from
+    the acting team) and D5 (a drop-blockable check is not mate): off by
+    default, sent only when on; D1 and D3 need the durative tree, D5 does not;
+    --continuity carries D1 and D5 but not D3."""
+    for name in ("own_pace_below_root", "wait_node_acting_eval", "blockable_check_not_mate"):
+        assert not getattr(wave2.STOCK, name) and not getattr(wave2.WAVE2, name)
+        assert "--" + name.replace("_", "-") not in wave2.WAVE2.engine_args()
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    options = wave2.from_args(parser.parse_args([
+        "--wave2", "--own-pace-below-root", "true", "--wait-node-acting-eval", "true",
+        "--blockable-check-not-mate", "true"]))
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--own-pace-below-root"] == pairs["--wait-node-acting-eval"] == "true"
+    assert pairs["--blockable-check-not-mate"] == "true"
+    with pytest.raises(ValueError):
+        wave2.Options(own_pace_below_root=True)
+    with pytest.raises(ValueError):
+        wave2.Options(wait_node_acting_eval=True)
+    assert wave2.Options(blockable_check_not_mate=True).engine_args() == [
+        "--blockable-check-not-mate", "true"]
+    continuity = wave2.from_args(parser.parse_args(["--wave2", "--continuity"]))
+    assert continuity.own_pace_below_root and continuity.blockable_check_not_mate
+    assert not continuity.wait_node_acting_eval
+    ablation = wave2.from_args(parser.parse_args(["--wave2", "--continuity",
+                                                  "--own-pace-below-root", "false"]))
+    assert not ablation.own_pace_below_root and ablation.blockable_check_not_mate
+    assert wave2.missing_engine_options(options, "--durative-tree --sit-gate --flag-loss "
+                                        "--instant-transfer --base-mix --seat-move-times") == [
+        "--own-pace-below-root", "--wait-node-acting-eval", "--blockable-check-not-mate"]
+
+
 def test_continuity_knob_needs_its_switch():
     """A wave 2c knob without its switch does nothing, and the engine would
     still take it as a search change and switch a stock run to the clock time
@@ -196,7 +229,8 @@ def test_continuity_flags_are_in_the_engine_help():
     wave2.add_arguments(parser)
     every = wave2.from_args(parser.parse_args([
         "--wave2", "--continuity", "--team-tree-reuse-tolerance-ms", "1000",
-        "--joint-plan-free-permille", "300", "--plan-carry-permille", "450"]))
+        "--joint-plan-free-permille", "300", "--plan-carry-permille", "450",
+        "--wait-node-acting-eval", "true"]))
     assert wave2.missing_engine_options(every, text) == []
 
 

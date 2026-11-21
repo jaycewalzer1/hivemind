@@ -34,8 +34,24 @@ Wave 2c (talisman docs/custom_engine_spec_v5_continuity.md), off by default:
                        and a base mix
   --plan-carry-permille
                        prior weight of the carried move (0..1000)
-  --continuity         rl-loop only: the three switches above at once (the
-                       engine gets the three flags)
+  --continuity         rl-loop only: the three switches above at once, with
+                       --own-pace-below-root and --blockable-check-not-mate
+                       below (the engine gets the five flags)
+
+Fixes from the durative tree diagnosis (talisman docs/durative_diagnosis.md,
+wave2-hivemind docs/wave2_engine.md "Diagnosis fixes"), off by default:
+
+  --own-pace-below-root
+                       D1: below the root our seats act at their own observed
+                       pace, not the root move time (UCI OwnPaceBelowRoot);
+                       needs the durative tree
+  --wait-node-acting-eval
+                       D3: forced-wait nodes are evaluated from the team that
+                       acts next, value negated (UCI WaitNodeActingEval);
+                       needs the durative tree; not in --continuity
+  --blockable-check-not-mate
+                       D5: a check a dropped piece could block is never mate,
+                       as in the arena (UCI BlockableCheckNotMate); any tree
 
 Every option's stock value reproduces v3.0.3, so `STOCK` is the engine with
 none of them. `WAVE2` is the setting the arena and self-play send.
@@ -84,6 +100,9 @@ class Options:
     joint_plan_free_permille: int = 500
     plan_carry: bool = False
     plan_carry_permille: int = 300
+    own_pace_below_root: bool = False
+    wait_node_acting_eval: bool = False
+    blockable_check_not_mate: bool = False
 
     def __post_init__(self):
         if not 1 <= self.pass_cap_k <= 64:
@@ -109,6 +128,10 @@ class Options:
         if self.joint_plans and not self.durative_tree:
             # Fix 2 acts inside each durative search; the engine refuses it otherwise.
             raise ValueError("joint_plans needs durative_tree")
+        for name in ("own_pace_below_root", "wait_node_acting_eval"):
+            if getattr(self, name) and not self.durative_tree:
+                # Diagnosis fixes D1 and D3 change the durative tree only; the engine refuses them otherwise.
+                raise ValueError(f"{name} needs durative_tree")
         if self.team_tree_reuse and not (self.durative_tree and self.base_mix):
             # The engine refuses it too: it acts on durative seat-clock games only.
             raise ValueError("team_tree_reuse needs durative_tree and a base_mix")
@@ -154,9 +177,12 @@ WAVE2 = Options(durative_tree=True, sit_gate=False, flag_loss=True, instant_tran
 
 # The engine flags rl-loop overrides, by Options field.
 BOOLEAN_FIELDS = ("durative_tree", "sit_gate", "flag_loss", "instant_transfer", "mate_race_by_landing",
-                  "seat_move_times", "team_tree_reuse", "joint_plans", "plan_carry")
-# Wave 2c: what --continuity switches on (an explicit switch still overrides it).
-CONTINUITY_FIELDS = ("team_tree_reuse", "joint_plans", "plan_carry")
+                  "seat_move_times", "team_tree_reuse", "joint_plans", "plan_carry",
+                  "own_pace_below_root", "wait_node_acting_eval", "blockable_check_not_mate")
+# Wave 2c: what --continuity switches on (an explicit switch still overrides it): the three
+# fixes and the diagnosis fixes D1 and D5 (D3 showed no gain and stays out).
+CONTINUITY_FIELDS = ("team_tree_reuse", "joint_plans", "plan_carry", "own_pace_below_root",
+                     "blockable_check_not_mate")
 
 
 def from_args(args):
@@ -202,7 +228,8 @@ def add_arguments(parser):
     group.add_argument("--plan-carry-permille", type=int, default=None,
                        help="Wave 2c: prior weight of the carried move under --plan-carry (default 300)")
     group.add_argument("--continuity", action="store_true",
-                       help="Wave 2c: --team-tree-reuse, --joint-plans and --plan-carry true at once "
+                       help="Wave 2c: --team-tree-reuse, --joint-plans, --plan-carry, "
+                            "--own-pace-below-root and --blockable-check-not-mate true at once "
                             "(an explicit switch overrides it)")
 
 
