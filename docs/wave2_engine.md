@@ -788,3 +788,81 @@ Checks run (Mac, `build-ninja` 4 workers and `build-sp1` 1 worker, 2 jobs):
 | `engine/tests/wave2_game_parity.sh` (0.6) | 5/5 identical |
 | wave2-hivemind Python (`uv run pytest tests`) | 203 passed, 8 failed, all bsdtar `tar --compare` (see D6) |
 | Smoke: `selfplay` 1 game, wave 2 flags, `--continuity true --wait-node-acting-eval true`; `tournament` 2 games with D1 and D5 (it13 fp32, 64 nodes) | no error; team tree reuse 17.6% of searches |
+
+## Wave 2d: the hybrid (spec v6, 2026-11-21)
+
+Talisman `docs/custom_engine_spec_v6_hybrid.md`. The v3 joint-action tree (`DurativeTree false`, nodur) chooses the
+move; the durative clock decides only whether the root may also wait for a landing on the other board, which the v3
+gate (`can_sit = lead > 0`) forbids. Built: H3 (`HybridMode gate`). H1 (`probe`) and H2 (`priced`) are specified but
+not built (the spec's build order: only if gate shows no gain over nodur); `setoption` and the self-play flags refuse
+them. Everything is off by default: `stock_parity.sh`, `wave2_parity.sh` and `wave2_game_parity.sh` are unchanged, and
+`engine/tests/hybrid_parity.sh` (spec test 0.3) shows a gate search with no trigger is nodur's search exactly.
+
+| UCI option | Flag (`selfplay`, `tournament`) | Default | Meaning |
+|---|---|---|---|
+| `HybridMode` (combo off, gate) | `--hybrid-mode` | off | gate: H3 below |
+| `Hybrid` (check, preset) | `--hybrid <bool>` | false | true sets `HybridMode gate`, false `off`; knobs keep their values |
+| `HybridEventLands` (combo all, sit, none) | `--hybrid-event-lands` | all | at depth 1 the thinking opponent seat on the event board must move: below every root child, below the hybrid sit only, or never (the first draft; inert, the ablation) |
+| `HybridMaxWaitMs` (spin 0..10000) | `--hybrid-max-wait-ms` | 1000 | T4 |
+| `HybridMinClockMs` (spin 0..600000) | `--hybrid-min-clock-ms` | 3000 | T6 |
+| `HybridMarginPermille` (spin 0..1000) | `--hybrid-margin-permille` | 20 | a kept sit's q beats the best moving child's by this |
+| `HybridPassPriorPermille` (spin 0..1000) | `--hybrid-pass-prior-permille` | 150 | the sit's root prior floor |
+
+`--hybrid-mode` needs `--durative-tree false` and `--base-mix`; a knob needs the mode (self-play refuses, UCI says
+`acts only with HybridMode gate`). With `DurativeTree true` UCI says `Hybrid acts only with DurativeTree false`.
+`tournament --hybrid-side both|contender|baseline` picks the side (hybrid vs nodur: `contender`). Python:
+`hivemind.wave2.Options` gains `hybrid_mode`, `hybrid_event_lands` and the four knobs, and `--hybrid`.
+
+**Trigger** (`search/hybrid.h` `hybrid_sit_boards`, once per search in `run_search`, never in a ponder or background
+search). It reads the search's v3 clock and the decision's durative clock (`SearchOptions::hybrid.clock`:
+`UCI::current_hybrid_clock()`, or `SeatClockGame::hybrid_clock()`, both `TimeState::durative` with `SitGate` off). Board
+X gets its bit when: T1 our team is on turn on X and not on the other board Y, X has a legal move, and `RequireMoveOn`
+does not name X; T2 `!v3.can_sit(team)`; T3 the opponent seat on Y is not sitting, `eventMs = seat_ready_ms` =
+`max(1, pace - elapsed)`; T4 `eventMs <= min(HybridMaxWaitMs, 1.5 x RootMoveTimeMs, PassCapK x RootMoveTimeMs)`; T5 the
+durative sit-off rule allows the sit; T6 our seat's clock `>= max(HybridMinClockMs, 4 x (eventMs + RootMoveTimeMs))`.
+`info string Hybrid: sit boards <A|B|-> event <msA>/<msB> mode gate [(<first failed condition>)]`.
+
+**H3, as built.**
+* The root's `JointActionRules::hybridSitBoards` (from `RuntimeConfig::hybridSitBoards`, read only at depth 0) makes the
+  one-board double sit legal on X. Both boards on turn never make a double sit legal.
+* The pass gets the root prior floor `p <- (1 - w) p + w` after the noise (`mix_root_plan`, as PlanCarry).
+* In `select_and_expand`, every child of the search root (`all`), or only the hybrid sit (`sit`), gets
+  `TimeState::with_hybrid_event(Y)` after `advance()`. The mark is one-shot (the next `advance()` clears it) and keyed
+  only while set. `process_batch` turns it into `JointActionRules::mustMoveBoards`: a pass on Y is illegal while Y can
+  move. `can_sit` and the terminal rules are untouched.
+* A non-empty mask drops an exact-hash retained root.
+* After the tree, `Agent::hybrid_excluded_index` is the one predicate. A sit qualifies with `q_sit >= q_act + margin`
+  and 10% of the root's visits, where `q_act` is the q-weighted best child that is not the sit; a proof through the sit
+  also qualifies. An unqualified sit is excluded from:
+  * the q-weighted pick and its most-visited fallback;
+  * the PV line;
+  * Gumbel's in-search decision;
+  * `race_safe_alternative` and `certified_mate_free_alternative`.
+* A proof through the sit prints a `cp` score, not `mate` (it assumes the event lands).
+* `info string Hybrid: chose <sit A|sit B|act> q_sit q_act visits n/n (<margin|visits|proven (assumes event)|no sit
+  chosen|certification>)`; `Agent::hybrid_report()`.
+
+`JointActionRules` is 7 bytes and fits in the generator's padding: `sizeof(Node)` stays 1040
+(`HybridRules.NodeAndCandidateSizesUnchanged`).
+
+**Self-play and tournament.** `search_clock` is split into `v3_clock` and `durative_clock(sitGate)`, bit for bit as
+before. Under `--hybrid-mode`:
+* each search gets `hybrid_clock()`;
+* the hybrid sit edge is never a policy target, and it is sampled only if it qualified;
+* a played hybrid sit's pass also ends at `hybrid_pass_cap_ms`: `min(PassCapK x budget, 1.5 x budget + 1,
+  eventMs + 100)`;
+* telemetry: per game `hybrid <played>/<triggered>/<searches> recent w<n> b<n>` (sits in each team's last two
+  decisions), `selfplay hybrid: ...` at the end, and `tournament hybrid game ...` per game.
+
+Tests: `engine/tests/test_hybrid.cc`, 18 tests: spec 0.2, 0.4, 1.1-1.6, the self-play wake cap, and on it13 2.1-2.5
+and 2.7. `engine/tests/hybrid_parity.sh` is 0.3. Not built: 2.6 (a fixture where certification or the race veto
+replaces a hybrid sit), and the uniform-network half of 2.4.
+
+What 2.1 shows on it13 (A `6rk/6pp/8/8/8/8/8/6K1[] w`, B `4k3/8/8/8/3q3N/8/8/K7[] w`, lead -2 s, Bw thinking 200 of
+300 ms, `RootMoveTimeMs 200`):
+* nodur plays `(g1f2,pass)`.
+* gate plays `(pass,pass)`, a solved win through the sit at about 60 nodes: `(pass,pass) (pass,a1b1) (pass,d4h4)
+  (pass,b1a1) (N@f7,pass)`.
+* `HybridEventLands none` plays `(g1f2,pass)` (q_sit about -0.02 against q_act +0.03, 9 of 9 runs; reason `no sit
+  chosen`), which is the first draft's inertness. One early ad-hoc run printed a proven sit under `none`; it did not
+  reproduce in 10 further runs.
