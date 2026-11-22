@@ -195,6 +195,11 @@ private:
     std::atomic<int> unsolvedChildCount{0};  // Number of unsolved children (for solver)
     int provenWinningChildCount = 0;
     bool allowLossProof = true;
+    // Spec v6 review fix: false at a depth-1 node of a triggered hybrid search
+    // below a moving root child whose must-move mask dropped an action v3
+    // allows. Such a node is solved only by a winning child; a loss or draw
+    // over its children could be refuted by the dropped pass. In padding.
+    bool allChildrenProof = true;
     std::atomic<int> endInPly{0};                        // Distance to terminal (for mate distance)
 
     struct RootGumbelEntry {
@@ -787,7 +792,11 @@ public:
                                   : config.jointPolicyTopK)),
                           config.jointPolicyResidualScale,
                           plannedBoard, handTypesA, handTypesB,
-                          hybridSitBoards, mustMoveBoards);
+                          hybridSitBoards,
+                          static_cast<uint8_t>(mustMoveBoards & 3u));
+        allChildrenProof = (mustMoveBoards & 3u) == 0
+            || (mustMoveBoards & HYBRID_MUST_MOVE_BELOW_SIT) != 0
+            || !candidateGenerator.mustMoveDropsLegalAction();
         expandedCount = 0;
         expandedPriorSum = 0.0f;
         visitedPolicySum = 0.0f;
@@ -952,6 +961,16 @@ public:
         std::shared_lock<std::shared_mutex> guard(nodeMutex);
         return candidateGenerator.sortedActions(boardNum);
     }
+    /**
+     * @brief Spec v6 review fix: whether a loss or draw over every child
+     * proves this node (false below a moving child of a triggered hybrid root
+     * whose mask dropped a pass v3 allows; see allChildrenProof).
+     */
+    bool proves_from_all_children() const {
+        std::shared_lock<std::shared_mutex> guard(nodeMutex);
+        return allChildrenProof;
+    }
+
     JointActionRules expanded_rules() const {
         std::shared_lock<std::shared_mutex> guard(nodeMutex);
         return candidateGenerator.actionRules();

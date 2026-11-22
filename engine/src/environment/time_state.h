@@ -318,13 +318,22 @@ public:
      * the next advance() clears it, and it enters exact_key() only while
      * set, so depth-2 states are plain v3 states again.
      */
-    TimeState with_hybrid_event(int board) const {
+    TimeState with_hybrid_event(int board, bool belowSit = false) const {
         TimeState next = *this;
         next.hybridEvent_ = board == 0 ? 1 : board == 1 ? 2 : 0;
+        next.hybridBelowSit_ = next.hybridEvent_ != 0 && belowSit;
         return next;
     }
     /** The board with the hybrid's event mark (with_hybrid_event), -1 = none. */
     int hybrid_event_board() const { return hybridEvent_ == 0 ? -1 : hybridEvent_ - 1; }
+    /**
+     * @brief The event mark is the one below the hybrid sit (with_hybrid_event's
+     * belowSit). Its proofs stand, reported as "assumes event"; a marked state
+     * below a moving root child proves no loss or draw from its children when
+     * the mark removed a pass v3 allows (Node::proves_from_all_children).
+     * Never in exact_key(): the sit's position is no moving child's.
+     */
+    bool hybrid_event_below_sit() const { return hybridBelowSit_; }
 
     /** Upstream's sit right, lead > 0, whatever the gate: the network's sit plane. */
     bool lead_sit_right(Stockfish::Color team) const {
@@ -390,6 +399,7 @@ public:
     void advance(Stockfish::Color actingTeam, bool actingTeamOnBothBoards) {
         // Spec v6: the hybrid's event mark lasts one ply.
         hybridEvent_ = 0;
+        hybridBelowSit_ = false;
         if (durative_.active) {
             // A caller that does not say which boards moved (the mate
             // provers, tree reuse) reasons in v3 alternation: from here on
@@ -466,6 +476,7 @@ public:
                         Stockfish::Move plannedA = Stockfish::MOVE_NONE,
                         Stockfish::Move plannedB = Stockfish::MOVE_NONE) {
         hybridEvent_ = 0;
+        hybridBelowSit_ = false;
         Durative& d = durative_;
         const Turn turn = turn_at_node();
         const bool actA = turn.acts[BOARD_A_IDX]
@@ -1229,5 +1240,7 @@ private:
     // Spec v6 (hybrid): 0 = none, 1 = board A, 2 = board B; see
     // with_hybrid_event(). In the padding after sitGate_.
     uint8_t hybridEvent_ = 0;
+    // Review fix: the mark is the hybrid sit's (with_hybrid_event's belowSit).
+    bool hybridBelowSit_ = false;
     Durative durative_;
 };

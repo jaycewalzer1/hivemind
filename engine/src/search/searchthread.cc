@@ -1426,7 +1426,10 @@ void SearchThread::process_batch(
                              // Spec v6: a depth-1 node of a triggered hybrid
                              // search, where the thinking seat lands a move.
                              ctx.time.hybrid_event_board() >= 0
-                                 ? static_cast<uint8_t>(1u << ctx.time.hybrid_event_board())
+                                 ? static_cast<uint8_t>(
+                                       (1u << ctx.time.hybrid_event_board())
+                                       | (ctx.time.hybrid_event_below_sit()
+                                              ? HYBRID_MUST_MOVE_BELOW_SIT : 0u))
                                  : uint8_t{0});
             ctx.leaf->release_evaluation_reservation();
                 
@@ -1777,7 +1780,10 @@ LeafSelection SearchThread::select_and_expand(
             if (runtimeConfig.hybridEventLands == SearchParams::HYBRID_EVENT_LANDS_ALL
                 || (runtimeConfig.hybridEventLands == SearchParams::HYBRID_EVENT_LANDS_SIT
                     && hybridSit)) {
-                next = next.with_hybrid_event(runtimeConfig.hybridEventBoard);
+                // Only the sit's mark keeps proofs that need the event
+                // (reported as "assumes event"); below a moving child the
+                // node proves nothing the dropped pass could refute.
+                next = next.with_hybrid_event(runtimeConfig.hybridEventBoard, hybridSit);
             }
         }
         return next;

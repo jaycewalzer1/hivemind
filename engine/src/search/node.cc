@@ -163,7 +163,7 @@ bool Node::update_child_node_type_from(
                 nodeType.store(NodeType::WIN, std::memory_order_release);
                 becameSolved = true;
             }
-        } else if (currentType != NodeType::WIN
+        } else if (currentType != NodeType::WIN && allChildrenProof
                    && unsolvedChildCount.load(std::memory_order_relaxed) == 0
                    && m_is_expanded.load(std::memory_order_relaxed)
                    && !candidateGenerator.hasNext()) {

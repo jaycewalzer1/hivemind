@@ -61,6 +61,15 @@ struct JointActionRules {
     uint8_t mustMoveBoards = 0;
 };
 
+/**
+ * Spec v6 review fix: a flag next to the mustMoveBoards bits that a depth-1
+ * node is given at expansion (never stored in JointActionRules): the node is
+ * the one below the hybrid sit, whose proofs stand as "assumes event". Below
+ * a moving root child the node proves no loss or draw from its children
+ * when the mask dropped an action v3 allows (Node::proves_from_all_children).
+ */
+constexpr uint8_t HYBRID_MUST_MOVE_BELOW_SIT = 4u;
+
 inline bool is_joint_action_legal(const JointActionRules& rules,
                                   Stockfish::Move moveA,
                                   Stockfish::Move moveB,
@@ -922,6 +931,45 @@ public:
         
         this->jointFactorRank = jointFactorRank;
         rebuildCandidateFrontier(jointPolicyTopK, jointResidualScale);
+    }
+
+    /**
+     * Spec v6 review fix: whether rules.mustMoveBoards drops a joint action
+     * the same rules without it allow (a pass on the event board that v3
+     * gives this team: it leads, or its move on the other board captures).
+     * False with no mask. Read once at expansion, by category of action.
+     */
+    bool mustMoveDropsLegalAction() const {
+        if (rules.mustMoveBoards == 0) {
+            return false;
+        }
+        auto categories = [](const std::vector<Stockfish::Move>& actions,
+                             const std::vector<uint8_t>& captures) {
+            std::array<bool, 3> present{};
+            for (size_t i = 0; i < actions.size(); ++i) {
+                present[actions[i] == Stockfish::MOVE_NONE ? 0
+                        : i < captures.size() && (captures[i] & 1) ? 2 : 1] = true;
+            }
+            return present;
+        };
+        const auto inA = categories(sortedActionsA, sortedCapturesA);
+        const auto inB = categories(sortedActionsB, sortedCapturesB);
+        JointActionRules plain = rules;
+        plain.mustMoveBoards = 0;
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                if (!inA[a] || !inB[b]) {
+                    continue;
+                }
+                const Stockfish::Move moveA = a ? Stockfish::Move(1) : Stockfish::MOVE_NONE;
+                const Stockfish::Move moveB = b ? Stockfish::Move(1) : Stockfish::MOVE_NONE;
+                if (is_joint_action_legal(plain, moveA, moveB, a == 2, b == 2)
+                    && !is_joint_action_legal(rules, moveA, moveB, a == 2, b == 2)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
