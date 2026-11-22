@@ -208,6 +208,7 @@ TEST(DiagFixesDefaults, ContinuityPresetCarriesD1AndD5NotD3) {
 }
 
 TEST(DiagFixesDefaults, SelfPlayFlagsParseAndValidate) {
+    init_fairy_stockfish();  // Board below; ctest runs each test in its own process
     Wave2GameOptions options;
     EXPECT_TRUE(parse_wave2_option("--own-pace-below-root", "true", options));
     EXPECT_TRUE(options.ownPaceBelowRoot);

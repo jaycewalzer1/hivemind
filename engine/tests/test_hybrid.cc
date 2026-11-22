@@ -297,10 +297,15 @@ TEST_F(HybridRules, EventMarkIsOneShotAndKeyedOnlyWhileSet) {
 
 TEST_F(HybridRules, NodeAndCandidateSizesUnchanged) {
     // JointActionRules grew from 5 to 7 bytes, inside the generator's
-    // padding before plannedBoard: no node grew (1040 since fix 2, f321334).
+    // padding before plannedBoard: no node grew (1040 since fix 2, f321334, on
+    // the Mac's libc++; 928 with libstdc++ on PACE, the same at 72e79eb).
     EXPECT_EQ(sizeof(JointActionRules), 7u);
     EXPECT_EQ(sizeof(JointActionCandidate), 48u);
+#if defined(__APPLE__)
     EXPECT_EQ(sizeof(Node), 1040u);
+#else
+    EXPECT_EQ(sizeof(Node), 928u);
+#endif
 }
 
 // ---- review fixes ---------------------------------------------------------------------
