@@ -1422,7 +1422,12 @@ void SearchThread::process_batch(
                              ctx.capturesA, ctx.capturesB,
                              jointFactorsA, jointFactorsB,
                              jointFactorRank, ctx.leafHash, ctx.expansionKey,
-                             ctx.plannedBoard, ctx.handTypesA, ctx.handTypesB);
+                             ctx.plannedBoard, ctx.handTypesA, ctx.handTypesB,
+                             // Spec v6: a depth-1 node of a triggered hybrid
+                             // search, where the thinking seat lands a move.
+                             ctx.time.hybrid_event_board() >= 0
+                                 ? static_cast<uint8_t>(1u << ctx.time.hybrid_event_board())
+                                 : uint8_t{0});
             ctx.leaf->release_evaluation_reservation();
                 
             // Backup value with WDL and moves-left shaping
@@ -1746,6 +1751,7 @@ LeafSelection SearchThread::select_and_expand(
     int childIdx;
     bool hasEvaluationReservation = false;
     TimeState pathTime = rootTime;
+    const Node* const searchRoot = currentNode.get();
     // The clock state after the current node's team plays its action, read
     // from the position before that action is made.
     // A durative clock (DurativeTree) also needs to know which boards the
@@ -1760,6 +1766,20 @@ LeafSelection SearchThread::select_and_expand(
             return durative_time_after(next, board, actingTeam, action);
         }
         next.advance(actingTeam, board.on_turn_on_both_boards(actingTeam));
+        if (runtimeConfig.hybridEventBoard >= 0 && &node == searchRoot) {
+            // Spec v6 H3, step 4: below the root of a triggered search the
+            // opponent seat thinking on the event board lands a move (its
+            // pass there is illegal at depth 1), below every root child or
+            // only below the hybrid sit, the root's one action passing on
+            // both boards.
+            const bool hybridSit = action.moveA == Stockfish::MOVE_NONE
+                && action.moveB == Stockfish::MOVE_NONE;
+            if (runtimeConfig.hybridEventLands == SearchParams::HYBRID_EVENT_LANDS_ALL
+                || (runtimeConfig.hybridEventLands == SearchParams::HYBRID_EVENT_LANDS_SIT
+                    && hybridSit)) {
+                next = next.with_hybrid_event(runtimeConfig.hybridEventBoard);
+            }
+        }
         return next;
     };
 
@@ -1940,7 +1960,8 @@ void SearchThread::expand_leaf_node(Node* leaf,
                                     uint32_t expansionKey,
                                     int plannedBoard,
                                     const vector<uint8_t>& handTypesA,
-                                    const vector<uint8_t>& handTypesB) {
+                                    const vector<uint8_t>& handTypesB,
+                                    uint8_t mustMoveBoards) {
     // Store the position hash in the node for MCGS
     if (positionHash != 0) {
         leaf->set_hash(positionHash);
@@ -1952,7 +1973,8 @@ void SearchThread::expand_leaf_node(Node* leaf,
                               teamHasTimeAdvantage, boardAOnTurn, boardBOnTurn,
                               runtimeConfig, capturesA, capturesB,
                               jointFactorsA, jointFactorsB, jointFactorRank,
-                              expansionKey, plannedBoard, handTypesA, handTypesB);
+                              expansionKey, plannedBoard, handTypesA, handTypesB,
+                              mustMoveBoards);
     
     // Note: The first child created during try_init_and_expand doesn't have its
     // hash computed yet (would require board access). However, when that child

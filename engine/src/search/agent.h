@@ -20,6 +20,7 @@
 #include "search/gc_thread.h"
 #include "common/globals.h"
 #include "environment/joint_action.h"
+#include "search/hybrid.h"
 
 class SearchThread;
 struct SearchInfo;
@@ -86,6 +87,16 @@ struct SearchOptions {
     // plan unless the new search finds better.
     bool planCarry = false;
     int planCarryPermille = 300;
+    // Spec v6, the hybrid (UCI HybridMode and its knobs): the mode and
+    // knobs, and the durative clock of this decision (TimeState::durative
+    // with SitGate off) whose seat clocks, paces, elapsed times and sitting
+    // flags the trigger reads. The search itself runs on `clock` (v3). Off,
+    // or without that clock, or in a ponder or background search, nothing
+    // changes.
+    struct Hybrid {
+        HybridKnobs knobs;
+        std::optional<TimeState> clock;
+    } hybrid;
 
     SearchParams::RuntimeConfig search;
     
@@ -384,6 +395,23 @@ private:
     // clear_plans() (ucinewgame, game start) empties them.
     std::array<CarriedPlan, 2> plans_;
     PlanCarryReport lastPlanCarry_;
+
+    // Spec v6 (hybrid): the last search's report, and the live search's
+    // root mask and margin (0 = no hybrid sit at this root).
+    HybridReport lastHybrid_;
+    uint8_t hybridMask_ = 0;
+    float hybridMargin_ = 0.0f;
+    /** The root child that is the hybrid sit (the action passing on both boards), -1 = none. */
+    int hybrid_sit_index() const;
+    /**
+     * @brief Spec v6 H3 step 5, the margin rule as one predicate: the root
+     * child to exclude from every root pick, which is the hybrid sit when
+     * it does not qualify (q at least the best moving child's plus the
+     * margin, and 10% of the root's visits; a proven win qualifies), else
+     * -1. Fills @p report's q and visit fields when given.
+     */
+    int hybrid_excluded_index(float qVetoDelta, float qValueWeight, bool avoidSolvedDraw,
+                              HybridReport* report = nullptr) const;
     void record_plans_locked(Board& board, Stockfish::Color team,
                              const JointActionCandidate& action, std::array<bool, 2> boards);
     /** The root's prior mix for this search, validated; fills lastPlanCarry_. */
@@ -448,6 +476,7 @@ private:
     friend class AgentContinuityFix2Peer;
     friend class AgentContinuityFix3Peer;
     friend class AgentDiagFixesPeer;
+    friend class AgentHybridPeer;
 
     void ensure_worker_pool(size_t workerCount);
     void worker_loop(size_t workerIndex, uint64_t observedGeneration);
@@ -547,6 +576,8 @@ public:
     const TeamTreeReuseReport& team_tree_reuse() const { return lastTeamTreeReuse_; }
     /** Fix 3: what PlanCarry did at the start of the last search. */
     const PlanCarryReport& plan_carry() const { return lastPlanCarry_; }
+    /** Spec v6: what the hybrid did in the last (non-background) search. */
+    const HybridReport& hybrid_report() const { return lastHybrid_; }
     /** Fix 3: the remembered halves, one slot per board. */
     const std::array<CarriedPlan, 2>& carried_plans() const { return plans_; }
     /** Fix 1: whether a team tree is retained for the next search. */
@@ -754,7 +785,7 @@ public:
      */
     static std::optional<JointActionCandidate> claimed_win_action(
         const Node& node, float qVetoDelta, float qValueWeight,
-        bool avoidSolvedDraw);
+        bool avoidSolvedDraw, int excludeIdx = -1);
 
     /**
      * @brief A replacement for a claimed win that loses the mate race.
@@ -775,7 +806,8 @@ public:
         Board& board, const Node& node, Stockfish::Color teamSide,
         const TimeState& time, float qVetoDelta, float qValueWeight,
         bool avoidSolvedDraw,
-        const std::atomic<bool>* cancelled = nullptr);
+        const std::atomic<bool>* cancelled = nullptr,
+        int excludeIdx = -1);
 
     /**
      * @brief Exact joint forced-mate proof for @p attackingTeam to move.
@@ -901,7 +933,8 @@ public:
         Stockfish::Color teamSide, const TimeState& time,
         MateSearchBudget::Clock::time_point deadline,
         const std::atomic<bool>* cancelled = nullptr,
-        SelectedMoveCertStats* stats = nullptr);
+        SelectedMoveCertStats* stats = nullptr,
+        int excludeIdx = -1);
 
     /**
      * @brief Whether playing @p move on @p boardNum reaches that board's

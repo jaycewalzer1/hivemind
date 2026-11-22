@@ -887,12 +887,12 @@ bool Agent::action_loses_mate_race(Board& board,
 
 std::optional<JointActionCandidate> Agent::claimed_win_action(
     const Node& node, float qVetoDelta, float qValueWeight,
-    bool avoidSolvedDraw) {
+    bool avoidSolvedDraw, int excludeIdx) {
     if (!node.is_expanded()) {
         return std::nullopt;
     }
     const int index = node.get_best_move_idx_with_q_weight(
-        qVetoDelta, qValueWeight, avoidSolvedDraw);
+        qVetoDelta, qValueWeight, avoidSolvedDraw, excludeIdx);
     if (index < 0 || static_cast<size_t>(index) >= node.get_num_generated()) {
         return std::nullopt;
     }
@@ -920,9 +920,9 @@ std::optional<JointActionCandidate> Agent::race_safe_alternative(
 std::optional<JointActionCandidate> Agent::race_safe_alternative(
     Board& board, const Node& node, Stockfish::Color teamSide,
     const TimeState& time, float qVetoDelta, float qValueWeight,
-    bool avoidSolvedDraw, const std::atomic<bool>* cancelled) {
+    bool avoidSolvedDraw, const std::atomic<bool>* cancelled, int excludeIdx) {
     const std::optional<JointActionCandidate> claimed = claimed_win_action(
-        node, qVetoDelta, qValueWeight, avoidSolvedDraw);
+        node, qVetoDelta, qValueWeight, avoidSolvedDraw, excludeIdx);
     if (!claimed) {
         return std::nullopt;
     }
@@ -949,7 +949,8 @@ std::optional<JointActionCandidate> Agent::race_safe_alternative(
     for (size_t index = 0; index < generated; ++index) {
         const JointActionCandidate action =
             node.get_joint_action(static_cast<int>(index));
-        if (action.same_moves(*claimed)) {
+        // Spec v6: a hybrid sit that does not qualify is no alternative.
+        if (action.same_moves(*claimed) || static_cast<int>(index) == excludeIdx) {
             continue;
         }
         byVisits.push_back(index);
@@ -1122,7 +1123,8 @@ std::optional<JointActionCandidate> Agent::certified_mate_free_alternative(
     Board& board, const Node& node, const JointActionCandidate& chosen,
     Stockfish::Color teamSide, const TimeState& time,
     MateSearchBudget::Clock::time_point deadline,
-    const std::atomic<bool>* cancelled, SelectedMoveCertStats* stats) {
+    const std::atomic<bool>* cancelled, SelectedMoveCertStats* stats,
+    int excludeIdx) {
     if (time.can_sit_through(teamSide, OPPONENT_PROOF_HORIZON_MOVES)
         || !node.is_expanded()) {
         return std::nullopt;
@@ -1168,7 +1170,8 @@ std::optional<JointActionCandidate> Agent::certified_mate_free_alternative(
     vector<size_t> byVisits;
     byVisits.reserve(generated);
     for (size_t index = 0; index < generated; ++index) {
-        if (isProvenLoss(index)
+        // Spec v6: a hybrid sit that does not qualify is no alternative.
+        if (isProvenLoss(index) || static_cast<int>(index) == excludeIdx
             || same_action(
                 node.get_joint_action(static_cast<int>(index)), chosen)) {
             continue;
@@ -6129,6 +6132,57 @@ bool Agent::try_reuse_mate_continuation(
 /**
  * @brief Runs a UCI search.
  */
+int Agent::hybrid_sit_index() const {
+    if (hybridMask_ == 0 || !rootNode || !rootNode->is_expanded()) {
+        return -1;
+    }
+    const int generated = static_cast<int>(rootNode->get_num_generated());
+    for (int index = 0; index < generated; ++index) {
+        const JointActionCandidate action = rootNode->get_joint_action(index);
+        if (action.moveA == Stockfish::MOVE_NONE && action.moveB == Stockfish::MOVE_NONE) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+int Agent::hybrid_excluded_index(float qVetoDelta, float qValueWeight, bool avoidSolvedDraw,
+                                 HybridReport* report) const {
+    const int sitIdx = hybrid_sit_index();
+    if (sitIdx < 0) {
+        return -1;
+    }
+    const vector<int> visits = rootNode->get_child_visits();
+    int total = 0;
+    for (int count : visits) {
+        total += std::max(0, count);
+    }
+    const int sitVisits = static_cast<size_t>(sitIdx) < visits.size() ? visits[sitIdx] : 0;
+    const float qSit = rootNode->get_child_q(sitIdx);
+    const int moveIdx = rootNode->get_best_move_idx_with_q_weight(
+        qVetoDelta, qValueWeight, avoidSolvedDraw, sitIdx);
+    const float qAct = moveIdx >= 0 ? rootNode->get_child_q(moveIdx) : -1.0f;
+    const shared_ptr<Node> sitChild = rootNode->get_child(sitIdx);
+    // The opponents' node below the sit is solved lost for them: a win the
+    // tree proved through the sit, assuming the event lands.
+    const bool proven = sitChild && sitChild->get_node_type() == NodeType::LOSS;
+    const bool provenLost = sitChild && sitChild->get_node_type() == NodeType::WIN;
+    const bool enoughVisits = static_cast<int64_t>(sitVisits) * 10 >= total;
+    const bool margin = qSit >= qAct + hybridMargin_;
+    const bool qualifies = !provenLost
+        && (proven || moveIdx < 0 || (margin && enoughVisits));
+    if (report) {
+        report->qSit = qSit;
+        report->qAct = qAct;
+        report->visitsSit = sitVisits;
+        report->visitsTotal = total;
+        report->proven = proven;
+        report->qualifies = qualifies;
+        report->reason = qualifies ? "" : !margin || provenLost ? "margin" : "visits";
+    }
+    return qualifies ? -1 : sitIdx;
+}
+
 JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engines, 
                                         Stockfish::Color teamSide, bool teamHasTimeAdvantage,
                                         const SearchOptions& options) {
@@ -6171,6 +6225,10 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     }
     
     certifiedChoice_ = false;
+    hybridMask_ = 0;
+    if (!options.background) {
+        lastHybrid_ = {};
+    }
     // Without a clock the flag stands for a permanent lead or deficit. With
     // one, the flag is whatever the clock implies for this team now, and the
     // workers charge every action they search to it.
@@ -6241,6 +6299,35 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
     uint64_t positionHash = board.search_hash_key(teamSide, searchTime_);
     const std::string positionSignature = board_signature(board);
 
+    // Spec v6 H3 (HybridMode gate): whether this root may also sit, though
+    // the v3 gate forbids it, to wait for a landing on the other board. A
+    // v3 clocked search only, never a ponder or background search; with an
+    // empty mask the search is the plain v3 search.
+    HybridTrigger hybridTrigger;
+    if (options.hybrid.knobs.mode == HybridMode::GATE && options.hybrid.clock
+        && options.hybrid.clock->is_durative() && !options.isPonder
+        && !options.background && searchTime_.is_clocked() && !searchTime_.is_durative()) {
+        hybridTrigger = hybrid_sit_boards(board, teamSide, searchTime_, *options.hybrid.clock,
+                                          options.hybrid.knobs);
+        hybridMask_ = hybridTrigger.mask;
+        hybridMargin_ = static_cast<float>(options.hybrid.knobs.marginPermille) / 1000.0f;
+        lastHybrid_.active = true;
+        lastHybrid_.trigger = hybridTrigger;
+        if (options.verbose) {
+            cout << "info string Hybrid: sit boards "
+                 << (hybridTrigger.mask == 0 ? "-" : hybridTrigger.sitBoard == BOARD_A ? "A" : "B")
+                 << " event "
+                 << (hybridTrigger.sitBoard == BOARD_A ? to_string(hybridTrigger.eventMs) : "-")
+                 << "/"
+                 << (hybridTrigger.sitBoard == BOARD_B ? to_string(hybridTrigger.eventMs) : "-")
+                 << " mode " << hybrid_mode_name(options.hybrid.knobs.mode);
+            if (hybridTrigger.mask == 0) {
+                cout << " (" << hybridTrigger.reason << ")";
+            }
+            cout << endl;
+        }
+    }
+
     // Every claimed forced win passes this before it is acted on, whichever
     // scan, cache or subtree produced it. A win that does not mate at once
     // while the opponents can is not a win at all: bughouse clocks run in
@@ -6304,12 +6391,35 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         }
     }
 
+    if (hybridMask_ != 0 && reusedRoot && !teamTreeMode) {
+        // Spec v6 H3 step 6: a retained root was expanded under the gate's
+        // rules, without the hybrid sit; this root starts fresh.
+        reusedRoot.reset();
+        drop_retained_candidates();
+    }
+
     // Fix 3: which carried moves this root mixes in. The workers' copy of
     // the search config carries them; a fresh root mixes and promotes at its
     // expansion, an adopted one below.
     SearchParams::RuntimeConfig workerConfig = options.search;
     if (planCarryMode) {
         resolve_plans(board, teamSide, options.planCarryPermille, workerConfig);
+    }
+    if (hybridMask_ != 0) {
+        // Spec v6 H3 steps 2-4: the root's extra pass, its prior floor, and
+        // the event board whose thinking seat lands a move at depth 1.
+        workerConfig.hybridSitBoards = hybridMask_;
+        workerConfig.hybridPassPriorWeight =
+            static_cast<float>(options.hybrid.knobs.passPriorPermille) / 1000.0f;
+        workerConfig.hybridEventBoard = static_cast<int8_t>(
+            options.hybrid.knobs.eventLands == HybridEventLands::NONE
+                ? -1 : hybridTrigger.eventBoard);
+        workerConfig.hybridEventLands =
+            options.hybrid.knobs.eventLands == HybridEventLands::SIT
+                ? SearchParams::HYBRID_EVENT_LANDS_SIT
+                : options.hybrid.knobs.eventLands == HybridEventLands::NONE
+                    ? SearchParams::HYBRID_EVENT_LANDS_NONE
+                    : SearchParams::HYBRID_EVENT_LANDS_ALL;
     }
 
     if (reusedRoot) {
@@ -7929,7 +8039,15 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             // Keep PV 1 aligned with the solver-aware move used for bestmove.
             int solverIdx = rootNode->get_best_move_idx_with_q_weight(
                 options.search.qVetoDelta, options.search.qValueWeight,
-                avoidSolvedDraw);
+                avoidSolvedDraw,
+                hybrid_excluded_index(options.search.qVetoDelta,
+                                      options.search.qValueWeight, avoidSolvedDraw));
+            // Spec v6: a win proven through a hybrid sit assumes the event
+            // lands, so it is reported as a value, never as a mate.
+            const bool hybridProvenPv = hybridMask_ != 0 && solverIdx >= 0
+                && solverIdx == hybrid_sit_index()
+                && rootNode->get_child(solverIdx)
+                && rootNode->get_child(solverIdx)->get_node_type() == NodeType::LOSS;
             if (solverIdx >= 0) {
                 auto it = std::find(sortedIndices.begin(), sortedIndices.end(), static_cast<size_t>(solverIdx));
                 if (it != sortedIndices.end() && it != sortedIndices.begin()) {
@@ -7959,7 +8077,10 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 float childQ = rootNode->get_child_q(static_cast<int>(childIdx));
                 // A solved root's score belongs to the move that proves it;
                 // the other lines keep their own.
-                string scoreStr = pvIdx == 0
+                string scoreStr = pvIdx == 0 && hybridProvenPv
+                    ? "score cp " + to_string(static_cast<int>(
+                          C * std::tan(k * std::clamp(childQ, -0.99f, 0.99f))))
+                    : pvIdx == 0
                     ? format_root_aware_uci_score(
                         rootNode, children[childIdx], childQ,
                         childVisits[childIdx], C, k)
@@ -8112,7 +8233,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                     const int decisionIdx = options.search.enableGumbelRootSearch
                         ? rootNode->get_best_move_idx_with_q_weight(
                             options.search.qVetoDelta,
-                            options.search.qValueWeight)
+                            options.search.qValueWeight, false,
+                            hybrid_excluded_index(options.search.qVetoDelta,
+                                                  options.search.qValueWeight, false))
                         : firstIdx;
                     float bestQ = rootNode->get_child_q(
                         decisionIdx >= 0 ? decisionIdx : firstIdx);
@@ -8242,7 +8365,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                     const int decisionIdx = options.search.enableGumbelRootSearch
                         ? rootNode->get_best_move_idx_with_q_weight(
                             options.search.qVetoDelta,
-                            options.search.qValueWeight)
+                            options.search.qValueWeight, false,
+                            hybrid_excluded_index(options.search.qVetoDelta,
+                                                  options.search.qValueWeight, false))
                         : firstIdx;
                     float bestQ = rootNode->get_child_q(
                         decisionIdx >= 0 ? decisionIdx : firstIdx);
@@ -8440,11 +8565,30 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             int bestIdx = rootNode->get_best_move_idx_with_q_weight(
                 options.search.qVetoDelta, options.search.qValueWeight,
                 avoidSolvedDraw);
+            // Spec v6 H3 step 5: a hybrid sit the root picked is kept only
+            // if it qualifies (hybrid_excluded_index); otherwise the best
+            // child that is not the sit, by the same rule.
+            int hybridExcluded = -1;
+            if (hybridMask_ != 0) {
+                const int sitIdx = hybrid_sit_index();
+                hybridExcluded = hybrid_excluded_index(
+                    options.search.qVetoDelta, options.search.qValueWeight,
+                    avoidSolvedDraw, &lastHybrid_);
+                lastHybrid_.sitChosen = sitIdx >= 0 && bestIdx == sitIdx;
+                if (bestIdx >= 0 && bestIdx == hybridExcluded) {
+                    bestIdx = rootNode->get_best_move_idx_with_q_weight(
+                        options.search.qVetoDelta, options.search.qValueWeight,
+                        avoidSolvedDraw, hybridExcluded);
+                }
+            }
             
             // Fallback to most-visited if Q-value selection failed
             if (bestIdx < 0) {
                 int maxVisits = 0;
                 for (size_t i = 0; i < numChildren; ++i) {
+                    if (static_cast<int>(i) == hybridExcluded) {
+                        continue;
+                    }
                     if (visits[i] > maxVisits) {
                         maxVisits = visits[i];
                         bestIdx = static_cast<int>(i);
@@ -8468,7 +8612,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                     race_safe_alternative(
                         board, *rootNode, teamSide, searchTime_,
                         options.search.qVetoDelta, options.search.qValueWeight,
-                        avoidSolvedDraw, &stopRequested_)) {
+                        avoidSolvedDraw, &stopRequested_, hybridExcluded)) {
                 if (options.verbose) {
                     cout << "info string Proven win loses the mate race; "
                             "playing an alternative" << endl;
@@ -8521,7 +8665,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                     certified_mate_free_alternative(
                         board, *rootNode, result, teamSide,
                         searchTime_, certDeadline, &stopRequested_,
-                        &certStats);
+                        &certStats, hybridExcluded);
                 if (mateFree) {
                     result = *mateFree;
                     certifiedChoice_ = true;
@@ -8547,6 +8691,30 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
         }
     }
     
+    if (hybridMask_ != 0) {
+        // Spec v6 H3 step 7: what the root did with its hybrid sit.
+        HybridReport& hybrid = lastHybrid_;
+        hybrid.kept = result.moveA == Stockfish::MOVE_NONE
+            && result.moveB == Stockfish::MOVE_NONE;
+        if (hybrid.kept) {
+            hybrid.reason = hybrid.proven ? "proven" : "margin";
+        } else if (!hybrid.sitChosen) {
+            hybrid.reason = "no sit chosen";
+        } else if (hybrid.reason.empty()) {
+            // The sit qualified but a mate-race veto or certification replaced it.
+            hybrid.reason = "certification";
+        }
+        if (options.verbose) {
+            cout << "info string Hybrid: chose "
+                 << (hybrid.kept ? hybrid.trigger.sitBoard == BOARD_A ? "sit A" : "sit B" : "act")
+                 << " q_sit " << hybrid.qSit << " q_act " << hybrid.qAct
+                 << " visits " << hybrid.visitsSit << "/" << hybrid.visitsTotal
+                 << " (" << hybrid.reason
+                 << (hybrid.kept && hybrid.proven ? ", proven (assumes event)" : "") << ")"
+                 << endl;
+        }
+    }
+
     if (!options.background) {
         rootScanStats_.thinkNanos += static_cast<uint64_t>(
             chrono::duration_cast<chrono::nanoseconds>(

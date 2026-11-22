@@ -418,7 +418,8 @@ public:
                           uint32_t expansionKey = 0,
                           int plannedBoard = -1,
                           const vector<uint8_t>& handTypesA = {},
-                          const vector<uint8_t>& handTypesB = {});
+                          const vector<uint8_t>& handTypesB = {},
+                          uint8_t mustMoveBoards = 0);
     void backup(vector<TrajectoryEntry>& trajectory, float value);
     void cancel_virtual_losses(const vector<TrajectoryEntry>& trajectory);
     
