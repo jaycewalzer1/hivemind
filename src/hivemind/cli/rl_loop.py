@@ -63,6 +63,27 @@ openings rotated so the chunks play them in the order one long match would);
 their games and summary are merged into arms/match_generator itself. The match
 against the fixed baseline keeps its fixed size, so that curve stays comparable.
 
+With --search-balance (talisman fork; docs/search_balance.md) the search balance
+controller (talisman cluster/search_balance.py, --search-balance-controller)
+picks each iteration's self-play recipe. --runs is then RUN/runs and the
+controller's files live in RUN/balance. Before an iteration's self-play the
+loop runs `search_balance.py plan RUN N` once and freezes its segment table
+(games, seed and engine flags of each segment) into rl-itN/stages/
+balance_plan.done, before the iteration's generator marker, so every
+--selfplay-worker reads the same table; the iteration plays exactly the
+planned segments (a challenger segment carries its arm's playout-cap flags
+and its twin's seed; validation always plays stock). Training counts steps by
+the plan's steps_rule and passes its trainer_args (--search-q-blend). After
+training: `hivemind balance probe` (when the plan refreshes the probe),
+`minitrain` and `score` (when it has a challenger); after the gate: the
+mini-gate (when `decide --dry` says it can promote), `balance accounting`,
+`search_balance.py realise` and `decide` (RUN/balance/itN.json). Each step
+leaves a stages/balance_*.done marker; a failed balance step is logged and
+skipped, never fatal (the controller then plans failsafe). Without a prior
+(RUN/balance/prior.json or --search-balance-prior) the controller holds
+today's recipe and plans no challenger, so self-play and training run exactly
+as without the flag.
+
 Stop between stages with: touch RUNS/rl-loop.stop"""
 
 import argparse
@@ -267,7 +288,42 @@ WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate":
                   "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None,
                   "wide": False, "arrivals_weight": None, "shared_selfplay": False, "selfplay_hook": None,
                   "gate_sprt": None, "gate_sprt_alpha": 0.05, "gate_sprt_beta": 0.05, "gate_chunk": 100,
-                  "gate_max_games": None}
+                  "gate_max_games": None, "search_balance": False, "search_balance_controller": None,
+                  "search_balance_prior": None, "search_balance_mini_steps": 200, "search_balance_probe_games": 150,
+                  "search_balance_minigate_games": 100, "search_balance_gpus": 1.0, "search_balance_device": "auto"}
+
+
+# --search-balance: engine flags of the playout cap and the state dump, which validation never gets.
+CAP_FLAGS = ("--deep-fraction", "--deep-multiplier", "--fast-nodes", "--fast-policy-mask", "--fast-dirichlet",
+             "--deep-dirichlet", "--cap-seed-salt", "--record-state-output")
+STEPS_RULES = ("positions", "policy_positions")  # functions of the same name in hivemind.cli.train
+
+
+def search_balance_controller(explicit=None):
+    """The controller script: `explicit` (None if it does not exist), else
+    $HIVEMIND_SEARCH_BALANCE, else cluster/search_balance.py in the first
+    directory above the fork that has one (the talisman repo the fork sits in
+    as third_party/wave2-hivemind)."""
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        return path if path.is_file() else None
+    if os.environ.get("HIVEMIND_SEARCH_BALANCE"):
+        path = Path(os.environ["HIVEMIND_SEARCH_BALANCE"]).expanduser().resolve()
+        return path if path.is_file() else None
+    return next((parent / "cluster" / "search_balance.py" for parent in PROJECT_ROOT.parents
+                 if (parent / "cluster" / "search_balance.py").is_file()), None)
+
+
+def last_json_line(text):
+    """The last line of `text` that parses as a JSON object, or None."""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return None
 
 
 # --gate-sprt: the sequential gate against the generator.
@@ -426,10 +482,11 @@ class Claims:
                 continue
         return found
 
-    def take(self, k, games):
+    def take(self, k, games, balance=None):
         """Claim segment k for `games` games: True if it is now ours. A stale
         claim is renamed aside first; of two processes taking it over, only the
-        one whose rename succeeds goes on to create the new claim."""
+        one whose rename succeeds goes on to create the new claim. `balance`
+        (--search-balance) records the segment's arm and engine flags in it."""
         claim = self.path(k)
         try:
             if time.time() - claim.stat().st_mtime >= self.stale_seconds:
@@ -451,7 +508,8 @@ class Claims:
         except FileExistsError:
             return False
         with os.fdopen(fd, "w") as stream:
-            stream.write(json.dumps({"games": games, "owner": self.owner, "at": time.time()}) + "\n")
+            stream.write(json.dumps({"games": games, "owner": self.owner, "at": time.time(),
+                                     **({"balance": balance} if balance is not None else {})}) + "\n")
         return True
 
     def release(self, k):
@@ -565,8 +623,14 @@ class Loop:
         else:
             self.aside(data, records, log)
         log.parent.mkdir(parents=True, exist_ok=True)
+        # --search-balance: the plan's segment (None for validation and without a plan).
+        planned = self.planned_segments()
+        spec = None if planned is None else planned.get(name)
+        cap = [] if spec is None else [str(a).replace("{segment_dir}", str(records)) for a in spec["engine_args"]]
         self.log(f"it{self.n} self-play {name}: {'resuming ' if resuming else ''}{games} games, "
-                 f"seed {seed}" + (f" ({self.owner})" if self.option("shared_selfplay") else ""))
+                 f"seed {seed}" + (f" ({self.owner})" if self.option("shared_selfplay") else "")
+                 + ("" if spec is None else f", search balance arm {spec['theta']}"
+                    + (f" {' '.join(cap)}" if cap else " (stock)")))
         extra = list(selfplay.time_model_options(self.args.time_model))
         # Validation keeps the settings every earlier iteration's was played
         # with, so its losses stay comparable across iterations.
@@ -579,11 +643,19 @@ class Loop:
             extra += ["--checkpoint-games", str(self.args.checkpoint_games), "--resume", "true"]
         # The wave 2 rules hold for validation too: its games are this iteration's game.
         extra += self.option("wave2_options").engine_args()
+        extra += cap
         command = selfplay.engine_command(self.args.selfplay_engine, self.generator_sp1, games, seed,
                                           data, records, self.args.parallel_games, extra)
+        if planned is not None:
+            if spec is None and any(flag in command for flag in CAP_FLAGS):
+                raise StageFailed(f"{name} must play stock under search balance: {command}")
+            if cap and not engine_supports(self.args.selfplay_engine, "--deep-fraction"):
+                raise StageFailed(f"{name}: {self.args.selfplay_engine} lacks the playout-cap flags {cap}")
+        started = time.monotonic()
         with log.open("a" if resuming else "w") as stream, self.heartbeat():
             if subprocess.run(command, cwd=ENGINE_DIR, stdout=stream, stderr=subprocess.STDOUT).returncode:
                 raise StageFailed(f"self-play {name} failed (see {log})")
+        wall = time.monotonic() - started
         lines = log.read_text(errors="replace").splitlines()
         if self.checkpoint_selfplay:
             # A resumed run prints game lines only for the games it played.
@@ -616,11 +688,41 @@ class Loop:
             self.log(f"it{self.n} {name} timing: {attached['rewritten']} of {attached['chunks']} chunks "
                      f"to v3, {attached['labelled']} of {attached['records']} records with arrivals labels")
             marker["timing"] = attached
+        if planned is not None:
+            if spec is not None:
+                marker["balance"] = {"theta": spec["theta"], "engine_args": cap,
+                                     **({"twin": spec["twin"]} if spec.get("twin") else {}),
+                                     "plan_sha256": (self.balance_plan_marker() or {}).get("plan_sha256")}
+            # The engine's own time, for the controller's realised cost (balance accounting). A resumed
+            # segment's earlier part is unknown: no number rather than a partial one.
+            if not resuming:
+                gpus = (self.balance_plan_marker() or {}).get("gpus_per_job", 1.0)
+                marker["wall_s"], marker["gpu_s"] = round(wall, 3), round(wall * gpus, 3)
         self.mark(name, marker)
         self.archive(self.n)
 
     def games_played(self):
         return sum(json.loads(marker.read_text())["games"] for marker in (self.it / "stages").glob("seg*.done"))
+
+    # --search-balance: the iteration's plan, frozen in stages/balance_plan.done.
+    def balance_plan_marker(self):
+        try:
+            return json.loads((self.it / "stages" / "balance_plan.done").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def planned_segments(self):
+        """{segNN: {"theta", "seed", "games", "engine_args"}} when the iteration
+        has a search balance plan (workers read it whatever their own flags),
+        else None: self-play then plays --games in --segment-games segments."""
+        marker = self.balance_plan_marker()
+        return (marker or {}).get("segments") or None
+
+    def selfplay_left(self):
+        planned = self.planned_segments()
+        if planned is None:
+            return self.games_played() < self.args.games
+        return any(not self.done(name) for name in planned)
 
     # --shared-selfplay: segments claimed through the shared filesystem.
     @property
@@ -653,22 +755,33 @@ class Loop:
         """Claim the next local segment still needed, as (k, games), or None once
         the finished and the live-claimed games reach --games."""
         claims = Claims(self.it / "stages", self.owner)
+        planned = self.planned_segments()
         while True:
             live = claims.live()
-            committed = self.games_played() + sum(live.values())
-            if committed >= self.args.games:
-                return None
-            k = 0
-            while self.done(f"seg{k:02d}") or k in live:
-                k += 1
-            if k >= 999:
-                raise StageFailed("out of local self-play seeds")
-            games = min(self.args.segment_games, self.args.games - committed)
+            balance = None
+            if planned is not None:
+                # --search-balance: exactly the plan's segments, each with its own game count.
+                left = [name for name in planned if not self.done(name) and int(name[3:]) not in live]
+                if not left:
+                    return None
+                k, spec = int(left[0][3:]), planned[left[0]]
+                games = spec["games"]
+                balance = {"theta": spec["theta"], "engine_args": spec["engine_args"]}
+            else:
+                committed = self.games_played() + sum(live.values())
+                if committed >= self.args.games:
+                    return None
+                k = 0
+                while self.done(f"seg{k:02d}") or k in live:
+                    k += 1
+                if k >= 999:
+                    raise StageFailed("out of local self-play seeds")
+                games = min(self.args.segment_games, self.args.games - committed)
             # A segment taken over from a dead claim resumes with the count its checkpoint holds.
             progress = self.it / "search" / "train_run" / f"seg{k:02d}" / "checkpoint" / "progress"
             if self.checkpoint_selfplay and progress.is_file():
                 games = checkpoint_games(progress)
-            if claims.take(k, games):
+            if claims.take(k, games, balance):
                 return k, games
             time.sleep(1)  # another process claimed k first, or its claim is still being written
 
@@ -679,9 +792,11 @@ class Loop:
             return False
         k, games = claim
         name = f"seg{k:02d}"
+        # A search balance challenger segment plays its twin's seed.
+        seed = (self.planned_segments() or {}).get(name, {}).get("seed", 1000 * self.n + k)
         self.claimed = k
         try:
-            self.attempt(self.selfplay, name, games, 1000 * self.n + k, self.it / "search" / "train" / name,
+            self.attempt(self.selfplay, name, games, seed, self.it / "search" / "train" / name,
                          self.it / "search" / "train_run" / name)
         finally:
             self.claimed = None
@@ -827,7 +942,14 @@ class Loop:
             archive.restore(directory, self.log)
         new = train_dirs(self.runs, self.n)
         old = [d for m in replays for d in train_dirs(self.runs, m)]
-        npos, opos = train.positions(new), train.positions(old)
+        # --search-balance: the plan's step rule (policy_positions leaves the playout cap's masked records
+        # out of the count) and trainer options (--search-q-blend); all segments train, the challenger's too.
+        balance = self.balance_plan_marker() if self.planned_segments() is not None else None
+        rule = (balance or {}).get("steps_rule", "positions")
+        if rule not in STEPS_RULES:
+            raise StageFailed(f"unknown search balance steps rule {rule!r}")
+        count = getattr(train, rule)
+        npos, opos = count(new), count(old)
         if not npos:
             raise StageFailed("no new self-play positions")
         if npos < self.args.batch_size:
@@ -842,12 +964,15 @@ class Loop:
         self.wait_for_quiet()
         self.log(f"it{self.n} training: {steps} steps from {init}, {npos} new positions "
                  f"x{self.args.new_passes}, {opos} replay positions x{self.args.replay_passes} "
-                 f"(replay share {fraction}, {len(old)} dirs, batch {self.args.batch_size})")
+                 f"(replay share {fraction}, {len(old)} dirs, batch {self.args.batch_size})"
+                 + ("" if balance is None else f", search balance steps rule {rule}, trainer args "
+                    f"{' '.join(balance.get('trainer_args') or []) or 'none'}"))
         command = train.distill_command(init, new, [self.it / "search" / "val"], old, steps, fraction,
                                         self.args.batch_size, self.n, out, self.teacher_val,
                                         lr=self.option("lr"), trunk_lr=self.option("trunk_lr"),
                                         extra=(["--arrivals-weight", str(self.option("arrivals_weight"))]
-                                               if self.option("wide") else []))
+                                               if self.option("wide") else [])
+                                        + [str(a) for a in (balance or {}).get("trainer_args") or []])
         with log.open("w") as stream:
             if subprocess.run(command, cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
                               env={**os.environ, **train.TRAINING_ENV}).returncode:
@@ -857,9 +982,12 @@ class Loop:
             raise StageFailed(f"training left no last.pt and ONNX in {out}")
         install(onnx, self.it / "models" / "C.onnx")
         install(onnx, self.generator.with_name(f"{self.generator.stem}-it{self.n}.onnx"))
-        self.mark("train", {"steps": steps, "replay_fraction": fraction, "new_positions": npos,
-                            "replay_positions": opos, "init": sha256(init),
-                            "onnx": sha256(self.it / "models" / "C.onnx")})
+        marker = {"steps": steps, "replay_fraction": fraction, "new_positions": npos,
+                  "replay_positions": opos, "init": sha256(init), "onnx": sha256(self.it / "models" / "C.onnx")}
+        if balance is not None:
+            marker["search_balance"] = {"steps_rule": rule, "trainer_args": balance.get("trainer_args") or [],
+                                        "main_mix": self.main_mix()}
+        self.mark("train", marker)
         self.archive(self.n, *replays)
         if not self.args.keep_selfplay:
             for directory in self.teacher_val:
@@ -885,8 +1013,9 @@ class Loop:
         self.log(f"it{self.n} vs {name}: {json.dumps(summary)}")
         self.mark(f"match_{name}", summary)
 
-    def tournament(self, name, baseline, out, log, games, seed, openings, flag_baseline, note=""):
-        """Play one engine tournament into `out`, restarting it when a game starts."""
+    def tournament(self, name, baseline, out, log, games, seed, openings, flag_baseline, note="", contender=None):
+        """Play one engine tournament into `out`, restarting it when a game starts
+        (`contender` defaults to the iteration's candidate, models/C.onnx)."""
         movetime, clock = self.args.match_movetime, self.args.time_model
         while True:
             # A resumable match keeps its finished pairs; the engine starts over
@@ -897,7 +1026,7 @@ class Loop:
             self.log(f"it{self.n} match vs {name} ({baseline}, {games} games at {movetime} ms"
                      + (", on a simulated clock" if clock == "clock" else "") + note + ")")
             command = [str(self.args.match_engine), "tournament",
-                       "--contender", str(self.it / "models" / "C.onnx"), "--baseline", str(baseline),
+                       "--contender", str(contender or self.it / "models" / "C.onnx"), "--baseline", str(baseline),
                        "--movetime", str(movetime), "--games", str(games), "--seed", str(seed),
                        "--positions", str(openings), "--output", str(out),
                        *(("--time-model", "clock") if clock == "clock" else ()),
@@ -1034,6 +1163,265 @@ class Loop:
                 if freed:
                     self.log(f"{it.name}: freed {freed / 1e9:.1f} GB on disk")
 
+    # --search-balance: the controller (talisman cluster/search_balance.py) and `hivemind balance` stages.
+    @property
+    def balance_root(self):
+        """RUN of runs/full/RUN: the loop's --runs is RUN/runs, the controller's files are in RUN/balance."""
+        return self.runs.parent
+
+    @property
+    def balance_controller(self):
+        return search_balance_controller(self.option("search_balance_controller"))
+
+    def balance_file(self, *parts):
+        return self.balance_root.joinpath("balance", *parts)
+
+    def balance_on(self):
+        """Whether this iteration runs the balance stages: the flag, and a real plan (not failsafe, not skipped)."""
+        return bool(self.option("search_balance")) and bool((self.balance_plan_marker() or {}).get("plan"))
+
+    def balance_call(self, what, command):
+        """Run one balance step, its output appended to RUN/balance/itN/logs/WHAT.log: (exit code, log, output)."""
+        log = self.balance_file(f"it{self.n}", "logs", f"{what}.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as stream:
+            stream.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} $ {' '.join(map(str, command))}\n")
+            stream.flush()
+            start = stream.tell()
+            controller = self.balance_controller
+            env = {**os.environ, **({"HIVEMIND_SEARCH_BALANCE": str(controller)} if controller else {})}
+            try:
+                status = subprocess.run(command, cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
+                                        env=env).returncode
+            except OSError as error:
+                stream.write(f"{error!r}\n")
+                status = 127
+        with log.open("rb") as stream:
+            stream.seek(start)
+            output = stream.read().decode(errors="replace")
+        return status, log, output
+
+    def controller_command(self, *argv):
+        return [sys.executable, str(self.balance_controller), *map(str, argv)]
+
+    def balance_stage_command(self, stage, *argv):
+        # The module itself, not `-m hivemind balance`: hivemind/__main__.py drops main()'s return code, so a stage's
+        # exit 2 (BalanceError) would read as success.
+        return [sys.executable, "-m", "hivemind.cli.balance", stage, str(self.balance_root), str(self.n),
+                *map(str, argv)]
+
+    def controller_prior_args(self):
+        prior = self.option("search_balance_prior")
+        return ["--prior", str(prior)] if prior else []
+
+    def balance_plan(self):
+        """`search_balance.py plan RUN N`, its segment table frozen in
+        stages/balance_plan.done (written before the iteration's generator
+        marker, so a worker that sees the iteration sees the plan). If the
+        controller fails, a failsafe table: stock self-play, no balance stages."""
+        if self.done("balance_plan"):
+            return
+        args, n = self.args, self.n
+        segments = -(-args.games // args.segment_games)
+        command = self.controller_command(
+            "plan", self.balance_root, n, "--segments", segments, "--segment-games", args.segment_games,
+            "--mini-steps", self.option("search_balance_mini_steps"), "--generator", self.generator)
+        if self.option("search_balance_prior"):
+            command += ["--prior", str(self.option("search_balance_prior"))]
+        path, failure = self.balance_file(f"it{n}.plan.json"), None
+        if self.balance_controller is None:
+            failure, log = "no controller (--search-balance-controller)", None
+        else:
+            status, log, _ = self.balance_call("plan", command)
+            if status:
+                failure = f"exit {status}"
+        if failure is None:
+            try:
+                plan = json.loads(path.read_text())
+                if plan.get("iteration") != n or sorted(plan["segments"]) != [f"seg{k:02d}" for k in range(segments)]:
+                    raise ValueError(f"segments {sorted(plan['segments'])}, iteration {plan.get('iteration')}")
+                if plan.get("val", {}).get("engine_args"):
+                    raise ValueError("validation is not stock")
+                table = {name: {"theta": s["theta"], "seed": int(s["seed"]), "games": int(s["games"]),
+                                "engine_args": [str(a) for a in s.get("engine_args") or []],
+                                **({"twin": s["twin"]} if s.get("twin") else {})}
+                         for name, s in sorted(plan["segments"].items())}
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                failure = f"unreadable plan {path}: {error}"
+        if failure is not None:
+            table = {f"seg{k:02d}": {"theta": "stock", "seed": 1000 * n + k, "engine_args": [],
+                                     "games": min(args.segment_games, args.games - k * args.segment_games)}
+                     for k in range(segments)}
+            marker = {"failsafe": failure, "segments": table, "trainer_args": [], "steps_rule": "positions",
+                      "gpus_per_job": self.option("search_balance_gpus")}
+            self.log(f"it{n} search balance plan failed ({failure}" + (f"; see {log}" if log else "")
+                     + "): failsafe, stock self-play and no balance stages this iteration")
+        else:
+            marker = {"plan": str(path.relative_to(self.balance_root)), "plan_sha256": sha256(path),
+                      "mode": plan.get("mode"), "reason": plan.get("reason"), "theta_star": plan.get("theta_star"),
+                      "challenger": plan.get("challenger"), "challenger_segment": plan.get("challenger_segment"),
+                      "twin_segment": plan.get("twin_segment"), "segments": table,
+                      "trainer_args": [str(a) for a in plan.get("trainer_args") or []],
+                      "steps_rule": plan.get("steps_rule", "positions"),
+                      "probe_refresh": bool((plan.get("probe") or {}).get("refresh")),
+                      "gpus_per_job": self.option("search_balance_gpus")}
+            arms = ", ".join(f"{name} {s['theta']} {s['games']} games"
+                             + (f" {' '.join(s['engine_args'])}" if s["engine_args"] else "")
+                             for name, s in table.items())
+            self.log(f"it{n} search balance plan: mode {marker['mode']}, challenger "
+                     f"{json.dumps(marker['challenger'], sort_keys=True) if marker['challenger'] else 'none'} "
+                     f"({marker['reason']}); {arms}")
+        self.mark("balance_plan", marker)
+
+    def balance_step(self, what, command, marker=None):
+        """Run one balance step with the loop's retries. A step that keeps
+        failing is logged and skipped, never fatal: the controller then has no
+        evidence this iteration (or plans failsafe next). `marker`: the stage
+        marker the step leaves (None: the loop marks balance_WHAT itself).
+        Returns (ok, output of the last attempt)."""
+        stage = marker or f"balance_{what}"
+        if self.done(stage):
+            return True, ""
+        self.check_stop()
+        output = ""
+        for count in range(1, ATTEMPTS + 1):
+            status, log, output = self.balance_call(what, command)
+            if not status and (marker is None or self.done(stage)):
+                return True, output
+            tail = " | ".join(output.strip().splitlines()[-2:])
+            self.log(f"it{self.n}: search balance {what} failed (exit {status}: {tail}; see {log}; "
+                     f"attempt {count} of {ATTEMPTS})")
+            if count < ATTEMPTS:
+                time.sleep(RETRY_SECONDS)
+        self.log(f"it{self.n}: search balance {what} skipped after {ATTEMPTS} attempts")
+        return False, output
+
+    def main_mix(self):
+        """The share of this iteration's training positions each search balance arm played."""
+        mix = {}
+        for marker in sorted((self.it / "stages").glob("seg*.done")):
+            done = json.loads(marker.read_text())
+            arm = (done.get("balance") or {}).get("theta", "other")
+            mix[arm] = mix.get(arm, 0) + (done.get("positions") or 0)
+        total = sum(mix.values())
+        return {arm: round(count / total, 6) for arm, count in mix.items()} if total else {}
+
+    def balance_device(self):
+        device = self.option("search_balance_device")
+        if device != "auto":
+            return device
+        probe = subprocess.run([sys.executable, "-c", "import torch; print(torch.cuda.is_available())"],
+                               capture_output=True, text=True)
+        return "cuda" if probe.stdout.strip() == "True" else "cpu"
+
+    def balance_after_train(self):
+        """The probe refresh, the four mini-trains and their scores (docs/search_balance.md section 4)."""
+        if not self.balance_on():
+            return
+        plan = json.loads(self.balance_file(f"it{self.n}.plan.json").read_text())
+        gpus = self.option("search_balance_gpus")
+        if (plan.get("probe") or {}).get("refresh") or plan.get("challenger"):
+            # Training archived the segments again: the mini-trains (and probe wave 2 options) need them.
+            for m in (self.n, self.n - 1):
+                if (self.runs / f"rl-it{m}" / "search").is_dir():
+                    archive.restore(self.runs / f"rl-it{m}" / "search", self.log)
+        if (plan.get("probe") or {}).get("refresh"):
+            self.wait_for_quiet()
+            self.balance_step("probe", self.balance_stage_command(
+                "probe", "--engine", self.args.selfplay_engine, "--model", self.generator_sp1,
+                "--games", self.option("search_balance_probe_games"), "--parallel-games", self.args.parallel_games,
+                "--time-model", self.args.time_model, "--gpus", gpus, *(["--wide"] if self.option("wide") else [])),
+                "balance_probe")
+        if not (plan.get("challenger") and plan.get("minitrain")):
+            return
+        self.wait_for_quiet()
+        trunk = self.option("trunk_lr")
+        ok, _ = self.balance_step("minitrain", self.balance_stage_command(
+            "minitrain", "--batch-size", self.args.batch_size, "--lr", self.option("lr"),
+            *(["--trunk-lr", trunk] if trunk is not None else []), "--gpus", gpus,
+            *(["--extra", f"--arrivals-weight {self.option('arrivals_weight')}"] if self.option("wide") else [])),
+            "balance_minitrain")
+        if ok:
+            self.wait_for_quiet()
+            self.balance_step("score", self.balance_stage_command(
+                "score", "--device", self.balance_device(), "--gpus", gpus), "balance_score")
+
+    def balance_minigate(self, plan):
+        """100 games (--search-balance-minigate-games) of the challenger's mini
+        net (seed 0) against the incumbent's, into RUN/balance/itN/minigate.json."""
+        if self.done("balance_minigate"):
+            return
+        out_file = self.balance_file(f"it{self.n}", "minigate.json")
+        games = self.option("search_balance_minigate_games")
+        mini = self.balance_file(f"it{self.n}", "mini")
+        nets = {arm: Path(json.loads((mini / f"{arm}_s0.done").read_text())["onnx"]) for arm in ("inc", "chal")}
+        out, log = self.arms / "balance_minigate", self.arms / "balance_minigate.log"
+        started = time.monotonic()
+        if not out_file.is_file():
+            self.tournament("search balance mini-gate", nets["inc"], out, log, games, 1000 * self.n + 997,
+                            self.args.openings, False, ", challenger mini net vs incumbent mini net",
+                            contender=nets["chal"])
+            summary = match_summary(out / "summary.json", games)
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.with_suffix(".tmp").write_text(json.dumps(
+                {"games": games, **{k: summary[k] for k in ("wins", "losses", "draws", "score", "elo")}},
+                sort_keys=True) + "\n")
+            out_file.with_suffix(".tmp").replace(out_file)
+        wall = time.monotonic() - started
+        self.log(f"it{self.n} search balance mini-gate: {out_file.read_text().strip()}")
+        self.mark("balance_minigate", {"path": str(out_file), "sha256": sha256(out_file), "games": games,
+                                       "wall_s": round(wall, 3),
+                                       "gpu_s": round(wall * self.option("search_balance_gpus"), 3)})
+
+    def balance_finish(self):
+        """After the gate: the mini-gate when it can change the decision, the
+        job accounting, the realised costs and the decision (RUN/balance/itN.json)."""
+        if not self.balance_on() or self.done("balance_decide"):
+            return
+        plan = json.loads(self.balance_file(f"it{self.n}.plan.json").read_text())
+        run, n = self.balance_root, self.n
+        if (plan.get("challenger") and plan.get("minigate_allowed") and not plan.get("revert_test")
+                and self.done("balance_score") and not self.option("no_gate") and not self.done("balance_minigate")):
+            status, log, output = self.balance_call("decide_dry", self.controller_command(
+                "decide", run, n, "--dry", *self.controller_prior_args()))
+            dry = last_json_line(output) if not status else None
+            if dry is None:
+                self.log(f"it{n}: search balance decide --dry failed (exit {status}; see {log}): no mini-gate")
+            elif dry.get("run_minigate"):
+                for count in range(1, ATTEMPTS + 1):
+                    try:
+                        self.balance_minigate(plan)
+                        break
+                    except Exception as error:
+                        self.log(f"it{n}: search balance mini-gate failed: {error} (attempt {count} of {ATTEMPTS})")
+                        if count < ATTEMPTS:
+                            time.sleep(RETRY_SECONDS)
+        status, log, output = self.balance_call("accounting", self.balance_stage_command(
+            "accounting", "--gpus", self.option("search_balance_gpus")))
+        if status:
+            tail = " | ".join(output.strip().splitlines()[-2:])
+            self.log(f"it{n}: search balance accounting failed (exit {status}: {tail}; see {log}): "
+                     f"no gamma sample and only planned overhead this iteration")
+        # realise rewrites its file only before decide has read it (--force: a redone segment changed it).
+        if self.balance_step("realise", self.controller_command("realise", run, n, "--force"))[0]:
+            self.mark("balance_realise", {"path": str(self.balance_file(f"it{n}", "realised.json"))})
+        # A challenger whose mini-trains or scores failed: decide still runs (action none, no evidence) so the
+        # overhead spent, the realised costs and the probe version reach the ledger instead of a failsafe next plan.
+        no_score = ["--no-score"] if plan.get("challenger") and not self.done("balance_score") else []
+        if no_score:
+            self.log(f"it{n}: search balance has no mini-train scores this iteration: decide records no evidence")
+        ok, _ = self.balance_step("decide", self.controller_command("decide", run, n, *self.controller_prior_args(),
+                                                                    *no_score))
+        result_path = self.balance_file(f"it{n}.json")
+        if ok and result_path.is_file():
+            result = json.loads(result_path.read_text())
+            decision = result.get("decision") or {}
+            self.mark("balance_decide", {"path": str(result_path), "sha256": sha256(result_path),
+                                         "action": decision.get("action"), "reason": decision.get("reason")})
+            self.log(f"it{n} search balance decision: {decision.get('action')} ({decision.get('reason')}); "
+                     f"theta* {json.dumps((result.get('state') or {}).get('theta_star'), sort_keys=True)}, "
+                     f"overhead {((result.get('state') or {}).get('overhead') or {}).get('frac')}")
+
     def iteration(self, n):
         self.n, self.it = n, self.runs / f"rl-it{n}"
         self.arms = self.it / "arms"
@@ -1046,15 +1434,22 @@ class Loop:
             (self.it / directory).mkdir(parents=True, exist_ok=True)
         # The generator is fixed for a whole iteration's self-play.
         if not (self.it / "stages" / "generator").is_file():
+            if self.option("search_balance"):
+                self.balance_plan()  # first: workers join once the generator marker exists
             (self.it / "stages" / "generator").write_text(sha256(self.generator) + "\n")
+        elif self.option("search_balance") and not self.done("balance_plan"):
+            self.mark("balance_plan", {"skipped": "the iteration started without --search-balance"})
+            self.log(f"it{n}: started without --search-balance: it plays and trains as it began, "
+                     f"without balance stages")
         self.archive(*range(1, n + 1))
         args = self.args
+        planned = self.planned_segments()
         if self.exchange:
             self.distributed_selfplay()
         elif self.option("shared_selfplay"):
-            if self.games_played() < args.games:
+            if self.selfplay_left():
                 self.run_hook()
-            while self.games_played() < args.games:
+            while self.selfplay_left():
                 if self.shared_segment():
                     continue
                 # Workers hold every segment still needed: play validation meanwhile, then wait.
@@ -1064,6 +1459,10 @@ class Loop:
                 else:
                     self.check_stop()
                     time.sleep(POLL_SECONDS)
+        elif planned is not None:
+            for name, spec in planned.items():
+                self.attempt(self.selfplay, name, spec["games"], spec["seed"], self.it / "search" / "train" / name,
+                             self.it / "search" / "train_run" / name)
         else:
             k = 0
             played = self.games_played()
@@ -1082,12 +1481,15 @@ class Loop:
         if self.exchange:
             self.gather()
         self.attempt(self.train)
+        self.balance_after_train()
         if self.option("no_gate"):
             self.log(f"it{n}: no matches (--no-gate): the generator stays")
+            self.balance_finish()
             self.mark("iteration", {"gate": False})
             return
         self.attempt(self.match, "generator", self.generator)
         self.promote()
+        self.balance_finish()
         self.upload()
         anchor = self.args.anchor_after
         if anchor is not None and n <= anchor:
@@ -1126,7 +1528,9 @@ class Loop:
                  + (f", sequential gate SPRT [{self.option('gate_sprt')[0]:g}, {self.option('gate_sprt')[1]:g}] "
                     f"alpha {self.option('gate_sprt_alpha'):g} beta {self.option('gate_sprt_beta'):g} in chunks of "
                     f"{self.option('gate_chunk')} up to {self.option('gate_max_games') or self.args.match_games} games"
-                    if self.option("gate_sprt") else ""))
+                    if self.option("gate_sprt") else "")
+                 + (f", search balance (controller {self.balance_controller}, files in "
+                    f"{self.balance_file()})" if self.option("search_balance") else ""))
         n = first
         while last is None or n <= last:
             self.iteration(n)
@@ -1275,6 +1679,28 @@ def main():
     parser.add_argument("--gate-max-games", type=even_int, default=None,
                         help="With --gate-sprt, the most games the gate plays; above --match-games "
                              "extends close gates (default: --match-games)")
+    parser.add_argument("--search-balance", action="store_true",
+                        help="Let the search balance controller (docs/search_balance.md) plan each iteration's "
+                             "self-play segments and run its stages; --runs must be RUN/runs, its files go to "
+                             "RUN/balance (default: off)")
+    parser.add_argument("--search-balance-controller", type=Path, default=None,
+                        help="With --search-balance, the controller script (default: $HIVEMIND_SEARCH_BALANCE, "
+                             "else cluster/search_balance.py of the talisman repo above the fork)")
+    parser.add_argument("--search-balance-prior", type=Path, default=None,
+                        help="With --search-balance, the controller's prior (default: RUN/balance/prior.json; "
+                             "without one it holds today's recipe and plans no challenger)")
+    parser.add_argument("--search-balance-mini-steps", type=positive_int, default=200,
+                        help="With --search-balance, steps of each mini-train (default: %(default)s)")
+    parser.add_argument("--search-balance-probe-games", type=positive_int, default=150,
+                        help="With --search-balance, games of a probe refresh (default: %(default)s)")
+    parser.add_argument("--search-balance-minigate-games", type=even_int, default=100,
+                        help="With --search-balance, games of the mini-gate (default: %(default)s)")
+    parser.add_argument("--search-balance-gpus", type=float, default=1.0,
+                        help="With --search-balance, GPUs each stage holds, for GPU-second accounting "
+                             "(default: %(default)s)")
+    parser.add_argument("--search-balance-device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="With --search-balance, where the mini nets are scored (default: cuda if torch "
+                             "sees one)")
     parser.add_argument("--no-gate", action="store_true",
                         help="Skip the matches (and promotion): a smoke test of self-play and training")
     parser.add_argument("--label-check", choices=("on", "off"), default="on",
@@ -1337,6 +1763,26 @@ def main():
     if args.segment_games is None:
         args.segment_games = 1000 if args.distributed else 10_000
     args.local_selfplay = not args.no_local_selfplay
+    if args.search_balance:
+        if args.distributed:
+            parser.error("--search-balance plans local segments: use it without --distributed")
+        if args.games % args.segment_games:
+            parser.error("--search-balance needs --games to be a multiple of --segment-games "
+                         "(the controller plans whole segments)")
+        controller = search_balance_controller(args.search_balance_controller)
+        if controller is None:
+            parser.error(f"--search-balance: no controller at "
+                         f"{args.search_balance_controller or 'cluster/search_balance.py above ' + str(PROJECT_ROOT)}")
+        args.search_balance_controller = controller
+        if args.search_balance_prior is not None:
+            args.search_balance_prior = args.search_balance_prior.resolve()
+            if not args.search_balance_prior.is_file():
+                parser.error(f"--search-balance-prior {args.search_balance_prior} not found")
+    elif any(getattr(args, name) != parser.get_default(name) for name in (
+            "search_balance_controller", "search_balance_prior", "search_balance_mini_steps",
+            "search_balance_probe_games", "search_balance_minigate_games", "search_balance_gpus",
+            "search_balance_device")):
+        parser.error("the --search-balance-* options need --search-balance")
 
     args.generator = args.generator.resolve()
     args.generator_checkpoint = args.generator_checkpoint.resolve()

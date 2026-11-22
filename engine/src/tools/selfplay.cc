@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -24,6 +25,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "search/agent.h"
@@ -773,6 +775,183 @@ void append_pgn(
            << '{' << winnerName << (winner < 0 ? " game" : " won") << " by " << termination << "} *\n\n";
 }
 
+// Playout cap counts (cap_counts.json): records written, deep searches,
+// records written without a policy, and root visits of deep and other searches.
+struct CapCounts {
+    uint64_t records = 0;
+    uint64_t deep = 0;
+    uint64_t masked = 0;
+    uint64_t deepVisits = 0;
+    uint64_t fastVisits = 0;
+
+    void add(const CapCounts& other) {
+        records += other.records;
+        deep += other.deep;
+        masked += other.masked;
+        deepVisits += other.deepVisits;
+        fastVisits += other.fastVisits;
+    }
+};
+
+void write_cap_counts(const std::filesystem::path& path, const CapCounts& counts) {
+    const std::filesystem::path temporaryPath = path.string() + ".tmp";
+    {
+        std::ofstream stream(temporaryPath, std::ios::trunc);
+        stream << "{\"records\": " << counts.records << ", \"deep\": " << counts.deep
+               << ", \"masked\": " << counts.masked << ", \"deep_visits\": " << counts.deepVisits
+               << ", \"fast_visits\": " << counts.fastVisits << "}\n";
+        if (!stream) {
+            throw std::runtime_error("Failed to write " + temporaryPath.string());
+        }
+    }
+    std::filesystem::rename(temporaryPath, path);
+}
+
+static_assert(std::is_trivially_copyable_v<TimeState>,
+              "--record-state-output dumps TimeState bytes; it must stay trivially copyable");
+
+// --record-state-output: the root of one searched record, enough for
+// `hivemind reanalyse` to rebuild it exactly (with the game's moves).
+struct StateLine {
+    size_t prefix = 0;  // moves of the game played before this search
+    uint16_t ply = 0;   // the record's ply (decision index)
+    int team = 0;
+    bool hasTimeAdvantage = false;
+    TimeState clock;
+    bool clockSet = false;  // the search had a clock (searchOptions.clock)
+    std::optional<TimeState> hybridClock;
+    uint64_t noiseSeed = 0;
+    size_t baseNodes = 0;    // the jittered base budget
+    size_t targetNodes = 0;  // what the search was given
+    size_t minNewNodes = 1;
+    float epsilon = 0.0f;
+    bool deep = false;
+    bool masked = false;
+    uint32_t visits = 0;
+};
+
+// What the cap and the state dump keep per game.
+struct CapGameData {
+    CapCounts counts;
+    std::vector<std::pair<int, int>> moves;  // (board, Stockfish::Move) in push order
+    std::vector<StateLine> states;
+};
+
+std::string hex_bytes(const void* data, size_t size);
+
+// TimeState's padding bytes: those whose change leaves the state equal under
+// its member-wise operator== (the low bit of each byte of a default state is
+// flipped in turn). The state dump zeroes them, so the file is a function of the game
+// alone and a resumed run writes the same bytes.
+const std::array<bool, sizeof(TimeState)>& time_state_padding() {
+    static const std::array<bool, sizeof(TimeState)> padding = [] {
+        const TimeState reference;
+        std::array<bool, sizeof(TimeState)> mask{};
+        for (size_t index = 0; index < sizeof(TimeState); ++index) {
+            TimeState probe = reference;
+            unsigned char* bytes = reinterpret_cast<unsigned char*>(&probe);
+            // Only the low bit: a bool member stays a valid bool (0 <-> 1),
+            // so its change is seen; inverting the byte would make it an
+            // invalid bool, which an optimised operator== may misread.
+            bytes[index] = static_cast<unsigned char>(bytes[index] ^ 1u);
+            mask[index] = probe == reference;
+        }
+        return mask;
+    }();
+    return padding;
+}
+
+std::string time_state_hex(const TimeState& state) {
+    unsigned char bytes[sizeof(TimeState)];
+    std::memcpy(bytes, &state, sizeof(TimeState));
+    const auto& padding = time_state_padding();
+    for (size_t index = 0; index < sizeof(TimeState); ++index) {
+        bytes[index] = padding[index] ? 0 : bytes[index];
+    }
+    return hex_bytes(bytes, sizeof(TimeState));
+}
+
+std::string hex_bytes(const void* data, size_t size) {
+    static const char* const digits = "0123456789abcdef";
+    std::string text;
+    text.reserve(size * 2);
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t index = 0; index < size; ++index) {
+        text.push_back(digits[bytes[index] >> 4]);
+        text.push_back(digits[bytes[index] & 15]);
+    }
+    return text;
+}
+
+/**
+ * --record-state-output: one "game" line (the moves pushed on both boards in
+ * order, as (board, Stockfish::Move) pairs) and then one "record" line per
+ * searched record, in record order, holding the search's root: the move
+ * prefix played before it, the team, the clock it searched on and the
+ * hybrid's durative clock (TimeState bytes in hex; same build only), the
+ * root noise seed and epsilon, the budgets, the cap's choice, and the
+ * targets the record got at game end (outcome, WDL loss/draw/win, moves-left
+ * half bits, exactly as writeGame gives the HDST record).
+ */
+void write_state_lines(const std::filesystem::path& path, size_t gameNumber,
+                       const CapGameData& data, const std::vector<TrainingSample>& samples,
+                       int winner, const std::string& termination) {
+    if (data.states.size() != samples.size()) {
+        throw std::runtime_error("State dump lost alignment with the game's records");
+    }
+    std::ofstream stream(path, std::ios::app);
+    if (!stream) {
+        throw std::runtime_error("Unable to append " + path.string());
+    }
+    stream << "{\"type\": \"game\", \"game\": " << gameNumber << ", \"winner\": " << winner
+           << ", \"termination\": \"" << termination << "\", \"moves\": [";
+    for (size_t index = 0; index < data.moves.size(); ++index) {
+        stream << (index ? ", " : "") << '[' << data.moves[index].first << ", "
+               << data.moves[index].second << ']';
+    }
+    stream << "]}\n";
+    const bool finished = termination != "macro-ply limit";
+    const bool resigned = termination == "resignation";
+    for (size_t index = 0; index < data.states.size(); ++index) {
+        const StateLine& state = data.states[index];
+        const int outcome = samples[index].outcome;
+        std::array<int, 3> wdl{0, 0, 0};
+        uint16_t movesLeft = 0;
+        if (finished) {
+            wdl[static_cast<size_t>(outcome + 1)] = 1;
+            const size_t remaining = std::min<size_t>(samples.size() - index, 100);
+            movesLeft = resigned ? distill::MOVES_LEFT_UNKNOWN
+                                 : distill::half_bits(__float2half_rn(
+                                       static_cast<float>(remaining) / 100.0f));
+        }
+        stream << "{\"type\": \"record\", \"game\": " << gameNumber << ", \"record\": " << index
+               << ", \"prefix\": " << state.prefix << ", \"ply\": " << state.ply
+               << ", \"team\": " << state.team
+               << ", \"time_advantage\": " << (state.hasTimeAdvantage ? 1 : 0)
+               << ", \"clock_set\": " << (state.clockSet ? 1 : 0)
+               << ", \"clock\": \"" << time_state_hex(state.clock) << '"'
+               << ", \"hybrid_clock\": ";
+        if (state.hybridClock) {
+            stream << '"' << time_state_hex(*state.hybridClock) << '"';
+        } else {
+            stream << "null";
+        }
+        uint32_t epsilonBits = 0;
+        std::memcpy(&epsilonBits, &state.epsilon, sizeof(epsilonBits));
+        stream << ", \"noise_seed\": " << state.noiseSeed << ", \"base_nodes\": " << state.baseNodes
+               << ", \"target_nodes\": " << state.targetNodes
+               << ", \"min_new_nodes\": " << state.minNewNodes
+               << ", \"epsilon_bits\": " << epsilonBits
+               << ", \"deep\": " << (state.deep ? 1 : 0) << ", \"masked\": " << (state.masked ? 1 : 0)
+               << ", \"visits\": " << state.visits << ", \"outcome\": " << outcome
+               << ", \"wdl\": [" << wdl[0] << ", " << wdl[1] << ", " << wdl[2] << ']'
+               << ", \"moves_left\": " << movesLeft << "}\n";
+    }
+    if (!stream) {
+        throw std::runtime_error("Failed to append " + path.string());
+    }
+}
+
 // How far a checkpointed run got; see run_selfplay.
 struct SelfPlayProgress {
     uint64_t seed = 0;
@@ -781,6 +960,10 @@ struct SelfPlayProgress {
     size_t flushedGames = 0;  // of those, the games in finished chunks
     size_t chunks = 0;        // distillation chunks written
     uintmax_t pgnBytes = 0;   // PGN size after the saved games
+    // Written only when the playout cap / state dump is on, so a stock
+    // checkpoint is unchanged.
+    std::optional<CapCounts> cap;
+    std::optional<uintmax_t> stateBytes;
 };
 
 void write_progress(const std::filesystem::path& path, const SelfPlayProgress& progress) {
@@ -793,6 +976,16 @@ void write_progress(const std::filesystem::path& path, const SelfPlayProgress& p
                << "flushed_games " << progress.flushedGames << '\n'
                << "chunks " << progress.chunks << '\n'
                << "pgn_bytes " << progress.pgnBytes << '\n';
+        if (progress.cap) {
+            stream << "cap_records " << progress.cap->records << '\n'
+                   << "cap_deep " << progress.cap->deep << '\n'
+                   << "cap_masked " << progress.cap->masked << '\n'
+                   << "cap_deep_visits " << progress.cap->deepVisits << '\n'
+                   << "cap_fast_visits " << progress.cap->fastVisits << '\n';
+        }
+        if (progress.stateBytes) {
+            stream << "state_bytes " << *progress.stateBytes << '\n';
+        }
         if (!stream) {
             throw std::runtime_error("Failed to write " + temporaryPath.string());
         }
@@ -820,6 +1013,18 @@ SelfPlayProgress read_progress(const std::filesystem::path& path) {
     progress.flushedGames = values["flushed_games"];
     progress.chunks = values["chunks"];
     progress.pgnBytes = values["pgn_bytes"];
+    if (values.contains("cap_records")) {
+        CapCounts cap;
+        cap.records = values["cap_records"];
+        cap.deep = values["cap_deep"];
+        cap.masked = values["cap_masked"];
+        cap.deepVisits = values["cap_deep_visits"];
+        cap.fastVisits = values["cap_fast_visits"];
+        progress.cap = cap;
+    }
+    if (values.contains("state_bytes")) {
+        progress.stateBytes = values["state_bytes"];
+    }
     return progress;
 }
 
@@ -882,6 +1087,7 @@ void append_pgn_move(
 
 /// What one seat-clock game produced (see play_seat_clock_game).
 struct SeatClockGameResult {
+    CapGameData cap;
     std::vector<TrainingSample> samples;
     std::vector<distill::Record> distillRecords;
     std::vector<PgnMove> pgnMoves;
@@ -1000,6 +1206,9 @@ SeatClockGameResult play_seat_clock_game(
                 const bool capture = board.is_capture(boardNumber, move);
                 const Stockfish::PieceType hand = board.hand_piece_type(boardNumber, move);
                 board.push_move(boardNumber, move);
+                if (!config.recordStateOutput.empty()) {
+                    result.cap.moves.emplace_back(boardNumber, static_cast<int>(move));
+                }
                 game.landed(seat, capture, hand);
             }
             if (rawInitializationActive) {
@@ -1074,7 +1283,10 @@ SeatClockGameResult play_seat_clock_game(
                 agent.reset_search_state();
             }
             SearchOptions searchOptions;
-            searchOptions.targetNodes = randomized_node_budget(config, randomEngine);
+            const size_t baseNodes = randomized_node_budget(config, randomEngine);
+            // Playout cap: with it off, the base budget and configured noise.
+            const CapDecision cap = cap_decision(config, runId, gameIndex, decisions, baseNodes);
+            searchOptions.targetNodes = cap.targetNodes;
             searchOptions.retainForReuse = false;
             if (teamTreeReuse) {
                 // Fix 1: the adopted visits count toward the budget, as
@@ -1100,7 +1312,7 @@ SeatClockGameResult play_seat_clock_game(
                 searchOptions.search.certifySelectedMove = false;
             }
             searchOptions.search.rootDirichletAlpha = config.dirichletAlpha;
-            searchOptions.search.rootDirichletEpsilon = config.dirichletEpsilon;
+            searchOptions.search.rootDirichletEpsilon = cap.dirichletEpsilon;
             searchOptions.search.rootNoiseSeed = selfplay_seed(
                 runId, gameIndex * config.maxMacroPlies + decisions);
             searchOptions.clock = clock;
@@ -1108,6 +1320,23 @@ SeatClockGameResult play_seat_clock_game(
                 // Spec v6: the trigger reads this decision's durative clock.
                 searchOptions.hybrid.knobs = config.wave2.hybrid;
                 searchOptions.hybrid.clock = game.hybrid_clock(team, sides, event.seats);
+            }
+            StateLine state;
+            if (!config.recordStateOutput.empty()) {
+                state.prefix = result.cap.moves.size();
+                state.ply = sample.macroPly;
+                state.team = sample.team;
+                state.hasTimeAdvantage = hasTimeAdvantage;
+                state.clock = clock;
+                state.clockSet = true;
+                state.hybridClock = searchOptions.hybrid.clock;
+                state.noiseSeed = searchOptions.search.rootNoiseSeed;
+                state.baseNodes = baseNodes;
+                state.targetNodes = searchOptions.targetNodes;
+                state.minNewNodes = searchOptions.minNewNodes;
+                state.epsilon = searchOptions.search.rootDirichletEpsilon;
+                state.deep = cap.deep;
+                state.masked = cap.masked;
             }
             const JointActionCandidate choice = agent.run_search(
                 board, threadEngines, team, hasTimeAdvantage, searchOptions);
@@ -1186,7 +1415,22 @@ SeatClockGameResult play_seat_clock_game(
                     board, BOARD_A, board.side_to_move(BOARD_A) == team, edges);
                 record.policy[1] = distill_search_policy(
                     board, BOARD_B, board.side_to_move(BOARD_B) == ~team, edges);
+                if (cap.masked) {
+                    // Fast record: value, WDL and moves-left targets only.
+                    record.policy[0].clear();
+                    record.policy[1].clear();
+                }
                 result.distillRecords.push_back(std::move(record));
+            }
+            if (config.cap_active()) {
+                ++result.cap.counts.records;
+                result.cap.counts.deep += cap.deep ? 1 : 0;
+                result.cap.counts.masked += cap.masked ? 1 : 0;
+                (cap.deep ? result.cap.counts.deepVisits : result.cap.counts.fastVisits) += actualVisits;
+            }
+            if (!config.recordStateOutput.empty()) {
+                state.visits = sample.nodes;
+                result.cap.states.push_back(state);
             }
             SeatClockRow row;
             row.sample = result.samples.size();
@@ -1206,14 +1450,15 @@ SeatClockGameResult play_seat_clock_game(
             result.seats.rows.push_back(row);
             result.samples.push_back(std::move(sample));
 
-            if (checksResign && result.wouldResignTeam < 0) {
+            // Playout cap: only full-budget searches judge resigning.
+            if (cap.feedsResign && checksResign && result.wouldResignTeam < 0) {
                 consecutiveResignPlies[teamIndex] = rootQ <= config.resignThreshold
                     ? consecutiveResignPlies[teamIndex] + 1 : 0;
                 if (consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
                     result.wouldResignTeam = static_cast<int>(teamIndex);
                 }
             }
-            if (canResign) {
+            if (canResign && cap.feedsResign) {
                 if (rootQ <= config.resignThreshold) {
                     if (++consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
                         result.winner = 1 - static_cast<int>(teamIndex);
@@ -1287,6 +1532,45 @@ SeatClockGameResult play_seat_clock_game(
 
 } // namespace
 
+CapDecision cap_decision(const SelfPlayConfig& config, uint64_t runId, size_t gameIndex,
+                         size_t decision, size_t baseNodes) {
+    CapDecision cap;
+    cap.targetNodes = baseNodes;
+    cap.dirichletEpsilon = config.dirichletEpsilon;
+    if (!config.cap_active()) {
+        return cap;
+    }
+    // Its own stream, never the game's: both arms of a twin pair draw the
+    // same openings, raw-policy plies and noise seeds.
+    const uint64_t bits = selfplay_seed(
+        0, selfplay_seed(runId ^ config.capSeedSalt, gameIndex * config.maxMacroPlies + decision));
+    const double unit = static_cast<double>(bits >> 11) * 0x1.0p-53;
+    const size_t fast = config.fast_nodes();
+    const bool reduced = fast < config.nodes;
+    cap.deep = unit < config.deepFraction;
+    if (cap.deep) {
+        cap.targetNodes = baseNodes * std::max<size_t>(1, config.deepMultiplier);
+        cap.dirichletEpsilon = config.deepDirichlet ? config.dirichletEpsilon : 0.0f;
+    } else {
+        if (fast != config.nodes) {
+            cap.targetNodes = std::max<size_t>(1, static_cast<size_t>(std::llround(
+                static_cast<double>(baseNodes) * static_cast<double>(fast)
+                / static_cast<double>(config.nodes))));
+        }
+        if (reduced && !config.fastDirichlet) {
+            cap.dirichletEpsilon = 0.0f;
+        }
+        cap.masked = config.fast_policy_masked();
+    }
+    cap.feedsResign = cap.deep || !reduced;
+    return cap;
+}
+
+std::vector<distill::PolicyEntry> selfplay_distill_policy(
+    Board& board, int boardNumber, bool onTurn, const std::vector<RootEdgeStats>& edges) {
+    return distill_search_policy(board, boardNumber, onTurn, edges);
+}
+
 int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& config) {
     if (config.games == 0 || config.nodes == 0 || config.maxMacroPlies == 0) {
         throw std::invalid_argument("games, nodes, and max-macro-plies must be positive");
@@ -1304,6 +1588,12 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         || config.nodeRandomFactor >= 1.0
         || !(config.treeReuseMinNewFraction >= 0.0 && config.treeReuseMinNewFraction <= 1.0)) {
         throw std::invalid_argument("Invalid self-play exploration configuration");
+    }
+    if (!(config.deepFraction >= 0.0 && config.deepFraction <= 1.0)
+        || config.deepMultiplier == 0 || config.deepMultiplier > 64
+        || config.fastNodes > config.nodes * 64
+        || config.fastPolicyMask < -1 || config.fastPolicyMask > 1) {
+        throw std::invalid_argument("Invalid playout cap configuration");
     }
     const bool checkpointing = config.checkpointGames > 0;
     if ((checkpointing || config.resume) && config.writeTrainingChunks) {
@@ -1372,6 +1662,48 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             config.distillOutputDirectory, distillPrefix,
             config.distillChunkPositions, resumed.has_value());
     }
+    // Playout cap counts (cap_counts.json, next to the distillation chunks)
+    // and the state dump, both restored from the progress record on resume.
+    const bool capActive = config.cap_active();
+    const std::filesystem::path capCountsPath =
+        (config.distillOutputDirectory.empty() ? config.outputDirectory
+                                               : config.distillOutputDirectory)
+        / "cap_counts.json";
+    CapCounts capTotals;
+    const bool recordStates = !config.recordStateOutput.empty();
+    if (resumed && capActive) {
+        if (!resumed->cap) {
+            throw std::invalid_argument(
+                "Self-play checkpoint was written without the playout cap options");
+        }
+        capTotals = *resumed->cap;
+    }
+    if (recordStates) {
+        if (resumed) {
+            if (!resumed->stateBytes) {
+                throw std::invalid_argument(
+                    "Self-play checkpoint was written without --record-state-output");
+            }
+            std::filesystem::resize_file(config.recordStateOutput, *resumed->stateBytes);
+        } else {
+            if (std::filesystem::exists(config.recordStateOutput)) {
+                throw std::invalid_argument("--record-state-output must not exist yet");
+            }
+            if (config.recordStateOutput.has_parent_path()) {
+                std::filesystem::create_directories(config.recordStateOutput.parent_path());
+            }
+            std::ofstream stream(config.recordStateOutput, std::ios::trunc);
+            stream << "{\"type\": \"header\", \"version\": 1, \"seed\": " << runId
+                   << ", \"nodes\": " << config.nodes
+                   << ", \"max_macro_plies\": " << config.maxMacroPlies
+                   << ", \"seat_clocks\": " << (config.wave2.seat_clocks() ? "true" : "false")
+                   << ", \"input_channels\": " << NB_INPUT_CHANNELS
+                   << ", \"time_state_bytes\": " << sizeof(TimeState) << "}\n";
+            if (!stream) {
+                throw std::runtime_error("Unable to write " + config.recordStateOutput.string());
+            }
+        }
+    }
     std::vector<distill::Record> unchunked;  // since the last chunk or checkpoint file
     size_t unchunkedFirst = 0;
     size_t flushedGames = 0;
@@ -1404,6 +1736,13 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         progress.chunks = distillWriter ? distillWriter->chunks_written() : 0;
         progress.pgnBytes = std::filesystem::exists(pgnPath)
             ? std::filesystem::file_size(pgnPath) : 0;
+        if (capActive) {
+            progress.cap = capTotals;
+            write_cap_counts(capCountsPath, capTotals);
+        }
+        if (recordStates) {
+            progress.stateBytes = std::filesystem::file_size(config.recordStateOutput);
+        }
         write_progress(progressPath, progress);
     };
     // Games run in `parallelGames` threads, each with its own engine, so the
@@ -1430,6 +1769,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         int wouldResignTeam;
         // Seat-clock games (--base-mix) only.
         std::optional<SeatClockSummary> seats;
+        // Playout cap counts and --record-state-output lines.
+        CapGameData cap;
     };
     std::map<size_t, FinishedGame> finishedGames;
     size_t nextOutput = firstGame;
@@ -1486,6 +1827,13 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             }
         }
         const size_t sampleCount = game.samples.size();
+        if (capActive) {
+            capTotals.add(game.cap.counts);
+        }
+        if (recordStates) {
+            write_state_lines(config.recordStateOutput, gameNumber, game.cap,
+                              game.samples, game.winner, game.termination);
+        }
         if (config.writeTrainingChunks) {
             chunkWriter.append(std::move(game.samples));
         }
@@ -1553,7 +1901,15 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             std::cout << " resign-check " << (right ? "right" : "wrong");
         }
         // Piped to `hivemind contribute`, which counts these lines.
-        std::cout << '\n' << std::flush;
+        std::cout << '\n';
+        if (capActive) {
+            // Its own line: the game line's parsers (labels.py, run_metrics.py)
+            // end the termination at known keywords.
+            std::cout << "selfplay cap game " << (gameNumber + 1) << " records "
+                      << game.cap.counts.records << " deep " << game.cap.counts.deep
+                      << " masked " << game.cap.counts.masked << '\n';
+        }
+        std::cout << std::flush;
     };
     auto playGames = [&](const std::vector<Engine*>& threadEngines) {
         std::vector<__half> distillPlanes(NB_INPUT_VALUES());
@@ -1615,6 +1971,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             int wouldResignTeam = -1;
 
             std::optional<SeatClockSummary> seats;
+            CapGameData capData;
+            const bool recordStates = !config.recordStateOutput.empty();
             if (config.wave2.seat_clocks()) {
                 SeatClockGameResult played = play_seat_clock_game(
                     config, threadEngines, agents, rawPolicyEvaluator, distillPlanes,
@@ -1651,6 +2009,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                     }
                 }
                 seats = std::move(played.seats);
+                capData = std::move(played.cap);
             }
 
             for (size_t macroPly = 0; !seats && macroPly < config.maxMacroPlies; ++macroPly) {
@@ -1673,12 +2032,18 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                                 board, BOARD_A, rawAction.moveA, moveNumbers, pgnMoves.size(),
                                 config.initialClockSeconds, pgnMoves);
                             board.push_move(BOARD_A, rawAction.moveA);
+                            if (recordStates) {
+                                capData.moves.emplace_back(BOARD_A, static_cast<int>(rawAction.moveA));
+                            }
                         }
                         if (rawAction.moveB != Stockfish::MOVE_NONE) {
                             append_pgn_move(
                                 board, BOARD_B, rawAction.moveB, moveNumbers, pgnMoves.size(),
                                 config.initialClockSeconds, pgnMoves);
                             board.push_move(BOARD_B, rawAction.moveB);
+                            if (recordStates) {
+                                capData.moves.emplace_back(BOARD_B, static_cast<int>(rawAction.moveB));
+                            }
                         }
                         rawPolicyMacroPlies++;
                         rawPolicyEvents = pgnMoves.size();
@@ -1709,7 +2074,9 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                         std::memory_order_relaxed);
                 }
                 SearchOptions searchOptions;
-                searchOptions.targetNodes = randomized_node_budget(config, randomEngine);
+                const size_t baseNodes = randomized_node_budget(config, randomEngine);
+                const CapDecision cap = cap_decision(config, runId, gameIndex, macroPly, baseNodes);
+                searchOptions.targetNodes = cap.targetNodes;
                 // The moves played are sampled, so the subtree worth keeping is
                 // the one they lead to, retained before this team's next search.
                 searchOptions.retainForReuse = false;
@@ -1731,7 +2098,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                     searchOptions.search.certifySelectedMove = false;
                 }
                 searchOptions.search.rootDirichletAlpha = config.dirichletAlpha;
-                searchOptions.search.rootDirichletEpsilon = config.dirichletEpsilon;
+                searchOptions.search.rootDirichletEpsilon = cap.dirichletEpsilon;
                 searchOptions.search.rootNoiseSeed = selfplay_seed(runId, gameIndex * config.maxMacroPlies + macroPly);
                 if (config.clockModel) {
                     searchOptions.clock = time;
@@ -1744,6 +2111,22 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                             time, team, board.side_to_move(BOARD_A),
                             board.side_to_move(BOARD_B), durative);
                     }
+                }
+                StateLine state;
+                if (recordStates) {
+                    state.prefix = capData.moves.size();
+                    state.ply = sample.macroPly;
+                    state.team = sample.team;
+                    state.hasTimeAdvantage = hasTimeAdvantage;
+                    state.clockSet = searchOptions.clock.has_value();
+                    state.clock = searchOptions.clock.value_or(time);
+                    state.noiseSeed = searchOptions.search.rootNoiseSeed;
+                    state.baseNodes = baseNodes;
+                    state.targetNodes = searchOptions.targetNodes;
+                    state.minNewNodes = searchOptions.minNewNodes;
+                    state.epsilon = searchOptions.search.rootDirichletEpsilon;
+                    state.deep = cap.deep;
+                    state.masked = cap.masked;
                 }
                 const JointActionCandidate choice = agent.run_search(
                     board, threadEngines, team, hasTimeAdvantage, searchOptions);
@@ -1786,18 +2169,32 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                         board, BOARD_A, board.side_to_move(BOARD_A) == team, edges);
                     record.policy[1] = distill_search_policy(
                         board, BOARD_B, board.side_to_move(BOARD_B) == ~team, edges);
+                    if (cap.masked) {
+                        record.policy[0].clear();
+                        record.policy[1].clear();
+                    }
                     distillRecords.push_back(std::move(record));
+                }
+                if (config.cap_active()) {
+                    ++capData.counts.records;
+                    capData.counts.deep += cap.deep ? 1 : 0;
+                    capData.counts.masked += cap.masked ? 1 : 0;
+                    (cap.deep ? capData.counts.deepVisits : capData.counts.fastVisits) += actualVisits;
+                }
+                if (recordStates) {
+                    state.visits = sample.nodes;
+                    capData.states.push_back(state);
                 }
                 samples.push_back(std::move(sample));
 
-                if (checksResign && wouldResignTeam < 0) {
+                if (cap.feedsResign && checksResign && wouldResignTeam < 0) {
                     consecutiveResignPlies[teamIndex] = rootQ <= config.resignThreshold
                         ? consecutiveResignPlies[teamIndex] + 1 : 0;
                     if (consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
                         wouldResignTeam = team == Stockfish::WHITE ? 0 : 1;
                     }
                 }
-                if (canResign) {
+                if (canResign && cap.feedsResign) {
                     if (rootQ <= config.resignThreshold) {
                         consecutiveResignPlies[teamIndex]++;
                         if (consecutiveResignPlies[teamIndex] >= config.resignConsecutivePlies) {
@@ -1830,12 +2227,18 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                         board, BOARD_A, action.moveA, moveNumbers, pgnMoves.size(),
                         config.initialClockSeconds, pgnMoves);
                     board.push_move(BOARD_A, action.moveA);
+                    if (recordStates) {
+                        capData.moves.emplace_back(BOARD_A, static_cast<int>(action.moveA));
+                    }
                 }
                 if (action.moveB != Stockfish::MOVE_NONE) {
                     append_pgn_move(
                         board, BOARD_B, action.moveB, moveNumbers, pgnMoves.size(),
                         config.initialClockSeconds, pgnMoves);
                     board.push_move(BOARD_B, action.moveB);
+                    if (recordStates) {
+                        capData.moves.emplace_back(BOARD_B, static_cast<int>(action.moveB));
+                    }
                 }
 
                 team = ~team;
@@ -1865,7 +2268,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             finishedGames.emplace(gameIndex, FinishedGame{
                 std::move(samples), std::move(distillRecords), std::move(pgnMoves), winner,
                 startingTeam, rawPolicyMacroPlies, rawPolicyEvents, std::move(termination),
-                initialTime, time, wouldResignTeam, std::move(seats)});
+                initialTime, time, wouldResignTeam, std::move(seats), std::move(capData)});
             for (auto next = finishedGames.find(nextOutput); next != finishedGames.end();
                  next = finishedGames.find(nextOutput)) {
                 writeGame(next->first, next->second);
@@ -1903,6 +2306,12 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     chunkWriter.finish();
     if (distillWriter) {
         distillWriter->flush();
+    }
+    if (capActive) {
+        write_cap_counts(capCountsPath, capTotals);
+        std::cout << "selfplay cap: " << capTotals.records << " records, " << capTotals.deep
+                  << " deep, " << capTotals.masked << " masked, visits deep "
+                  << capTotals.deepVisits << " other " << capTotals.fastVisits << '\n';
     }
     if (checkpointing) {
         std::filesystem::remove_all(checkpointDirectory);

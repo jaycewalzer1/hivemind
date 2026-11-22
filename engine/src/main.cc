@@ -6,6 +6,7 @@
 #include "nn/embedded_files.h"
 #include "tools/benchmark.h"
 #include "tools/selfplay.h"
+#include "tools/reanalyse.h"
 #include "tools/teacher_data.h"
 #include "tools/search_diag.h"
 #include "environment/planes.h"
@@ -136,6 +137,14 @@ void printUsage(const char* progName) {
     cout << "    --distill-output <dir> (also write HDST chunks of the search targets)" << endl;
     cout << "    --distill-chunk-positions <n> --parallel-games <n> --root-scans <bool>" << endl;
     cout << "    --training-chunks <bool> (write HVM6 chunks; default true)" << endl;
+    cout << "    Playout cap (docs/search_balance.md; all off by default):" << endl;
+    cout << "    --deep-fraction <f> (share of searched decisions given a deep search; 0)" << endl;
+    cout << "    --deep-multiplier <k> (deep budget = k x the node budget; 1)" << endl;
+    cout << "    --fast-nodes <n> (budget of the other decisions; 0 = --nodes)" << endl;
+    cout << "    --fast-policy-mask <bool> (write the other decisions' records without a policy;" << endl;
+    cout << "      default: true when --fast-nodes < --nodes) --fast-dirichlet <bool> (false)" << endl;
+    cout << "    --deep-dirichlet <bool> (true) --cap-seed-salt <n> (0x5EEDCA9)" << endl;
+    cout << "    --record-state-output <file.jsonl> (every record's search root, for reanalyse)" << endl;
     cout << "    --resign-threshold <q> --resign-consecutive-plies <n> --resign-disable-fraction <x>" << endl;
     cout << "      (q < 0 resigns; resigned games keep their result but no moves-left target)" << endl;
     cout << "    --tree-reuse <bool> --tree-reuse-min-new-fraction <x> (keep the played move's subtree)" << endl;
@@ -180,6 +189,10 @@ void printUsage(const char* progName) {
     cout << "    tournament only: --hybrid-side both|contender|baseline (default both)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
+    cout << "  reanalyse [options] Re-search the roots of selfplay --record-state-output as HDST records" << endl;
+    cout << "    --model <onnx> --states <jsonl> --output <dir> [--source-dst <dir|file> ..]" << endl;
+    cout << "    --nodes <n> (0: the recorded budgets) --replay-noise <bool> --dirichlet <bool>" << endl;
+    cout << "    --select <f> --skip-deep <bool> --parallel-engines <n> and the selfplay wave 2 options" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;
     cout << "    --model <onnx> --positions <n> --threads <n> --batch-size <n> --output <dir>" << endl;
     cout << "    --seed <n> --max-macro-plies <n> --chunk-positions <n> --random-move-prob <x> --fens <bool>" << endl;
@@ -380,6 +393,15 @@ int main(int argc, char* argv[]) {
                 else if (option == "--dirichlet-alpha") config.dirichletAlpha = stof(value);
                 else if (option == "--dirichlet-epsilon") config.dirichletEpsilon = stof(value);
                 else if (option == "--batch-size") config.batchSize = stoi(value);
+                // Playout cap (docs/search_balance.md section 6), off by default.
+                else if (option == "--deep-fraction") config.deepFraction = stod(value);
+                else if (option == "--deep-multiplier") config.deepMultiplier = stoull(value);
+                else if (option == "--fast-nodes") config.fastNodes = stoull(value);
+                else if (option == "--fast-policy-mask") config.fastPolicyMask = parse_bool_argument(value) ? 1 : 0;
+                else if (option == "--fast-dirichlet") config.fastDirichlet = parse_bool_argument(value);
+                else if (option == "--deep-dirichlet") config.deepDirichlet = parse_bool_argument(value);
+                else if (option == "--cap-seed-salt") config.capSeedSalt = stoull(value, nullptr, 0);
+                else if (option == "--record-state-output") config.recordStateOutput = value;
                 else if (parse_clock_option(option, value, config.clockModel, config.clock)) {}
                 else if (parse_wave2_option(option, value, config.wave2)) {}
                 else throw invalid_argument("Unknown selfplay option: " + option);
@@ -443,6 +465,96 @@ int main(int argc, char* argv[]) {
             return run_selfplay(engines, config);
         } catch (const exception& error) {
             cerr << "Self-play failed: " << error.what() << endl;
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (argc > 1 && string(argv[1]) == "reanalyse") {
+        // docs/search_balance.md section 6: re-search the roots a self-play
+        // run dumped with --record-state-output and write HDST records.
+        ReanalyseConfig config;
+        filesystem::path modelPath;
+        size_t parallelEngines = 1;
+        int batchSize = SearchParams::BATCH_SIZE;
+        try {
+            for (int i = 2; i < argc; ++i) {
+                const string option = argv[i];
+                if (i + 1 >= argc) {
+                    throw invalid_argument("Missing value for " + option);
+                }
+                const string value = argv[++i];
+                if (option == "--model" || option == "--network") modelPath = value;
+                else if (option == "--states") config.statesFile = value;
+                else if (option == "--source-dst") {
+                    const filesystem::path source = value;
+                    if (filesystem::is_directory(source)) {
+                        vector<filesystem::path> files;
+                        for (const auto& entry : filesystem::directory_iterator(source)) {
+                            if (entry.path().extension() == ".dst") {
+                                files.push_back(entry.path());
+                            }
+                        }
+                        sort(files.begin(), files.end());
+                        config.sourceFiles.insert(config.sourceFiles.end(), files.begin(), files.end());
+                    } else {
+                        config.sourceFiles.push_back(source);
+                    }
+                }
+                else if (option == "--output") config.outputDirectory = value;
+                else if (option == "--nodes") config.nodes = stoull(value);
+                else if (option == "--replay-noise") config.replayNoise = parse_bool_argument(value);
+                else if (option == "--dirichlet") config.dirichlet = parse_bool_argument(value);
+                else if (option == "--dirichlet-alpha") config.dirichletAlpha = stof(value);
+                else if (option == "--dirichlet-epsilon") config.dirichletEpsilon = stof(value);
+                else if (option == "--select") config.select = stod(value);
+                else if (option == "--select-salt") config.selectSalt = stoull(value, nullptr, 0);
+                else if (option == "--skip-deep") config.skipDeep = parse_bool_argument(value);
+                else if (option == "--fairy-stockfish-mate-nodes") config.fairyStockfishMateNodes = stoull(value);
+                else if (option == "--root-scans") config.rootScans = parse_bool_argument(value);
+                else if (option == "--distill-chunk-positions") config.chunkPositions = stoull(value);
+                else if (option == "--parallel-engines") parallelEngines = stoull(value);
+                else if (option == "--batch-size") batchSize = stoi(value);
+                else if (parse_wave2_option(option, value, config.wave2)) {}
+                else throw invalid_argument("Unknown reanalyse option: " + option);
+            }
+            config.wave2.validate();
+            if (config.statesFile.empty() || config.outputDirectory.empty()) {
+                throw invalid_argument("reanalyse needs --states and --output");
+            }
+            if (parallelEngines < 1 || batchSize < 1 || batchSize > 1024) {
+                throw invalid_argument("--parallel-engines and --batch-size must be positive");
+            }
+        } catch (const exception& error) {
+            cerr << "Invalid reanalyse arguments: " << error.what() << endl;
+            return EXIT_FAILURE;
+        }
+        const string onnxFile = resolveModelPath(modelPath.string());
+        if (onnxFile.empty()) {
+            cerr << "No ONNX model found; pass --model <onnx>" << endl;
+            return EXIT_FAILURE;
+        }
+        vector<unique_ptr<Engine>> ownedEngines;
+        vector<Engine*> engines;
+        for (int deviceId = 0; deviceId < deviceCount; ++deviceId) {
+            for (size_t copy = 0; copy < parallelEngines; ++copy) {
+                auto engine = make_unique<Engine>(deviceId, batchSize);
+                const string engineFile = getEnginePath(onnxFile, "fp16", batchSize, deviceId, "v3");
+                if (!engine->loadNetwork(onnxFile, engineFile)) {
+                    cerr << "Failed to load engine on device " << deviceId << endl;
+                    return EXIT_FAILURE;
+                }
+                engines.push_back(engine.get());
+                ownedEngines.push_back(std::move(engine));
+            }
+        }
+        if (engines.empty()) {
+            cerr << "Failed to load an engine on any device" << endl;
+            return EXIT_FAILURE;
+        }
+        try {
+            return run_reanalyse(engines, config);
+        } catch (const exception& error) {
+            cerr << "reanalyse failed: " << error.what() << endl;
             return EXIT_FAILURE;
         }
     }

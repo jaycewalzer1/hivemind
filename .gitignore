@@ -219,3 +219,6 @@ __marimo__/
 /data/
 # Vendored inference runtimes fetched by tools/fetch_onnxruntime.py
 third_party/
+
+# cluster/build_sp1.sh lock (talisman)
+engine/.build-*.lock

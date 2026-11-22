@@ -112,6 +112,7 @@ set(LIB_SOURCES
     src/interface/uci.cc
     src/tools/benchmark.cc
     src/tools/selfplay.cc
+    src/tools/reanalyse.cc
     src/tools/teacher_data.cc
     src/tools/distill_data.cc
     src/tools/search_diag.cc

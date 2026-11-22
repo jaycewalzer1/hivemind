@@ -8,6 +8,7 @@ loop) moved to Hugging Face are downloaded back first."""
 
 import argparse
 from datetime import datetime
+import json
 import math
 import os
 from pathlib import Path
@@ -50,14 +51,65 @@ def positions(dirs):
     return sum(chunk_positions(path) for path in chunk_paths(dirs))
 
 
+CAP_COUNTS = "cap_counts.json"
+
+
+def chunk_policy_positions(path):
+    """Positions in a chunk with a policy on at least one board (playout-cap
+    fast records carry none), from its header and policy counts alone."""
+    import numpy as np
+    from hivemind.distill.data import HEADER_BYTES, _header
+    with open(path, "rb") as stream:
+        n, _, planes, _ = _header(stream.read(HEADER_BYTES), path)
+        # plane bits i64, plane values f16, value f32, wdl 3xf32, moves-left f16,
+        # ply u16, outcome i8, then policy_count 2xu16 (hivemind.distill.data.read_chunk).
+        stream.seek(HEADER_BYTES + n * planes * 10 + n * (4 + 12 + 2 + 2 + 1))
+        counts = np.frombuffer(stream.read(4 * n), np.uint16).reshape(n, 2)
+    if len(counts) != n:
+        raise ValueError(f"{path}: truncated chunk")
+    return int((counts.sum(1, dtype=np.int64) > 0).sum())
+
+
+def policy_positions(dirs):
+    """Positions that carry a policy target: records minus the playout cap's
+    masked (fast) records, per the engine's cap_counts.json next to each
+    directory's chunks. A source without that sidecar (every run without the
+    cap) counts like positions(), so this equals it at the stock recipe. When
+    a sidecar's record count disagrees with the chunks (a segment cut short or
+    merged), the chunks' own policy counts are used instead."""
+    from hivemind.distill.data import chunk_paths, chunk_positions
+    total = 0
+    for source in dirs:
+        source = Path(source)
+        paths = chunk_paths([source])
+        sidecar = (source if source.is_dir() else source.parent) / CAP_COUNTS
+        if not sidecar.is_file():
+            total += sum(chunk_positions(path) for path in paths)
+            continue
+        counts = json.loads(sidecar.read_text())
+        records = sum(chunk_positions(path) for path in paths)
+        if source.is_dir() and int(counts["records"]) == records:
+            total += records - int(counts["masked"])
+        else:
+            total += sum(chunk_policy_positions(path) for path in paths)
+    return total
+
+
+# How a run counts the positions its passes are over (search balance
+# steps_rule): every record, or only policy-carrying ones when self-play
+# writes playout-cap fast records.
+STEPS_RULES = {"positions": positions, "policy_positions": policy_positions}
+
+
 # Settings the RL loop trained with, applied to the distill-train process.
 TRAINING_ENV = {"OMP_NUM_THREADS": "2", "PYTORCH_ALLOC_CONF": "expandable_segments:True"}
 
 
 def distill_command(init, data, val, replay, steps, fraction, batch_size, seed, out,
-                    teacher_val=(), extra=(), lr="1e-4", trunk_lr=None):
+                    teacher_val=(), extra=(), lr="1e-4", trunk_lr=None, q_blend=None):
     """The `hivemind distill-train` command line of one RL iteration;
-    `trunk_lr` gives the trunk its own, smaller rate (a fine-tune)."""
+    `trunk_lr` gives the trunk its own, smaller rate (a fine-tune);
+    `q_blend` (search balance lambda) adds --search-q-blend when non-zero."""
     return [
         sys.executable, "-m", "hivemind", "distill-train",
         "--init", str(Path(init).resolve()),
@@ -81,6 +133,7 @@ def distill_command(init, data, val, replay, steps, fraction, batch_size, seed, 
         "--search-wdl-weight", "1",
         "--search-moves-left-weight", "0.1",
         "--out", str(out),
+        *(["--search-q-blend", str(q_blend)] if q_blend else []),
         *extra,
     ]
 
@@ -111,6 +164,10 @@ def main():
                         default=[TEACHER_VAL] if TEACHER_VAL.is_dir() else [],
                         help="Teacher validation chunks, scored for reference only "
                              "(default: data/distill/val when present; pass no value to skip)")
+    parser.add_argument("--steps-rule", choices=sorted(STEPS_RULES), default="positions",
+                        help="What the passes count: every record (default) or only records with a "
+                             "policy target (policy_positions, for self-play with playout-cap fast "
+                             "records; cap_counts.json)")
     parser.add_argument("--dry-run", action="store_true", help="Print the command and exit")
     args, extra = parser.parse_known_args()
     if args.batch_size < 1 or args.new_passes <= 0 or args.replay_passes < 0:
@@ -126,13 +183,15 @@ def main():
 
     for directory in dict.fromkeys([*args.data, *args.val, *args.replay, *args.teacher_val]):
         archive.restore(directory)
-    new, val, old = positions(args.data), positions(args.val), positions(args.replay)
+    count = STEPS_RULES[args.steps_rule]
+    new, val, old = count(args.data), positions(args.val), count(args.replay)
     if not new or not val:
         sys.exit("--data and --val must contain HDST chunks (*.dst).")
     steps, fraction = plan(new, old, args.new_passes, args.replay_passes, args.batch_size)
     out = args.out or OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f"{steps} steps: {new} new positions x{args.new_passes}, {old} replay positions "
-          f"x{args.replay_passes} (replay share {fraction}, batch {args.batch_size})", flush=True)
+          f"x{args.replay_passes} (replay share {fraction}, batch {args.batch_size})"
+          + (f", steps rule {args.steps_rule}" if args.steps_rule != "positions" else ""), flush=True)
     command = distill_command(args.init, args.data, args.val, args.replay, steps, fraction,
                               args.batch_size, args.seed, out, args.teacher_val, extra)
     print(" ".join(command), flush=True)

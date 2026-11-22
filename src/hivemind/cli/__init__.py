@@ -17,6 +17,8 @@ COMMANDS = {
     "restore": ("hivemind.cli.restore", "Download archived data directories back"),
     "fetch-network": ("hivemind.cli.fetch_network", "Download verified network weights"),
     "distill-train": ("hivemind.distill.train", "Distil the teacher into a faster policy-value network"),
+    "reanalyse": ("hivemind.cli.reanalyse", "Search self-play roots again at a deeper budget (search balance)"),
+    "balance": ("hivemind.cli.balance", "Search balance stages: minitrain, score, probe, accounting"),
 }
 
 

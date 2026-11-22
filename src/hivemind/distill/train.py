@@ -56,8 +56,41 @@ def layout(model):
         or model.planes_per_board == NUM_WIDE_CHANNELS_PER_BOARD else "narrow"
 
 
-def _loss_rows(model, batch):
-    """Loss numerators and target masks before normalization."""
+def q_wdl(value):
+    """A WDL target [loss, draw, win] from a root Q in [-1, 1]: win (1 + q) / 2,
+    loss (1 - q) / 2, no draw mass. The engine writes outcome WDL at index
+    outcome + 1 (-1 loss, 0 draw, +1 win) and root Q from the same team's
+    side, so q = +1 is a certain win."""
+    q = value.float().clamp(-1, 1)
+    return torch.stack(((1 - q) / 2, torch.zeros_like(q), (1 + q) / 2), dim=1)
+
+
+def q_blend_rows(batch):
+    """Rows whose WDL target --search-q-blend changes: search rows (source > 0)
+    with an outcome WDL (not a macro-ply-limit game), a policy on at least one
+    board (not a playout-cap fast record: its root Q comes from a smaller
+    search) and a finite root Q in [-1, 1]."""
+    value = batch["value"]
+    source = batch.get("source", torch.zeros_like(value))
+    has_policy = batch["policy"][0][2] | batch["policy"][1][2]
+    return ((source > 0) & (batch["wdl"].sum(1) > 0) & has_policy
+            & torch.isfinite(value) & (value.abs() <= 1))
+
+
+def wdl_target(batch, q_blend=0.0):
+    """The WDL target: the outcome, or with --search-q-blend lambda > 0
+    (1 - lambda) * outcome + lambda * q_wdl(root Q) on q_blend_rows. Lambda 0
+    returns the outcome tensor itself, untouched."""
+    if not q_blend:
+        return batch["wdl"]
+    outcome = batch["wdl"].float()
+    blended = (1 - q_blend) * outcome + q_blend * q_wdl(batch["value"])
+    return torch.where(q_blend_rows(batch).unsqueeze(1), blended, outcome)
+
+
+def _loss_rows(model, batch, q_blend=0.0):
+    """Loss numerators and target masks before normalization. `q_blend` mixes
+    root Q into the WDL target (wdl_target); 0 is the outcome alone."""
     outputs = model(batch["planes"])
     value, (policy_a, policy_b), _, wdl_logits, plys = outputs[:5]
     per_row = {}
@@ -67,7 +100,7 @@ def _loss_rows(model, batch):
         log_probs = F.log_softmax(logits.float().masked_fill(~legal, float("-inf")), dim=1)
         per_row[name] = (-torch.where(legal, target * log_probs, 0.0).sum(1), mask.float())
     has_wdl = (batch["wdl"].sum(1) > 0).float()
-    per_row["wdl"] = (-(batch["wdl"] * F.log_softmax(wdl_logits.float(), dim=1)).sum(1), has_wdl)
+    per_row["wdl"] = (-(wdl_target(batch, q_blend) * F.log_softmax(wdl_logits.float(), dim=1)).sum(1), has_wdl)
     per_row["value"] = ((value.float().squeeze(1) - batch["value"]) ** 2, torch.ones_like(has_wdl))
     # A resigned game has a result but no length: MOVES_LEFT_UNKNOWN (< 0).
     has_moves_left = has_wdl * (batch["moves_left"] >= 0).float()
@@ -84,13 +117,16 @@ def _source_masks(batch, weights):
     return ((None, torch.ones_like(source, dtype=torch.bool)),)
 
 
-def losses(model, batch, weights):
+def losses(model, batch, weights, q_blend=0.0):
     """Normalize each term within its source, then add fixed source weights.
 
     Flat weights retain a single mean over all applicable rows. Unlabelled
-    games contribute to neither WDL nor moves-left.
+    games contribute to neither WDL nor moves-left. `q_blend` (training only,
+    --search-q-blend) blends root Q into the search rows' WDL target; the
+    validation metrics (evaluate) keep the outcome target, so runs with
+    different lambdas report comparable losses.
     """
-    per_row, outputs = _loss_rows(model, batch)
+    per_row, outputs = _loss_rows(model, batch, q_blend)
     total, terms = 0.0, {}
     for name, (loss, valid) in per_row.items():
         for source, mask in _source_masks(batch, weights):
@@ -222,6 +258,11 @@ def main():
                         help="Weight of game-result WDL on search rows (only finished games carry one)")
     parser.add_argument("--search-moves-left-weight", type=float, default=None,
                         help="Default: --moves-left-weight")
+    parser.add_argument("--search-q-blend", type=float, default=0.0, metavar="LAMBDA",
+                        help="Search balance: train the WDL head of search rows that carry a policy "
+                             "and a game result on (1 - LAMBDA) * outcome + LAMBDA * root-Q WDL "
+                             "(win (1 + q) / 2, loss (1 - q) / 2, draw 0). Validation keeps the "
+                             "outcome target. 0 (default) is the outcome alone")
     parser.add_argument("--init", type=Path, default=None,
                         help="Start from this checkpoint (its size and variant replace --size and the "
                              "architecture flags)")
@@ -272,6 +313,8 @@ def main():
     args = parser.parse_args()
     if args.batch_size < 1 or args.eval_batch_size < 1:
         parser.error("--batch-size and --eval-batch-size must be positive")
+    if not 0 <= args.search_q_blend <= 1:
+        parser.error("--search-q-blend must be in [0, 1]")
 
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -374,6 +417,9 @@ def main():
         print(f"search {len(search_pool)} chunks ({search_positions} positions), "
               f"{search_rows}/{args.batch_size} of each batch, val {len(search_val) if search_val else 0}",
               flush=True)
+    if args.search_q_blend:
+        print(f"search q blend {args.search_q_blend}: WDL target of policy-carrying search rows = "
+              f"(1 - lambda) outcome + lambda root-Q WDL", flush=True)
     if replay_pool:
         print(f"replay {len(replay_pool)} chunks "
               f"({sum(chunk_positions(path) for path in replay_pool)} positions), "
@@ -405,7 +451,9 @@ def main():
     for step in range(1, total_steps + 1):
         batch = next_batch()
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            total, _, _ = losses(model, batch, weights)
+            # Lambda 0 makes the same call as before the flag existed.
+            total, _, _ = (losses(model, batch, weights, q_blend=args.search_q_blend)
+                           if args.search_q_blend else losses(model, batch, weights))
         optimizer.zero_grad(set_to_none=True)
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
