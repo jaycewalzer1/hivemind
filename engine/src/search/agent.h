@@ -1225,8 +1225,14 @@ public:
      * generated opponent response beneath it.
      */
     void store_next_root_candidates(Board& board, bool teamHasTimeAdvantage);
-    /** As above, from the clock state the root was searched under. */
-    void store_next_root_candidates(Board& board, const TimeState& rootTime);
+    /**
+     * As above, from the clock state the root was searched under. With
+     * @p played (spec v6 review fix: a triggered hybrid search, whose
+     * refused sit may be the most visited child) the played action's child
+     * is retained when the root has it.
+     */
+    void store_next_root_candidates(Board& board, const TimeState& rootTime,
+                                    const JointActionCandidate* played = nullptr);
 
     /**
      * @brief Keeps searching between moves, from the position our own move creates.

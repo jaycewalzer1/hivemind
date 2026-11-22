@@ -8791,7 +8791,10 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             nextRootCandidates_.clear();
             retain_reuse_candidates(rootNode, board, searchTime_);
         } else if (options.retainForReuse) {
-            store_next_root_candidates(board, searchTime_);
+            // Spec v6 review fix: a triggered hybrid search retains the
+            // played action's subtree (a refused sit may lead on visits).
+            store_next_root_candidates(board, searchTime_,
+                                       hybridMask_ != 0 ? &result : nullptr);
         } else {
             nextRootCandidates_.clear();
         }
@@ -9984,7 +9987,8 @@ void Agent::store_next_root_candidates(Board& board,
 }
 
 void Agent::store_next_root_candidates(Board& board,
-                                       const TimeState& rootTime) {
+                                       const TimeState& rootTime,
+                                       const JointActionCandidate* played) {
     nextRootCandidates_.clear();
 
     if (!rootNode || !rootNode->is_expanded()) {
@@ -9999,8 +10003,24 @@ void Agent::store_next_root_candidates(Board& board,
     }
     
     // Find best child (most visited, with Q-value consideration)
-    int bestIdx = rootNode->get_best_move_idx_with_q_weight(
-        lastRuntimeConfig_.qVetoDelta, lastRuntimeConfig_.qValueWeight);
+    int bestIdx = -1;
+    if (played) {
+        // Spec v6 review fix: the child of the action actually played (a
+        // refused hybrid sit may lead on visits), when the root has it.
+        const int generated = std::min(static_cast<int>(rootNode->get_num_generated()),
+                                       static_cast<int>(children.size()));
+        for (int index = 0; index < generated; ++index) {
+            const JointActionCandidate action = rootNode->get_joint_action(index);
+            if (action.moveA == played->moveA && action.moveB == played->moveB) {
+                bestIdx = index;
+                break;
+            }
+        }
+    }
+    if (bestIdx < 0) {
+        bestIdx = rootNode->get_best_move_idx_with_q_weight(
+            lastRuntimeConfig_.qVetoDelta, lastRuntimeConfig_.qValueWeight);
+    }
     if (bestIdx < 0) {
         // Fallback to most-visited
         int maxVisits = 0;
