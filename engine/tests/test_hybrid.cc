@@ -22,6 +22,7 @@
 #include "search/hybrid.h"
 #include "search/node.h"
 #include "tools/seat_clock_game.h"
+#include "tools/selfplay_policy.h"
 
 // Spec v6, the hybrid (talisman docs/custom_engine_spec_v6_hybrid.md): the
 // v3 joint-action tree chooses the move; the durative clock decides only
@@ -31,6 +32,20 @@
 class AgentHybridPeer {
 public:
     static std::shared_ptr<Node> root(Agent& agent) { return agent.rootNode; }
+    static TimeState search_time(const Agent& agent) { return agent.searchTime_; }
+    static void store_next_roots(Agent& agent, Board& board, const TimeState& time,
+                                 const JointActionCandidate* played) {
+        agent.store_next_root_candidates(board, time, played);
+    }
+    /** Whether tree reuse retained @p node (the subtree root it indexes first). */
+    static bool retains(const Agent& agent, const Node* node) {
+        for (const auto& [hash, candidate] : agent.nextRootCandidates_) {
+            if (candidate.node.get() == node) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 class UCIHybridPeer {
@@ -286,6 +301,135 @@ TEST_F(HybridRules, NodeAndCandidateSizesUnchanged) {
     EXPECT_EQ(sizeof(JointActionRules), 7u);
     EXPECT_EQ(sizeof(JointActionCandidate), 48u);
     EXPECT_EQ(sizeof(Node), 1040u);
+}
+
+// ---- review fixes ---------------------------------------------------------------------
+
+TEST_F(HybridRules, ReviewFix_SitMarkIsNotKeyedAndOneShot) {
+    const TimeState plain = TimeState::clocked(WHITE, -2000, 200, 300, 200);
+    const TimeState moved = plain.with_hybrid_event(1);
+    const TimeState sat = plain.with_hybrid_event(1, true);
+    EXPECT_FALSE(moved.hybrid_event_below_sit());
+    EXPECT_TRUE(sat.hybrid_event_below_sit());
+    EXPECT_EQ(sat.hybrid_event_board(), 1);
+    // Not in the key: the sit's position is no moving child's.
+    EXPECT_EQ(sat.exact_key(), moved.exact_key());
+    // No mark, no flag; the next advance() clears both.
+    EXPECT_FALSE(plain.with_hybrid_event(-1, true).hybrid_event_below_sit());
+    TimeState next = sat;
+    next.advance(BLACK, false);
+    EXPECT_FALSE(next.hybrid_event_below_sit());
+    EXPECT_EQ(next, plain.after(BLACK, false));
+}
+
+/**
+ * Review fix 1: a depth-1 node (Black to play, B alone on turn) whose
+ * children are all proven lost for it. Its one move on B is m; the pass on B
+ * is what the must-move mask drops.
+ */
+NodeType all_children_won(bool lead, uint8_t mustMove, bool* provesAll = nullptr,
+                          NodeType childType = NodeType::WIN) {
+    const Stockfish::Move m = Stockfish::Move(1);
+    SearchParams::RuntimeConfig config;
+    auto node = std::make_shared<Node>(BLACK);
+    EXPECT_TRUE(node->try_init_and_expand({MOVE_NONE}, {m, MOVE_NONE}, {1.0f}, {0.9f, 0.1f},
+                                          lead, false, true, config, {}, {}, {}, {}, 0, 0,
+                                          -1, {}, {}, mustMove));
+    JointActionCandidate expanded;
+    while (node->expand_next_joint_child(nullptr, 0, expanded, config)) {
+    }
+    for (int index = 0; index < static_cast<int>(node->get_num_generated()); ++index) {
+        node->update_child_node_type(index, childType);
+    }
+    if (provesAll) {
+        *provesAll = node->proves_from_all_children();
+    }
+    return node->get_node_type();
+}
+
+TEST_F(HybridRules, ReviewFix_MaskedNodeBelowAMoveProvesNoLossOrDraw) {
+    bool provesAll = true;
+    // Black leads: v3 lets it sit on B, the mask dropped that pass, and the
+    // one move left losing proves nothing (the sit may hold).
+    EXPECT_EQ(all_children_won(true, 2, &provesAll), NodeType::UNSOLVED);
+    EXPECT_FALSE(provesAll);
+    EXPECT_EQ(all_children_won(true, 2, nullptr, NodeType::DRAW), NodeType::UNSOLVED);
+    // A winning child still proves the node: the mask only removes actions.
+    EXPECT_EQ(all_children_won(true, 2, nullptr, NodeType::LOSS), NodeType::WIN);
+    // Below the hybrid sit the proof stands ("assumes event", spec v6 10).
+    EXPECT_EQ(all_children_won(true, 2 | HYBRID_MUST_MOVE_BELOW_SIT, &provesAll), NodeType::LOSS);
+    EXPECT_TRUE(provesAll);
+    // Behind, the pass was never v3's to drop: the proof stands.
+    EXPECT_EQ(all_children_won(false, 2, &provesAll), NodeType::LOSS);
+    EXPECT_TRUE(provesAll);
+    // No mask: the stock solver.
+    EXPECT_EQ(all_children_won(true, 0, &provesAll), NodeType::LOSS);
+    EXPECT_TRUE(provesAll);
+    // The generator keeps the board bits only (the expanded rules).
+    const Stockfish::Move m = Stockfish::Move(1);
+    SearchParams::RuntimeConfig config;
+    Node node(BLACK);
+    ASSERT_TRUE(node.try_init_and_expand({MOVE_NONE}, {m, MOVE_NONE}, {1.0f}, {0.9f, 0.1f}, true,
+                                         false, true, config, {}, {}, {}, {}, 0, 0, -1, {}, {},
+                                         2 | HYBRID_MUST_MOVE_BELOW_SIT));
+    EXPECT_EQ(node.expanded_rules().mustMoveBoards, 2);
+}
+
+RootEdgeStats edge(Stockfish::Move a, Stockfish::Move b, int visits, NodeType type) {
+    RootEdgeStats stats;
+    stats.action.moveA = a;
+    stats.action.moveB = b;
+    stats.visits = visits;
+    stats.childType = type;
+    return stats;
+}
+
+TEST_F(HybridRules, ReviewFix_HybridPolicyTargetNeverHoldsTheSit) {
+    const Stockfish::Move m1 = Stockfish::Move(1);
+    const Stockfish::Move m2 = Stockfish::Move(2);
+    const RootEdgeStats sit = edge(MOVE_NONE, MOVE_NONE, 50, NodeType::LOSS);
+    const RootEdgeStats a = edge(m1, MOVE_NONE, 30, NodeType::UNSOLVED);
+    const RootEdgeStats b = edge(m2, MOVE_NONE, 20, NodeType::UNSOLVED);
+    const auto hasSit = [](const std::vector<RootEdgeStats>& edges) {
+        return std::any_of(edges.begin(), edges.end(), [](const RootEdgeStats& e) {
+            return e.action.moveA == MOVE_NONE && e.action.moveB == MOVE_NONE;
+        });
+    };
+    // The bug: a root WIN only through the sit narrows the stock target to the sit.
+    const std::vector<RootEdgeStats> all{sit, a, b};
+    const auto stock = selfplay_policy_edges(all, NodeType::WIN, sit.action, false);
+    ASSERT_EQ(stock.size(), 1u);
+    EXPECT_TRUE(hasSit(stock));
+    // Fixed: the moves, read as an unsolved root's.
+    auto target = hybrid_policy_edges(all, NodeType::WIN, sit.action, false);
+    EXPECT_FALSE(hasSit(target));
+    EXPECT_EQ(target.size(), 2u);
+    // Certified sit: the same.
+    target = hybrid_policy_edges(all, NodeType::WIN, sit.action, true);
+    EXPECT_FALSE(hasSit(target));
+    EXPECT_EQ(target.size(), 2u);
+    // A move proven too: the solved filter keeps that move alone.
+    const RootEdgeStats won = edge(m2, MOVE_NONE, 20, NodeType::LOSS);
+    target = hybrid_policy_edges({sit, a, won}, NodeType::WIN, sit.action, false);
+    ASSERT_EQ(target.size(), 1u);
+    EXPECT_EQ(target[0].action.moveA, m2);
+    // A lost root whose choice is the sit: every move, never the sit.
+    const RootEdgeStats lostSit = edge(MOVE_NONE, MOVE_NONE, 50, NodeType::WIN);
+    const RootEdgeStats lostA = edge(m1, MOVE_NONE, 30, NodeType::WIN);
+    const RootEdgeStats lostB = edge(m2, MOVE_NONE, 20, NodeType::WIN);
+    target = hybrid_policy_edges({lostSit, lostA, lostB}, NodeType::LOSS, lostSit.action, true);
+    EXPECT_FALSE(hasSit(target));
+    EXPECT_EQ(target.size(), 2u);
+    // Every move lost, the sit not: the moves, as an unsolved root with no alternative.
+    target = hybrid_policy_edges({edge(MOVE_NONE, MOVE_NONE, 50, NodeType::UNSOLVED), lostA, lostB},
+                                 NodeType::UNSOLVED, a.action, false);
+    EXPECT_FALSE(hasSit(target));
+    EXPECT_EQ(target.size(), 2u);
+    // An unsolved root with a move choice: the stock filter without the sit.
+    target = hybrid_policy_edges({edge(MOVE_NONE, MOVE_NONE, 50, NodeType::UNSOLVED), a, b},
+                                 NodeType::UNSOLVED, a.action, false);
+    EXPECT_EQ(target.size(), 2u);
+    EXPECT_FALSE(hasSit(target));
 }
 
 // ---- 1.x the trigger -----------------------------------------------------------------
@@ -699,6 +843,74 @@ TEST_F(HybridIt13, Test2_5_NoCycleBelowTheSit) {
             });
             EXPECT_FALSE(rootBelow) << hybrid_event_lands_name(lands);
         }
+    }
+}
+
+TEST_F(HybridIt13, ReviewFix_ProofsBelowMovingChildrenNeedNoEvent) {
+    // HybridEventLands all, our lead -2 s: Bw may sit on B under v3, so every
+    // depth-1 node below a moving child that the mask touched proves no loss
+    // or draw; the sit's node keeps its proofs (assumes event).
+    Agent agent(2);
+    const Run all = search(agent, Seats(), 4000, gate());
+    ASSERT_EQ(all.report.trigger.mask, 1);
+    const std::shared_ptr<Node> root = AgentHybridPeer::root(agent);
+    ASSERT_TRUE(root && root->is_expanded());
+    const std::vector<std::shared_ptr<Node>> children = root->get_children();
+    int movers = 0;
+    for (size_t index = 0; index < children.size() && index < root->get_num_generated(); ++index) {
+        const std::shared_ptr<Node>& child = children[index];
+        if (!child || !child->is_expanded()) {
+            continue;
+        }
+        if (sits(root->get_joint_action(static_cast<int>(index)))) {
+            EXPECT_TRUE(child->proves_from_all_children());
+            continue;
+        }
+        if (child->expanded_rules().mustMoveBoards == 0) {
+            continue;
+        }
+        ++movers;
+        EXPECT_FALSE(child->proves_from_all_children());
+        EXPECT_NE(child->get_node_type(), NodeType::LOSS) << all.output;
+        EXPECT_NE(child->get_node_type(), NodeType::DRAW) << all.output;
+    }
+    EXPECT_GT(movers, 0);
+    // A proof the root stands on is the sit's or none: no "score mate" for a move.
+    if (all.rootType == NodeType::WIN) {
+        EXPECT_TRUE(sits(all.choice)) << all.output;
+        EXPECT_EQ(all.output.find("score mate"), std::string::npos) << all.output;
+    }
+}
+
+TEST_F(HybridIt13, ReviewFix_ReuseRetainsThePlayedChild) {
+    Agent agent(2);
+    const Run on = search(agent, Seats(), 2000, gate());
+    ASSERT_EQ(on.report.trigger.mask, 1);
+    const std::shared_ptr<Node> root = AgentHybridPeer::root(agent);
+    ASSERT_TRUE(root && root->is_expanded());
+    const std::vector<std::shared_ptr<Node>> children = root->get_children();
+    // The search's own retention is the played action's child.
+    int playedIdx = -1;
+    int moveIdx = -1;
+    for (size_t index = 0; index < children.size() && index < root->get_num_generated(); ++index) {
+        const JointActionCandidate action = root->get_joint_action(static_cast<int>(index));
+        if (action.moveA == on.choice.moveA && action.moveB == on.choice.moveB) {
+            playedIdx = static_cast<int>(index);
+        } else if (!sits(action) && children[index] && moveIdx < 0) {
+            moveIdx = static_cast<int>(index);
+        }
+    }
+    ASSERT_GE(playedIdx, 0);
+    ASSERT_GE(moveIdx, 0);
+    EXPECT_TRUE(AgentHybridPeer::retains(agent, children[playedIdx].get()));
+    // A move played other than the root's best (a refused sit): its child
+    // is retained, not the best one's.
+    Board board = boards(kKnightA, kKnightB);
+    const JointActionCandidate move = root->get_joint_action(moveIdx);
+    AgentHybridPeer::store_next_roots(agent, board, AgentHybridPeer::search_time(agent), &move);
+    EXPECT_TRUE(AgentHybridPeer::retains(agent, children[moveIdx].get()));
+    if (moveIdx != playedIdx) {
+        EXPECT_FALSE(AgentHybridPeer::retains(agent, children[playedIdx].get()));
     }
 }
 

@@ -830,7 +830,15 @@ durative sit-off rule allows the sit; T6 our seat's clock `>= max(HybridMinClock
   `TimeState::with_hybrid_event(Y)` after `advance()`. The mark is one-shot (the next `advance()` clears it) and keyed
   only while set. `process_batch` turns it into `JointActionRules::mustMoveBoards`: a pass on Y is illegal while Y can
   move. `can_sit` and the terminal rules are untouched.
-* A non-empty mask drops an exact-hash retained root.
+* Only the sit's proofs may rest on the event (review fix, 2026-11-22). The sit's depth-1 state carries
+  `TimeState::hybrid_event_below_sit()` (not keyed), which `process_batch` passes as `HYBRID_MUST_MOVE_BELOW_SIT`
+  next to the board bit. A depth-1 node below a moving root child whose mask dropped an action v3 allows (the
+  opponent leads, or its move on the other board captures; `JointActionCandidateGenerator::mustMoveDropsLegalAction`)
+  is solved only by a winning child: `Node::proves_from_all_children()` is false and it never becomes LOSS or DRAW
+  over its children, so no "score mate" and no solved-root early exit rest on a pass the real opponent still has.
+* A non-empty mask drops an exact-hash retained root. After a triggered search, tree reuse retains the played
+  action's child, not the most-visited one (a refused sit may lead on visits; `store_next_root_candidates` with the
+  played action).
 * After the tree, `Agent::hybrid_excluded_index` is the one predicate. A sit qualifies with `q_sit >= q_act + margin`
   and 10% of the root's visits, where `q_act` is the q-weighted best child that is not the sit; a proof through the sit
   also qualifies. An unqualified sit is excluded from:
@@ -848,14 +856,17 @@ durative sit-off rule allows the sit; T6 our seat's clock `>= max(HybridMinClock
 **Self-play and tournament.** `search_clock` is split into `v3_clock` and `durative_clock(sitGate)`, bit for bit as
 before. Under `--hybrid-mode`:
 * each search gets `hybrid_clock()`;
-* the hybrid sit edge is never a policy target, and it is sampled only if it qualified;
+* the hybrid sit edge is never a policy target, and it is sampled only if it qualified. It is dropped before the
+  solved-root filter (`hybrid_policy_edges`): a root WIN only through the sit, or the sit as a certified or lost
+  root's choice, leaves the other edges read as an unsolved root's, never `[sit]`;
 * a played hybrid sit's pass also ends at `hybrid_pass_cap_ms`: `min(PassCapK x budget, 1.5 x budget + 1,
   eventMs + 100)`;
 * telemetry: per game `hybrid <played>/<triggered>/<searches> recent w<n> b<n>` (sits in each team's last two
   decisions), `selfplay hybrid: ...` at the end, and `tournament hybrid game ...` per game.
 
-Tests: `engine/tests/test_hybrid.cc`, 18 tests: spec 0.2, 0.4, 1.1-1.6, the self-play wake cap, and on it13 2.1-2.5
-and 2.7. `engine/tests/hybrid_parity.sh` is 0.3. Not built: 2.6 (a fixture where certification or the race veto
+Tests: `engine/tests/test_hybrid.cc`, 23 tests: spec 0.2, 0.4, 1.1-1.6, the self-play wake cap, and on it13 2.1-2.5
+and 2.7; review fixes `ReviewFix_*` (the sit flag, no loss/draw proof below a masked moving child, the policy target
+without the sit, and on it13 the depth-1 proofs and the retained played child). `engine/tests/hybrid_parity.sh` is 0.3. Not built: 2.6 (a fixture where certification or the race veto
 replaces a hybrid sit), and the uniform-network half of 2.4.
 
 What 2.1 shows on it13 (A `6rk/6pp/8/8/8/8/8/6K1[] w`, B `4k3/8/8/8/3q3N/8/8/K7[] w`, lead -2 s, Bw thinking 200 of
