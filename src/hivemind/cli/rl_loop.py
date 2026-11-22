@@ -51,6 +51,18 @@ of the iteration in self-play until the claimed and finished games reach
 trains and gates as before. --selfplay-hook runs a shell command at the start of
 each iteration's self-play (the cluster uses it to submit the worker jobs).
 
+With --gate-sprt ELO0,ELO1 (talisman fork) the match against the generator is
+sequential: it plays --gate-chunk games at a time and stops as soon as a
+generalized SPRT (fishtest's trinomial normal approximation, logistic Elo;
+--gate-sprt-alpha, --gate-sprt-beta) accepts H0 (Elo <= ELO0) or H1 (Elo >=
+ELO1), or at --gate-max-games (default --match-games; larger extends a close
+gate). H1 promotes, H0 does not, and an undecided gate falls back to the score
+rule. The engine restarts a match whose --games changed, so each chunk is its
+own tournament in arms/match_generator/chunkNN (seed 1000 N + chunk, the
+openings rotated so the chunks play them in the order one long match would);
+their games and summary are merged into arms/match_generator itself. The match
+against the fixed baseline keeps its fixed size, so that curve stays comparable.
+
 Stop between stages with: touch RUNS/rl-loop.stop"""
 
 import argparse
@@ -253,7 +265,138 @@ def finished_selfplay(it):
 # when its arguments do not name them.
 WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate": False,
                   "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None,
-                  "wide": False, "arrivals_weight": None, "shared_selfplay": False, "selfplay_hook": None}
+                  "wide": False, "arrivals_weight": None, "shared_selfplay": False, "selfplay_hook": None,
+                  "gate_sprt": None, "gate_sprt_alpha": 0.05, "gate_sprt_beta": 0.05, "gate_chunk": 100,
+                  "gate_max_games": None}
+
+
+# --gate-sprt: the sequential gate against the generator.
+def expected_score(elo):
+    return 1 / (1 + 10 ** (-elo / 400))
+
+
+def score_elo(score):
+    return None if not 0 < score < 1 else 400 * math.log10(score / (1 - score))
+
+
+def sprt_bounds(alpha, beta):
+    """Wald's bounds on the log-likelihood ratio: below the first accepts H0,
+    above the second H1 (-2.94 and 2.94 at fishtest's alpha = beta = 0.05)."""
+    return math.log(beta / (1 - alpha)), math.log((1 - beta) / alpha)
+
+
+def sprt_llr(wins, losses, draws, elo0, elo1):
+    """The GSPRT log-likelihood ratio of H1 (Elo elo1) against H0 (Elo elo0),
+    as fishtest's LLRcalc.LLR_logistic computes it on a trinomial: the score's
+    mean and variance per game from the counts, then N (s1 - s0)(2 mean - s0 -
+    s1) / (2 var). Logistic Elo, the Elo the matches report, rather than
+    BayesElo, whose draw Elo needs draws and bughouse games are seldom drawn. A
+    zero count is taken as 1e-3, as fishtest regularizes, so a one-sided start
+    still moves the ratio."""
+    if wins + losses + draws == 0:
+        return 0.0
+    counts = [max(count, 1e-3) for count in (wins, draws, losses)]
+    n = sum(counts)
+    w, d = counts[0] / n, counts[1] / n
+    mean = w + d / 2
+    var = w + d / 4 - mean ** 2
+    s0, s1 = expected_score(elo0), expected_score(elo1)
+    return n * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var)
+
+
+# The trinomial's variance is meaningless on a handful of games (2-0 gives an LLR
+# past 30), so no bound counts before this many games or the cap.
+SPRT_MIN_GAMES = 100
+
+
+def sprt_decision(llr, bounds, games=SPRT_MIN_GAMES, cap=SPRT_MIN_GAMES):
+    if games < min(SPRT_MIN_GAMES, cap):
+        return None
+    return "H0" if llr <= bounds[0] else "H1" if llr >= bounds[1] else None
+
+
+def rotated_openings(path, skip):
+    """The opening lines of `path` starting at line `skip` (mod their count):
+    the engine opens pair p with line p, so a chunk after `skip` pairs plays the
+    openings one long match would."""
+    lines = [line for line in Path(path).read_text().splitlines() if line.strip() and not line.startswith("#")]
+    skip %= len(lines)
+    return "\n".join(lines[skip:] + lines[:skip]) + "\n"
+
+
+def pair_confidence(outcomes):
+    """95% score interval over colour-swapped pairs, as the engine reports it
+    (paired-opening normal approximation)."""
+    pairs = [(outcomes[i] + outcomes[i + 1] + 2) / 4 for i in range(0, len(outcomes) - 1, 2)]
+    if len(pairs) < 2:
+        return None
+    mean = sum(pairs) / len(pairs)
+    margin = 1.959963984540054 * math.sqrt(sum((p - mean) ** 2 for p in pairs) / (len(pairs) - 1) / len(pairs))
+    return [max(0.0, mean - margin), min(1.0, mean + margin)]
+
+
+def add_counts(total, part):
+    """Sum the integer leaves of two engine summary dicts (breakdowns, terminations)."""
+    for key, value in part.items():
+        if isinstance(value, dict):
+            add_counts(total.setdefault(key, {}), value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+    return total
+
+
+def merge_chunks(out, chunks, sprt):
+    """Write out/summary.json, games.tsv and games.pgn for the chunked match
+    `chunks` [(directory, seed, games)], in the engine's format where the
+    readers of a match look (match_summary, training curves): counts summed,
+    games renumbered, score, Elo and the paired interval recomputed over all."""
+    summaries = [json.loads((directory / "summary.json").read_text()) for directory, _, _ in chunks]
+    rows, outcomes, pgn = [], [], b""
+    perf = {"contender": [0, 0, 0], "baseline": [0, 0, 0]}  # searches, nodes, nanoseconds
+    for directory, _, _ in chunks:
+        lines = (directory / "games.tsv").read_text().splitlines()[1:]
+        for line in lines:
+            fields = line.split("\t")
+            outcomes.append(int(fields[1]))
+            for side, at in (("contender", 5), ("baseline", 8)):
+                for i in range(3):
+                    perf[side][i] += int(fields[at + i])
+            fields[0] = str(len(rows))
+            fields[11] = str(len(pgn) + int(fields[11]))
+            rows.append("\t".join(fields))
+        if (directory / "games.pgn").is_file():
+            pgn += (directory / "games.pgn").read_bytes()
+    wins, losses, draws = (sum(s[key] for s in summaries) for key in ("contender_wins", "baseline_wins", "draws"))
+    games = wins + losses + draws
+    if games != len(outcomes):
+        raise StageFailed(f"{out}: chunk summaries count {games} games, their games.tsv {len(outcomes)}")
+    score = (wins + draws / 2) / games
+    interval = pair_confidence(outcomes)
+    elo_interval = (None if interval is None or interval[0] <= 0 or interval[1] >= 1
+                    else [score_elo(interval[0]), score_elo(interval[1])])
+    first = summaries[0]
+    merged = {key: first[key] for key in first
+              if key not in ("games", "seed", "positions_file", "contender_wins", "baseline_wins", "draws",
+                             "contender_score", "contender_elo", "confidence_method", "score_confidence_95",
+                             "elo_confidence_95", "sprt", "performance", "contender_breakdown", "terminations")}
+    merged.update({
+        "games": games, "seeds": [seed for _, seed, _ in chunks],
+        "chunks": [{"directory": directory.name, "seed": seed, "games": n} for directory, seed, n in chunks],
+        "contender_wins": wins, "baseline_wins": losses, "draws": draws, "contender_score": score,
+        "contender_elo": score_elo(score), "confidence_method": "paired-opening normal approximation",
+        "score_confidence_95": interval, "elo_confidence_95": elo_interval, "sprt": sprt,
+        "performance": {side: {"searches": s, "nodes": nodes, "nps": 1e9 * nodes / ns if ns else 0.0}
+                        for side, (s, nodes, ns) in perf.items()},
+        "contender_breakdown": {}, "terminations": {}})
+    for summary in summaries:
+        add_counts(merged["contender_breakdown"], summary.get("contender_breakdown", {}))
+        add_counts(merged["terminations"], summary.get("terminations", {}))
+    (out / "games.pgn").write_bytes(pgn)
+    seeds = " ".join(f"{directory.name}:{seed}" for directory, seed, _ in chunks)
+    (out / "games.tsv.tmp").write_text("\n".join([f"config\tsequential gate, chunks {seeds}", *rows]) + "\n")
+    (out / "games.tsv.tmp").replace(out / "games.tsv")
+    (out / "summary.json.tmp").write_text(json.dumps(merged, indent=2) + "\n")
+    (out / "summary.json.tmp").replace(out / "summary.json")
 
 
 class Claims:
@@ -728,9 +871,23 @@ class Loop:
         if self.done(f"match_{name}"):
             return
         self.check_stop()
+        if name == "generator" and self.option("gate_sprt"):
+            return self.sequential_match(name, baseline, baseline_time_model)
         out, log = self.arms / f"match_{name}", self.arms / f"match_{name}.log"
         games, movetime, clock = self.args.match_games, self.args.match_movetime, self.args.time_model
         flag_baseline = clock == "clock" and baseline_time_model == "flag"
+        self.tournament(name, baseline, out, log, games, self.n, self.args.openings, flag_baseline)
+        summary = {**match_summary(out / "summary.json", games), "movetime": movetime, "time_model": clock}
+        if not self.option("wave2_options").is_stock:
+            summary["wave2"] = self.option("wave2_options").as_dict()
+        if flag_baseline:
+            summary["baseline_time_model"] = "flag"
+        self.log(f"it{self.n} vs {name}: {json.dumps(summary)}")
+        self.mark(f"match_{name}", summary)
+
+    def tournament(self, name, baseline, out, log, games, seed, openings, flag_baseline, note=""):
+        """Play one engine tournament into `out`, restarting it when a game starts."""
+        movetime, clock = self.args.match_movetime, self.args.time_model
         while True:
             # A resumable match keeps its finished pairs; the engine starts over
             # by itself when they came from another match.
@@ -738,11 +895,11 @@ class Loop:
                 self.aside(out, log)
             self.wait_for_quiet()
             self.log(f"it{self.n} match vs {name} ({baseline}, {games} games at {movetime} ms"
-                     + (", on a simulated clock" if clock == "clock" else "") + ")")
+                     + (", on a simulated clock" if clock == "clock" else "") + note + ")")
             command = [str(self.args.match_engine), "tournament",
                        "--contender", str(self.it / "models" / "C.onnx"), "--baseline", str(baseline),
-                       "--movetime", str(movetime), "--games", str(games), "--seed", str(self.n),
-                       "--positions", str(self.args.openings), "--output", str(out),
+                       "--movetime", str(movetime), "--games", str(games), "--seed", str(seed),
+                       "--positions", str(openings), "--output", str(out),
                        *(("--time-model", "clock") if clock == "clock" else ()),
                        *(("--baseline-time-model", "flag") if flag_baseline else ()),
                        *(("--resume", "true") if self.resume_matches else ()),
@@ -763,29 +920,83 @@ class Loop:
                 continue
             if status:
                 raise StageFailed(f"match vs {name} failed (see {log})")
-            break
-        summary = {**match_summary(out / "summary.json", games), "movetime": movetime, "time_model": clock}
+            return
+
+    def sequential_match(self, name, baseline, baseline_time_model=None):
+        """--gate-sprt: chunks of --gate-chunk games until the SPRT decides or
+        --gate-max-games are played. Each finished chunk leaves
+        match_NAME/chunkNN.done, so a rerun replays the same decisions and plays
+        on from the first unfinished chunk (resumed by the engine where it can)."""
+        out = self.arms / f"match_{name}"
+        out.mkdir(parents=True, exist_ok=True)
+        movetime, clock = self.args.match_movetime, self.args.time_model
+        flag_baseline = clock == "clock" and baseline_time_model == "flag"
+        elo0, elo1 = self.option("gate_sprt")
+        alpha, beta = self.option("gate_sprt_alpha"), self.option("gate_sprt_beta")
+        bounds = sprt_bounds(alpha, beta)
+        cap = self.option("gate_max_games") or self.args.match_games
+        chunks, wins, losses, draws, k = [], 0, 0, 0, 0
+        llr, decision = 0.0, None
+        while decision is None and wins + losses + draws < cap:
+            played = wins + losses + draws
+            directory, marker = out / f"chunk{k:02d}", out / f"chunk{k:02d}.done"
+            seed = 1000 * self.n + k
+            if marker.is_file():
+                result = json.loads(marker.read_text())
+                games = result["games"]
+            else:
+                games = min(self.option("gate_chunk"), cap - played)
+                openings = out / f"chunk{k:02d}.openings.tsv"
+                openings.write_text(rotated_openings(self.args.openings, played // 2))
+                self.check_stop()
+                self.tournament(name, baseline, directory, out / f"chunk{k:02d}.log", games, seed, openings,
+                                flag_baseline, f", chunk {k} of up to {cap} games, seed {seed}")
+                result = {**match_summary(directory / "summary.json", games), "games": games, "seed": seed}
+                marker.with_suffix(".tmp").write_text(json.dumps(result) + "\n")
+                marker.with_suffix(".tmp").replace(marker)
+            chunks.append((directory, seed, games))
+            wins, losses, draws = wins + result["wins"], losses + result["losses"], draws + result["draws"]
+            llr = sprt_llr(wins, losses, draws, elo0, elo1)
+            decision = sprt_decision(llr, bounds, wins + losses + draws, cap)
+            self.log(f"it{self.n} vs {name} after {wins + losses + draws} games: {wins}-{losses}-{draws}, "
+                     f"LLR {llr:.2f} in [{bounds[0]:.2f}, {bounds[1]:.2f}]"
+                     + (f": accepts {decision}" if decision else ""))
+            k += 1
+        played = wins + losses + draws
+        sprt = {"llr": llr, "bounds": list(bounds), "decision": decision or "inconclusive", "elo0": elo0,
+                "elo1": elo1, "alpha": alpha, "beta": beta, "chunk": self.option("gate_chunk"),
+                "max_games": cap, "chunks": len(chunks)}
+        merge_chunks(out, chunks, sprt)
+        summary = {**match_summary(out / "summary.json", played), "movetime": movetime, "time_model": clock}
         if not self.option("wave2_options").is_stock:
             summary["wave2"] = self.option("wave2_options").as_dict()
         if flag_baseline:
             summary["baseline_time_model"] = "flag"
+        summary.update(games=played, sprt=sprt)
         self.log(f"it{self.n} vs {name}: {json.dumps(summary)}")
         self.mark(f"match_{name}", summary)
 
     def promote(self):
         if self.done("promote"):
             return
-        score = json.loads((self.it / "stages" / "match_generator.done").read_text())["score"]
+        result = json.loads((self.it / "stages" / "match_generator.done").read_text())
+        score = result["score"]
         above = self.option("promote_above")
         promoted = score >= 0.5 if above is None else score > above
+        # A sequential gate's decision overrides the score rule; undecided, the rule stands.
+        decision = result.get("sprt", {}).get("decision")
+        if decision in ("H0", "H1"):
+            promoted = decision == "H1"
+        why = f"score {score}" + (f", SPRT {decision}" if "sprt" in result else "")
         if promoted:
             install(self.it / "models" / "C.onnx", self.generator)
             install(self.it / "models" / "C.onnx", self.generator_sp1)
             install(self.arms / "C" / "last.pt", self.checkpoint)
-            self.log(f"it{self.n} promoted (score {score}): it is the generator for it{self.n + 1}")
+            self.log(f"it{self.n} promoted ({why}): it is the generator for it{self.n + 1}")
         else:
-            self.log(f"it{self.n} not promoted (score {score}): the generator stays")
-        self.mark("promote", {"promoted": promoted, "score": score})
+            self.log(f"it{self.n} not promoted ({why}): the generator stays")
+        self.mark("promote", {"promoted": promoted, "score": score,
+                              **({"sprt": decision} if "sprt" in result else {})})
 
     def upload(self):
         """Not fatal: the next iteration's upload retries whatever is missing."""
@@ -887,8 +1098,10 @@ class Loop:
                 self.log(f"it{n}: no fixed-baseline match before it{anchor + 1}")
         elif (self.fixed.is_file() and not self.done(f"match_{self.fixed_name}")
               and sha256(self.fixed) == (self.it / "stages" / "generator").read_text().strip()
-              and self.fixed_time_model == self.args.time_model):
-            # The generator is still the fixed baseline: the same match again.
+              and self.fixed_time_model == self.args.time_model
+              and "sprt" not in json.loads((self.it / "stages" / "match_generator.done").read_text())):
+            # The generator is still the fixed baseline: the same match again
+            # (unless the gate was sequential: the fixed match keeps its size).
             self.log(f"it{n}: the generator is {self.fixed.name}; its match counts for both")
             self.mark(f"match_{self.fixed_name}", {
                 **json.loads((self.it / "stages" / "match_generator.done").read_text()), "same_as": "generator"})
@@ -909,7 +1122,11 @@ class Loop:
                  f"passes new {self.args.new_passes} / replay {self.args.replay_passes}, "
                  f"upload {'off' if self.args.no_upload else self.args.repo}, "
                  f"self-play {'kept on disk' if self.args.keep_selfplay else 'moved to ' + self.args.archive}"
-                 + (f", distributed via {self.exchange}" if self.exchange else ""))
+                 + (f", distributed via {self.exchange}" if self.exchange else "")
+                 + (f", sequential gate SPRT [{self.option('gate_sprt')[0]:g}, {self.option('gate_sprt')[1]:g}] "
+                    f"alpha {self.option('gate_sprt_alpha'):g} beta {self.option('gate_sprt_beta'):g} in chunks of "
+                    f"{self.option('gate_chunk')} up to {self.option('gate_max_games') or self.args.match_games} games"
+                    if self.option("gate_sprt") else ""))
         n = first
         while last is None or n <= last:
             self.iteration(n)
@@ -929,6 +1146,17 @@ def even_int(value):
     if parsed % 2:
         raise argparse.ArgumentTypeError("must be even")
     return parsed
+
+
+def sprt_elos(value):
+    """ELO0,ELO1 of --gate-sprt."""
+    try:
+        elo0, elo1 = (float(part) for part in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be ELO0,ELO1, e.g. 0,15")
+    if not elo1 > elo0:
+        raise argparse.ArgumentTypeError("ELO1 must be above ELO0")
+    return elo0, elo1
 
 
 def onnx_input_planes(path):
@@ -1034,6 +1262,19 @@ def main():
     parser.add_argument("--promote-above", type=float, default=None,
                         help="Promote when the score against the generator is above this (default: at or "
                              "above 0.5; above 0.5 with --wave2, so a tie keeps the generator)")
+    parser.add_argument("--gate-sprt", type=sprt_elos, metavar="ELO0,ELO1",
+                        help="Sequential gate against the generator: stop once an SPRT of H0 Elo <= ELO0 "
+                             "against H1 Elo >= ELO1 decides (e.g. 0,15); H1 promotes, H0 does not, undecided "
+                             "at --gate-max-games falls back to the score rule (default: off, a fixed match)")
+    parser.add_argument("--gate-sprt-alpha", type=float, default=0.05,
+                        help="With --gate-sprt, the false-promotion rate (default: %(default)s)")
+    parser.add_argument("--gate-sprt-beta", type=float, default=0.05,
+                        help="With --gate-sprt, the false-rejection rate (default: %(default)s)")
+    parser.add_argument("--gate-chunk", type=even_int, default=100,
+                        help="With --gate-sprt, games played between SPRT checks (default: %(default)s)")
+    parser.add_argument("--gate-max-games", type=even_int, default=None,
+                        help="With --gate-sprt, the most games the gate plays; above --match-games "
+                             "extends close gates (default: --match-games)")
     parser.add_argument("--no-gate", action="store_true",
                         help="Skip the matches (and promotion): a smoke test of self-play and training")
     parser.add_argument("--label-check", choices=("on", "off"), default="on",
@@ -1077,6 +1318,10 @@ def main():
         parser.error("--shared-selfplay and --distributed are two ways to share self-play: pick one")
     if args.selfplay_hook and not args.shared_selfplay:
         parser.error("--selfplay-hook needs --shared-selfplay")
+    if not (0 < args.gate_sprt_alpha < 1 and 0 < args.gate_sprt_beta < 1):
+        parser.error("--gate-sprt-alpha and --gate-sprt-beta must be in (0, 1)")
+    if args.gate_max_games is not None and not args.gate_sprt:
+        parser.error("--gate-max-games needs --gate-sprt")
     if not -1 < args.resign_threshold <= 0:
         parser.error("--resign-threshold must be in (-1, 0]")
     if args.new_passes <= 0 or args.replay_passes < 0:
