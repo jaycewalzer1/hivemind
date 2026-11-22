@@ -602,9 +602,19 @@ void play_seat_clock_match(const TournamentConfig& config,
         options.search.rootNoiseSeed = tournament_seed(
             config.seed, pairIndex * config.maxMacroPlies + decisions);
         options.clock = clock;
+        if (config.hybridFor(contenderActing)) {
+            // Spec v6: the trigger reads this decision's durative clock.
+            options.hybrid.knobs = config.wave2.hybrid;
+            options.hybrid.clock = game.hybrid_clock(team, sides, event.seats);
+        }
         const auto searchStart = std::chrono::steady_clock::now();
         const JointActionCandidate action = agent.run_search(
             board, engines, team, clock.can_sit(team), options);
+        const HybridReport& hybrid = agent.hybrid_report();
+        const bool hybridSit = hybrid.active && hybrid.trigger.mask != 0
+            && action.moveA == Stockfish::MOVE_NONE && action.moveB == Stockfish::MOVE_NONE;
+        (contenderActing ? continuity.contenderHybrid : continuity.baselineHybrid)
+            .record(hybrid, team, hybridSit);
         const uint64_t searchNanos = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - searchStart).count());
@@ -662,7 +672,10 @@ void play_seat_clock_match(const TournamentConfig& config,
             }
             const Stockfish::Move move = seat / 2 == BOARD_A ? action.moveA : action.moveB;
             if (move == Stockfish::MOVE_NONE) {
-                game.commit_pass(seat, sides);
+                // Spec v6: a hybrid sit also ends at the arena's wake.
+                game.commit_pass(seat, sides,
+                                 hybridSit ? game.hybrid_pass_cap_ms(seat, hybrid.trigger.eventMs)
+                                           : -1);
             } else {
                 committed[seat] = move;
                 game.commit_move(seat);
@@ -1177,6 +1190,23 @@ int run_tournament(
                           << continuity.plansApplied << " other team " << continuity.otherTeamPlans;
             }
             std::cout << ", left at start " << continuity.leftAtStart << '\n';
+        }
+        if (seatGame && config.wave2.hybrid.mode != HybridMode::OFF) {
+            // Spec v6: what the hybrid did in this game, per side, and the
+            // hybrid sits in each team's last two decisions (a sit-off or a
+            // flag right after one is the risk the wake cap bounds).
+            std::cout << "tournament hybrid game " << (gameIndex + 1) << '/' << config.games;
+            for (const bool contenderSide : {true, false}) {
+                if (!config.hybridFor(contenderSide)) {
+                    continue;
+                }
+                const HybridGameStats& stats = contenderSide ? continuity.contenderHybrid
+                                                             : continuity.baselineHybrid;
+                std::cout << (contenderSide ? " contender: " : " baseline: ") << stats.summary()
+                          << ", recent w" << stats.recent_sits(Stockfish::WHITE) << " b"
+                          << stats.recent_sits(Stockfish::BLACK) << ';';
+            }
+            std::cout << " termination " << termination << '\n';
         }
         if (gameIndex % 2 == 1
             && result.sprt.decision != SprtState::Decision::CONTINUE) {

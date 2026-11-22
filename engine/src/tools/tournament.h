@@ -105,6 +105,15 @@ struct TournamentConfig {
     // really leads. This is how a pre-clock engine plays a clocked game.
     bool contenderFlagSearch = false;
     bool baselineFlagSearch = false;
+    // Spec v6 (--hybrid-side): which side searches with wave2.hybrid when its
+    // mode is on: "both", "contender" or "baseline" (the other plays the v3
+    // tree without it, e.g. hybrid vs nodur).
+    std::string hybridSide = "both";
+
+    bool hybridFor(bool isContender) const {
+        return wave2.hybrid.mode != HybridMode::OFF
+            && (hybridSide == "both" || hybridSide == (isContender ? "contender" : "baseline"));
+    }
 
     bool searchesOnClock(bool isContender) const {
         return clockModel
@@ -214,6 +223,9 @@ struct TournamentContinuity {
     uint64_t otherTeamPlans = 0;
     // Agents still holding a team tree or a plan after the game-start clear.
     uint64_t leftAtStart = 0;
+    // Spec v6 (--hybrid-mode): what the hybrid did, per side.
+    HybridGameStats contenderHybrid;
+    HybridGameStats baselineHybrid;
 };
 
 struct TournamentResult {

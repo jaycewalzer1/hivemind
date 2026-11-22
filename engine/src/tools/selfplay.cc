@@ -640,6 +640,8 @@ struct SeatClockSummary {
     int64_t gameMs = 0;
     int flagSeat = -1;
     std::vector<SeatClockRow> rows;
+    // Spec v6 (--hybrid-mode): what the hybrid did in this game.
+    HybridGameStats hybrid;
 };
 
 const char* seat_name(int seat) {
@@ -1034,6 +1036,8 @@ SeatClockGameResult play_seat_clock_game(
         const bool hasTimeAdvantage = clock.can_sit(team);
         JointActionCandidate action;
         bool searched = false;
+        bool hybridSit = false;
+        int32_t hybridEventMs = 0;
         if (rawInitializationActive && decisions < initializationLength) {
             const JointActionCandidate rawAction = sample_raw_policy_action(
                 rawPolicyEngine, rawPolicyEvaluator, board, team, clock,
@@ -1100,6 +1104,11 @@ SeatClockGameResult play_seat_clock_game(
             searchOptions.search.rootNoiseSeed = selfplay_seed(
                 runId, gameIndex * config.maxMacroPlies + decisions);
             searchOptions.clock = clock;
+            if (config.wave2.hybrid.mode != HybridMode::OFF) {
+                // Spec v6: the trigger reads this decision's durative clock.
+                searchOptions.hybrid.knobs = config.wave2.hybrid;
+                searchOptions.hybrid.clock = game.hybrid_clock(team, sides, event.seats);
+            }
             const JointActionCandidate choice = agent.run_search(
                 board, threadEngines, team, hasTimeAdvantage, searchOptions);
             if (teamTreeReuse && agent.team_tree_reuse().attempted) {
@@ -1143,6 +1152,25 @@ SeatClockGameResult play_seat_clock_game(
             sample.nodes = static_cast<uint32_t>(std::min<uint64_t>(
                 actualVisits, std::numeric_limits<uint32_t>::max()));
             edges = selfplay_policy_edges(edges, agent.root_type(), choice, agent.certified_choice());
+            // Spec v6: the root's hybrid sit (the action passing on both
+            // boards of a triggered search) is the game's action at most,
+            // never a policy target; it is sampled only if it qualified.
+            const HybridReport& hybrid = agent.hybrid_report();
+            std::vector<RootEdgeStats> sampleEdges = edges;
+            if (hybrid.trigger.mask != 0) {
+                const auto isSit = [](const RootEdgeStats& edge) {
+                    return edge.action.moveA == Stockfish::MOVE_NONE
+                        && edge.action.moveB == Stockfish::MOVE_NONE;
+                };
+                if (std::any_of(edges.begin(), edges.end(),
+                                [&](const RootEdgeStats& edge) { return !isSit(edge); })) {
+                    std::erase_if(edges, isSit);
+                }
+                const bool sitQualifies = hybrid.qualifies;
+                if (!sitQualifies) {
+                    sampleEdges = edges;
+                }
+            }
             const float rootQ = agent.root_q();
             sample.rootQ = rootQ;
             if (config.writeTrainingChunks) {
@@ -1198,8 +1226,16 @@ SeatClockGameResult play_seat_clock_game(
                     consecutiveResignPlies[teamIndex] = 0;
                 }
             }
-            action = select_action(edges, mcts_temperature(config, decisions), randomEngine);
+            action = select_action(sampleEdges, mcts_temperature(config, decisions), randomEngine);
             searched = true;
+            if (hybrid.active) {
+                hybridSit = hybrid.trigger.mask != 0 && action.moveA == Stockfish::MOVE_NONE
+                    && action.moveB == Stockfish::MOVE_NONE;
+                result.seats.hybrid.record(hybrid, team, hybridSit);
+                if (hybridSit) {
+                    hybridEventMs = hybrid.trigger.eventMs;
+                }
+            }
             if (config.wave2.planCarry) {
                 // Fix 3: only the deciding seats' halves are played. The
                 // half for the team's other on-turn seat is remembered for
@@ -1229,7 +1265,9 @@ SeatClockGameResult play_seat_clock_game(
             }
             const Stockfish::Move move = seat / 2 == BOARD_A ? action.moveA : action.moveB;
             if (move == Stockfish::MOVE_NONE) {
-                game.commit_pass(seat, sides);
+                // Spec v6: a hybrid sit also ends at the arena's wake.
+                game.commit_pass(seat, sides,
+                                 hybridSit ? game.hybrid_pass_cap_ms(seat, hybridEventMs) : -1);
             } else {
                 committed[seat] = move;
                 game.commit_move(seat);
@@ -1414,6 +1452,9 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     std::atomic<uint64_t> planCarryApplied{0};
     std::atomic<uint64_t> planCarryRecorded{0};
     std::map<std::string, uint64_t> planCarryDrops;  // guarded by outputMutex
+    // Spec v6 (--hybrid-mode): what the hybrid did, over all games.
+    std::mutex hybridMutex;
+    HybridGameStats hybridTotals;
     const auto writeGame = [&](size_t gameNumber, FinishedGame& game) {
         if (distillWriter) {
             // Finished games give WDL (loss, draw, win) and moves-left targets
@@ -1492,6 +1533,16 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 std::cout << " flag-seat " << seat_name(seats.flagSeat);
             }
             std::cout << " clocks " << four(seats.finalClocks);
+            if (config.wave2.hybrid.mode != HybridMode::OFF) {
+                // Spec v6: played hybrid sits / triggered / searches, and
+                // the sits in each team's last two decisions.
+                const HybridGameStats& hybrid = seats.hybrid;
+                std::cout << " hybrid " << hybrid.played << '/' << hybrid.triggered << '/'
+                          << hybrid.searches << " recent w" << hybrid.recent_sits(Stockfish::WHITE)
+                          << " b" << hybrid.recent_sits(Stockfish::BLACK);
+                std::lock_guard lock(hybridMutex);
+                hybridTotals.add(hybrid);
+            }
         } else if (game.initialTime.is_clocked()) {
             std::cout << " lead " << game.initialTime.lead_ms(Stockfish::WHITE)
                       << "->" << game.finalTime.lead_ms(Stockfish::WHITE) << " ms";
@@ -1897,6 +1948,9 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             std::cout << ' ' << reason << ' ' << count;
         }
         std::cout << '\n';
+    }
+    if (config.wave2.hybrid.mode != HybridMode::OFF) {
+        std::cout << "selfplay hybrid: " << hybridTotals.summary() << '\n';
     }
     if (resignChecks > 0) {
         std::cout << "selfplay resign check: " << resignChecks

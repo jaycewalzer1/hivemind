@@ -21,6 +21,7 @@ private:
     friend class UCIContinuityPeer;
     friend class UCIContinuityFix3Peer;
     friend class UCIDiagFixesPeer;
+    friend class UCIHybridPeer;
 
     std::thread* mainSearchThread;
     std::unique_ptr<Agent> agent;
@@ -72,6 +73,11 @@ private:
     // with OwnPaceBelowRoot and BlockableCheckNotMate.
     bool planCarry = false;
     int planCarryPermille = 300;
+    // Spec v6, the hybrid (docs/custom_engine_spec_v6_hybrid.md): HybridMode
+    // and its knobs (HybridEventLands, HybridMaxWaitMs, HybridMinClockMs,
+    // HybridMarginPermille, HybridPassPriorPermille); the Hybrid preset sets
+    // the mode. Only under DurativeTree false; off by default.
+    HybridKnobs hybrid;
     // Ceiling for a `go movetime` search extended in a critical position;
     // 0, or anything at or below the movetime, keeps the movetime exact.
     int maxMoveTimeMs = 0;
@@ -80,6 +86,12 @@ private:
     bool clock_model_active() const;
     /** The clock a search should root on, or none under TimeModel flag. */
     std::optional<TimeState> current_clock() const;
+    /**
+     * Spec v6: the durative clock of this decision for the hybrid's trigger
+     * (TimeState::durative on the seat options, SitGate off), or none when
+     * HybridMode is off, under TimeModel flag, or under DurativeTree.
+     */
+    std::optional<TimeState> current_hybrid_clock() const;
     /** Whether our team may sit now, under whichever time model is active. */
     bool team_may_sit() const;
     std::vector<std::unique_ptr<Engine>> engines;

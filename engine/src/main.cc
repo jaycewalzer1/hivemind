@@ -169,6 +169,15 @@ void printUsage(const char* progName) {
     cout << "      negated; needs --durative-tree true)" << endl;
     cout << "    --blockable-check-not-mate <bool> (a check a drop could block is never mate, as in the" << endl;
     cout << "      arena; any tree, also the game's own end check)" << endl;
+    cout << "    Spec v6, the hybrid (docs/wave2_engine.md \"Wave 2d\"; --durative-tree false, --base-mix):" << endl;
+    cout << "    --hybrid-mode off|gate (gate: the v3 root may also sit, when it is behind and on turn on" << endl;
+    cout << "      one board, to wait for the thinking opponent on the other; off by default)" << endl;
+    cout << "    --hybrid <bool> (preset: true = --hybrid-mode gate, false = off)" << endl;
+    cout << "    --hybrid-event-lands all|sit|none (depth-1 rule: the event seat must move below every" << endl;
+    cout << "      root child, below the sit only, or never; default all)" << endl;
+    cout << "    --hybrid-max-wait-ms <0..10000> --hybrid-min-clock-ms <0..600000> (defaults 1000, 3000)" << endl;
+    cout << "    --hybrid-margin-permille <0..1000> --hybrid-pass-prior-permille <0..1000> (defaults 20, 150)" << endl;
+    cout << "    tournament only: --hybrid-side both|contender|baseline (default both)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  gendistill [options] Generate HDST distillation data from teacher-policy games" << endl;
@@ -679,6 +688,12 @@ int main(int argc, char* argv[]) {
                 else if (option == "--sprt-alpha") config.sprtAlpha = stod(value);
                 else if (option == "--sprt-beta") config.sprtBeta = stod(value);
                 else if (option == "--resume") config.resume = parse_bool_argument(value);
+                else if (option == "--hybrid-side") {
+                    if (value != "both" && value != "contender" && value != "baseline") {
+                        throw invalid_argument("--hybrid-side must be both, contender or baseline");
+                    }
+                    config.hybridSide = value;
+                }
                 else if (parse_clock_option(option, value, config.clockModel, config.clock)) {}
                 else if (parse_wave2_option(option, value, config.wave2)) {}
                 else throw invalid_argument("Unknown tournament option: " + option);

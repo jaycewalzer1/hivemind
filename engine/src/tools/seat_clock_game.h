@@ -14,6 +14,7 @@
 
 #include "environment/board.h"
 #include "environment/time_state.h"
+#include "search/hybrid.h"
 #include "tools/clock_sampling.h"
 
 /**
@@ -75,6 +76,12 @@ struct Wave2GameOptions {
     bool ownPaceBelowRoot = false;
     bool waitNodeActingEval = false;
     bool blockableCheckNotMate = false;
+    // Spec v6, the hybrid (UCI HybridMode and knobs; --hybrid-mode,
+    // --hybrid, --hybrid-event-lands, --hybrid-max-wait-ms,
+    // --hybrid-min-clock-ms, --hybrid-margin-permille,
+    // --hybrid-pass-prior-permille): the v3 tree's root may also sit to wait
+    // for a landing on the other board. Seat-clock games with the v3 tree.
+    HybridKnobs hybrid;
 
     bool seat_clocks() const { return !baseMix.empty(); }
 
@@ -87,7 +94,8 @@ struct Wave2GameOptions {
     bool changes_search() const {
         return durativeTree || !sitGate || flagLoss || !instantTransfer
             || mateRaceByLanding || passCapK != 8 || teamTreeReuse || jointPlans
-            || planCarry || ownPaceBelowRoot || waitNodeActingEval;
+            || planCarry || ownPaceBelowRoot || waitNodeActingEval
+            || hybrid.mode != HybridMode::OFF;
     }
 
     /** D5: the game's board (and so every search's copy) plays the arena's mate rule. */
@@ -138,6 +146,29 @@ struct Wave2GameOptions {
         if (teamTreeReuse && (!durativeTree || baseMix.empty())) {
             throw std::invalid_argument(
                 "--team-tree-reuse needs --durative-tree true and seat clocks (--base-mix)");
+        }
+        if (hybrid.maxWaitMs < 0 || hybrid.maxWaitMs > 10000) {
+            throw std::invalid_argument("--hybrid-max-wait-ms must be in 0..10000");
+        }
+        if (hybrid.minClockMs < 0 || hybrid.minClockMs > 600000) {
+            throw std::invalid_argument("--hybrid-min-clock-ms must be in 0..600000");
+        }
+        if (hybrid.marginPermille < 0 || hybrid.marginPermille > 1000
+            || hybrid.passPriorPermille < 0 || hybrid.passPriorPermille > 1000) {
+            throw std::invalid_argument(
+                "--hybrid-margin-permille and --hybrid-pass-prior-permille must be in 0..1000");
+        }
+        if (hybrid.mode == HybridMode::PROBE || hybrid.mode == HybridMode::PRICED) {
+            throw std::invalid_argument(std::string("--hybrid-mode ") + hybrid_mode_name(hybrid.mode)
+                                        + " is not built (spec v6 builds gate first)");
+        }
+        if (hybrid.mode == HybridMode::OFF && hybrid.knobs_changed()) {
+            throw std::invalid_argument("a --hybrid-* knob needs --hybrid-mode gate");
+        }
+        if (hybrid.mode != HybridMode::OFF && (durativeTree || baseMix.empty())) {
+            // The hybrid adds to the v3 tree, and its trigger reads the seat clocks.
+            throw std::invalid_argument(
+                "--hybrid-mode needs --durative-tree false and seat clocks (--base-mix)");
         }
         for (const auto& [base, weight] : baseMix) {
             if (base < 1 || !(weight > 0.0)) {
@@ -215,6 +246,24 @@ inline bool parse_wave2_option(const std::string& option, const std::string& val
     else if (option == "--own-pace-below-root") options.ownPaceBelowRoot = boolean();
     else if (option == "--wait-node-acting-eval") options.waitNodeActingEval = boolean();
     else if (option == "--blockable-check-not-mate") options.blockableCheckNotMate = boolean();
+    else if (option == "--hybrid-mode") {
+        if (!parse_hybrid_mode(value, options.hybrid.mode)) {
+            throw std::invalid_argument("--hybrid-mode expects off/gate/probe/priced, got: " + value);
+        }
+    }
+    else if (option == "--hybrid") {
+        // Preset: gate or off; the knobs keep their values.
+        options.hybrid.mode = boolean() ? HybridMode::GATE : HybridMode::OFF;
+    }
+    else if (option == "--hybrid-event-lands") {
+        if (!parse_hybrid_event_lands(value, options.hybrid.eventLands)) {
+            throw std::invalid_argument("--hybrid-event-lands expects all/sit/none, got: " + value);
+        }
+    }
+    else if (option == "--hybrid-max-wait-ms") options.hybrid.maxWaitMs = std::stoi(value);
+    else if (option == "--hybrid-min-clock-ms") options.hybrid.minClockMs = std::stoi(value);
+    else if (option == "--hybrid-margin-permille") options.hybrid.marginPermille = std::stoi(value);
+    else if (option == "--hybrid-pass-prior-permille") options.hybrid.passPriorPermille = std::stoi(value);
     else if (option == "--continuity") {
         // Preset: the three wave 2c switches with the diagnosis fixes D1 and
         // D5; the knobs keep their values.
@@ -422,8 +471,23 @@ public:
         sittingSince_[seat] = -1;
     }
 
-    /** @p seat decided to pass (see the class comment for how long). */
-    void commit_pass(int seat, const std::array<Stockfish::Color, 2>& sides) {
+    /**
+     * @brief Spec v6: the longest a hybrid sit of @p seat waits: the
+     * arena's wake, min(PassCapK, 1.5) x this decision's budget (its planned
+     * cost), and the expected event time plus 100 ms. Pass it to commit_pass.
+     */
+    int64_t hybrid_pass_cap_ms(int seat, int32_t eventMs) const {
+        const int64_t budget = std::max(1, plannedMs_[seat]);
+        return std::min({static_cast<int64_t>(options_.passCapK) * budget, budget * 3 / 2 + 1,
+                         static_cast<int64_t>(eventMs) + 100});
+    }
+
+    /**
+     * @p seat decided to pass (see the class comment for how long); @p capMs
+     * >= 0 also ends it after that many ms (a hybrid sit, hybrid_pass_cap_ms).
+     */
+    void commit_pass(int seat, const std::array<Stockfish::Color, 2>& sides,
+                     int64_t capMs = -1) {
         const int board = seat / 2;
         const int other = TimeState::seat_of(1 - board, sides[1 - board]);
         // Until the other board's next landing; a seat there that is still
@@ -437,6 +501,9 @@ public:
             wait = std::min<int64_t>(wait, clockMs_[seat]);
         }
         wait = std::min<int64_t>(wait, static_cast<int64_t>(options_.passCapK) * moveTimeMs_[seat]);
+        if (capMs >= 0) {
+            wait = std::min<int64_t>(wait, capMs);
+        }
         wait = std::max<int64_t>(wait, 1);
         kind_[seat] = EventType::DECIDE;
         eventAt_[seat] = nowMs_ + wait;
@@ -490,12 +557,36 @@ public:
      */
     TimeState search_clock(Stockfish::Color team, const std::array<Stockfish::Color, 2>& sides,
                            const std::array<bool, 4>& deciding) const {
-        int32_t budget = 0;
-        for (int seat = 0; seat < 4; ++seat) {
-            if (deciding[seat]) {
-                budget = std::max(budget, plannedMs_[seat]);
-            }
-        }
+        return options_.durativeTree ? durative_clock(team, sides, deciding, options_.sitGate)
+                                     : v3_clock(team, sides, deciding);
+    }
+
+    /**
+     * Spec v6: the durative clock of @p team's decision for the hybrid's
+     * trigger (SitGate off), beside the v3 clock the search runs on.
+     */
+    TimeState hybrid_clock(Stockfish::Color team, const std::array<Stockfish::Color, 2>& sides,
+                           const std::array<bool, 4>& deciding) const {
+        return durative_clock(team, sides, deciding, false);
+    }
+
+    /** search_clock's v3 state: the clocked lead the seat clocks give, the teams' mean paces. */
+    TimeState v3_clock(Stockfish::Color team, const std::array<Stockfish::Color, 2>& sides,
+                       const std::array<bool, 4>& deciding) const {
+        (void)sides;
+        return v3_base(team, deciding).with_sit_gate(options_.sitGate);
+    }
+
+    /** search_clock's durative state, with the sit gate @p sitGate. */
+    TimeState durative_clock(Stockfish::Color team, const std::array<Stockfish::Color, 2>& sides,
+                             const std::array<bool, 4>& deciding, bool sitGate) const {
+        const TimeState base = v3_base(team, deciding).with_sit_gate(sitGate);
+        return TimeState::durative(base, team, sides[0], sides[1],
+                                   durative_seats(team, sides, decision_budget(deciding)));
+    }
+
+    /** v3's clocked state (no gate set) at the lead the seat clocks give, the teams' mean paces. */
+    TimeState v3_base(Stockfish::Color team, const std::array<bool, 4>& deciding) const {
         std::array<int64_t, 2> paceSum{0, 0};
         for (int seat = 0; seat < 4; ++seat) {
             paceSum[TimeState::team_of_seat(seat)] += pace_ms(seat);
@@ -503,11 +594,23 @@ public:
         const int32_t teamPace = static_cast<int32_t>(paceSum[team] / 2);
         const int32_t otherPace = static_cast<int32_t>(paceSum[~team] / 2);
         const int32_t lead = white_lead_ms() * (team == Stockfish::WHITE ? 1 : -1);
-        const TimeState base = TimeState::clocked(team, lead, teamPace, otherPace, budget)
-            .with_sit_gate(options_.sitGate);
-        if (!options_.durativeTree) {
-            return base;
+        return TimeState::clocked(team, lead, teamPace, otherPace, decision_budget(deciding));
+    }
+
+    /** The search's budget: the largest planned cost of the seats deciding now. */
+    int32_t decision_budget(const std::array<bool, 4>& deciding) const {
+        int32_t budget = 0;
+        for (int seat = 0; seat < 4; ++seat) {
+            if (deciding[seat]) {
+                budget = std::max(budget, plannedMs_[seat]);
+            }
         }
+        return budget;
+    }
+
+    /** The durative clock's options for @p team now, on top of decision_budget's root budget. */
+    DurativeConfig durative_seats(Stockfish::Color team, const std::array<Stockfish::Color, 2>& sides,
+                                  int32_t budget) const {
         DurativeConfig config = options_.durative_config();
         config.rootMoveTimeMs = std::max(1, budget);
         for (int seat = 0; seat < 4; ++seat) {
@@ -542,7 +645,7 @@ public:
                     static_cast<int32_t>(ago)};
             }
         }
-        return TimeState::durative(base, team, sides[0], sides[1], config);
+        return config;
     }
 
     /** Wave 2b: searches carry the wide-plane timing (a wide network). */
@@ -629,6 +732,63 @@ private:
     bool wideInputs_ = false;
     std::array<int64_t, 2> lastLandMs_{0, 0};
     std::vector<Landing> landings_;
+};
+
+/**
+ * @brief Spec v6: what the hybrid did in one seat-clock game (self-play or
+ * tournament): searches, those with a non-empty trigger mask, hybrid sits
+ * the root picked, kept (returned) or refused by the margin or visit rule,
+ * and played. `lastTwo[team]`: whether each of that team's last two
+ * decisions played a hybrid sit (newest last), to tell a sit-off or flag
+ * that followed a hybrid sit.
+ */
+struct HybridGameStats {
+    uint64_t searches = 0;
+    uint64_t triggered = 0;
+    uint64_t sitsChosen = 0;
+    uint64_t kept = 0;
+    uint64_t refusedMargin = 0;
+    uint64_t refusedVisits = 0;
+    uint64_t played = 0;
+    std::array<std::array<bool, 2>, 2> lastTwo{};
+
+    /** One search of @p team with the hybrid on; @p playedSit: the game played its hybrid sit. */
+    void record(const HybridReport& report, Stockfish::Color team, bool playedSit) {
+        if (!report.active) {
+            return;
+        }
+        ++searches;
+        triggered += report.trigger.mask != 0 ? 1 : 0;
+        sitsChosen += report.sitChosen ? 1 : 0;
+        kept += report.kept ? 1 : 0;
+        refusedMargin += report.sitChosen && !report.kept && report.reason == "margin" ? 1 : 0;
+        refusedVisits += report.sitChosen && !report.kept && report.reason == "visits" ? 1 : 0;
+        played += playedSit ? 1 : 0;
+        std::array<bool, 2>& recent = lastTwo[static_cast<int>(team)];
+        recent = {recent[1], playedSit};
+    }
+    /** How many of @p team's last two decisions played a hybrid sit. */
+    int recent_sits(Stockfish::Color team) const {
+        const std::array<bool, 2>& recent = lastTwo[static_cast<int>(team)];
+        return (recent[0] ? 1 : 0) + (recent[1] ? 1 : 0);
+    }
+    void add(const HybridGameStats& other) {
+        searches += other.searches;
+        triggered += other.triggered;
+        sitsChosen += other.sitsChosen;
+        kept += other.kept;
+        refusedMargin += other.refusedMargin;
+        refusedVisits += other.refusedVisits;
+        played += other.played;
+    }
+    /** "<sits> sits in <triggered> triggered of <searches> searches, kept <k> / refused margin <m> visits <v>" */
+    std::string summary() const {
+        std::ostringstream text;
+        text << played << " sits in " << triggered << " triggered of " << searches
+             << " searches, kept " << kept << " / refused margin " << refusedMargin
+             << " visits " << refusedVisits;
+        return text.str();
+    }
 };
 
 /**

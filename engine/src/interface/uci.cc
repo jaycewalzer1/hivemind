@@ -267,6 +267,8 @@ void UCI::go(std::istringstream& is) {
     opts.teamTreeReuseToleranceMs = teamTreeReuseToleranceMs;
     opts.planCarry = planCarry;
     opts.planCarryPermille = planCarryPermille;
+    opts.hybrid.knobs = hybrid;
+    opts.hybrid.clock = current_hybrid_clock();
     // Fix 1 keeps the team's whole tree for the next search. The permanent
     // brain charges our action with v3's advance() and re-roots, which would
     // throw that tree away, so it does not run then. Under fix 3 alone the
@@ -697,6 +699,9 @@ void UCI::setoption(std::istringstream& is) {
             else if (name == "InstantTransfer") durativeConfig.instantTransfer = on;
             else durativeConfig.mateRaceByLanding = on;
             std::cout << "info string " << name << " set to " << value << std::endl;
+            if (name == "DurativeTree" && on && hybrid.mode != HybridMode::OFF) {
+                std::cout << "info string Hybrid acts only with DurativeTree false" << std::endl;
+            }
         }
     } else if (name == "TeamTreeReuse") {
         if (value == "true" || value == "false") {
@@ -763,6 +768,48 @@ void UCI::setoption(std::istringstream& is) {
                 std::cout << "info string Continuity acts only with DurativeTree true"
                           << std::endl;
             }
+        }
+    } else if (name == "HybridMode" || name == "Hybrid") {
+        // Spec v6. Hybrid is the preset: true = HybridMode gate, false = off;
+        // the knobs keep their values.
+        HybridMode mode = hybrid.mode;
+        if (name == "Hybrid" && (value == "true" || value == "false")) {
+            mode = value == "true" ? HybridMode::GATE : HybridMode::OFF;
+        } else if (name == "Hybrid" || !parse_hybrid_mode(value, mode)) {
+            return;
+        }
+        if (mode == HybridMode::PROBE || mode == HybridMode::PRICED) {
+            std::cout << "info string HybridMode " << value
+                      << " is not built (spec v6 build order: only if gate shows no gain);"
+                      << " HybridMode stays " << hybrid_mode_name(hybrid.mode) << std::endl;
+            return;
+        }
+        hybrid.mode = mode;
+        std::cout << "info string " << name << " set to " << value
+                  << " (HybridMode " << hybrid_mode_name(hybrid.mode) << ")" << std::endl;
+        if (hybrid.mode != HybridMode::OFF && durativeTree) {
+            std::cout << "info string Hybrid acts only with DurativeTree false" << std::endl;
+        }
+    } else if (name == "HybridEventLands" || name == "HybridMaxWaitMs"
+               || name == "HybridMinClockMs" || name == "HybridMarginPermille"
+               || name == "HybridPassPriorPermille") {
+        if (name == "HybridEventLands") {
+            if (!parse_hybrid_event_lands(value, hybrid.eventLands)) {
+                return;
+            }
+            std::cout << "info string HybridEventLands set to " << value << std::endl;
+        } else {
+            int32_t& knob = name == "HybridMaxWaitMs" ? hybrid.maxWaitMs
+                : name == "HybridMinClockMs" ? hybrid.minClockMs
+                : name == "HybridMarginPermille" ? hybrid.marginPermille
+                                                 : hybrid.passPriorPermille;
+            const int32_t high = name == "HybridMaxWaitMs" ? 10000
+                : name == "HybridMinClockMs" ? 600000 : 1000;
+            knob = std::clamp(std::stoi(value), 0, high);
+            std::cout << "info string " << name << " set to " << knob << std::endl;
+        }
+        if (hybrid.mode == HybridMode::OFF) {
+            std::cout << "info string " << name << " acts only with HybridMode gate" << std::endl;
         }
     } else if (name == "JointPlanFreePermille") {
         durativeConfig.jointPlanFreePermille = std::clamp(std::stoi(value), 0, 1000);
@@ -868,6 +915,20 @@ std::optional<TimeState> UCI::current_clock() const {
     // side_to_move is not const, though it only reads.
     Board& root = const_cast<Board&>(board);
     return TimeState::durative(gated, teamSide, root.side_to_move(BOARD_A),
+                               root.side_to_move(BOARD_B), config);
+}
+
+std::optional<TimeState> UCI::current_hybrid_clock() const {
+    if (hybrid.mode == HybridMode::OFF || durativeTree || !clock_model_active()) {
+        return std::nullopt;
+    }
+    const TimeState v3 = TimeState::clocked(
+        teamSide, timeLeadMs, teamMoveTimeMs, opponentMoveTimeMs, rootMoveTimeMs);
+    DurativeConfig config = durativeConfig;
+    config.rootMoveTimeMs = rootMoveTimeMs;
+    config.wideInputs = networkWide;
+    Board& root = const_cast<Board&>(board);
+    return TimeState::durative(v3.with_sit_gate(false), teamSide, root.side_to_move(BOARD_A),
                                root.side_to_move(BOARD_B), config);
 }
 
@@ -987,6 +1048,14 @@ void UCI::send_uci_response() {
     cout << "option name OwnPaceBelowRoot type check default false" << endl;
     cout << "option name WaitNodeActingEval type check default false" << endl;
     cout << "option name BlockableCheckNotMate type check default false" << endl;
+    // Spec v6, the hybrid (docs/custom_engine_spec_v6_hybrid.md); off by default.
+    cout << "option name HybridMode type combo default off var off var gate" << endl;
+    cout << "option name Hybrid type check default false" << endl;
+    cout << "option name HybridEventLands type combo default all var all var sit var none" << endl;
+    cout << "option name HybridMaxWaitMs type spin default 1000 min 0 max 10000" << endl;
+    cout << "option name HybridMinClockMs type spin default 3000 min 0 max 600000" << endl;
+    cout << "option name HybridMarginPermille type spin default 20 min 0 max 1000" << endl;
+    cout << "option name HybridPassPriorPermille type spin default 150 min 0 max 1000" << endl;
     cout << "info string CUDA engines " << engines.size()
          << " search workers " << engines.size() * SearchParams::NUM_SEARCH_THREADS
          << " (" << SearchParams::NUM_SEARCH_THREADS << " per engine)" << endl;
