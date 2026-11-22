@@ -40,9 +40,21 @@ docs/wave2_training.md), each segment's value labels are checked
 a slow trunk (--train-from generator, --trunk-lr), and a candidate is
 promoted only when it beats the generator (--promote-above 0.5).
 
+With --shared-selfplay (talisman fork), any number of `rl-loop --selfplay-worker`
+processes on other GPUs of the same cluster share step 1 through the shared
+filesystem: every local segment is claimed first (rl-itN/stages/segNN.claim,
+created exclusively, its mtime a heartbeat while the segment plays), so no two
+processes play one segment, and a claim whose heartbeat stopped (a job killed at
+its time limit) is taken over and its segment resumed. A worker plays segments
+of the iteration in self-play until the claimed and finished games reach
+--games, then exits; the main loop plays validation while workers finish, then
+trains and gates as before. --selfplay-hook runs a shell command at the start of
+each iteration's self-play (the cluster uses it to submit the worker jobs).
+
 Stop between stages with: touch RUNS/rl-loop.stop"""
 
 import argparse
+import contextlib
 from datetime import datetime
 import json
 import math
@@ -50,8 +62,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 
 from hivemind import wave2
@@ -75,6 +89,10 @@ POLL_SECONDS = 20
 COLLECT_SECONDS = 60
 RETRY_SECONDS = 60
 ATTEMPTS = 3
+# --shared-selfplay: a claim's mtime is touched this often while its segment
+# plays, and taken over once it is this old.
+HEARTBEAT_SECONDS = 60
+STALE_CLAIM_SECONDS = 15 * 60
 
 
 class StageFailed(Exception):
@@ -235,7 +253,75 @@ def finished_selfplay(it):
 # when its arguments do not name them.
 WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate": False,
                   "train_from": "previous", "lr": "1e-4", "trunk_lr": None, "promote_above": None,
-                  "wide": False, "arrivals_weight": None}
+                  "wide": False, "arrivals_weight": None, "shared_selfplay": False, "selfplay_hook": None}
+
+
+class Claims:
+    """--shared-selfplay: which process plays which local segment of an
+    iteration. A claim is rl-itN/stages/segNN.claim, created with O_EXCL (atomic
+    on the cluster's shared filesystem) and holding the segment's game count; its
+    mtime is the owner's heartbeat. A finished segment's .done marker outlives
+    its claim, which the owner then removes."""
+
+    def __init__(self, stages, owner, stale_seconds=STALE_CLAIM_SECONDS):
+        self.stages, self.owner, self.stale_seconds = stages, owner, stale_seconds
+
+    def path(self, k):
+        return self.stages / f"seg{k:02d}.claim"
+
+    def live(self):
+        """{k: games} of the claims whose heartbeat is fresh and whose segment is not finished."""
+        found, now = {}, time.time()
+        for claim in self.stages.glob("seg*.claim"):
+            k = claim.stem[3:]
+            if not k.isdigit() or (self.stages / f"seg{k}.done").is_file():
+                continue
+            try:
+                if now - claim.stat().st_mtime < self.stale_seconds:
+                    found[int(k)] = json.loads(claim.read_text())["games"]
+            except (OSError, ValueError, KeyError):  # removed or half written: a claim being taken over
+                continue
+        return found
+
+    def take(self, k, games):
+        """Claim segment k for `games` games: True if it is now ours. A stale
+        claim is renamed aside first; of two processes taking it over, only the
+        one whose rename succeeds goes on to create the new claim."""
+        claim = self.path(k)
+        try:
+            if time.time() - claim.stat().st_mtime >= self.stale_seconds:
+                aside = claim.with_name(f"{claim.name}.stale-{self.owner}-{time.time_ns()}")
+                claim.rename(aside)
+                if time.time() - aside.stat().st_mtime < self.stale_seconds:
+                    # Another process took it over between our stat and our rename: give its claim
+                    # back (link fails if a third one claimed meanwhile) and leave the segment to it.
+                    try:
+                        os.link(aside, claim)
+                    except FileExistsError:
+                        pass
+                    aside.unlink()
+                    return False
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w") as stream:
+            stream.write(json.dumps({"games": games, "owner": self.owner, "at": time.time()}) + "\n")
+        return True
+
+    def release(self, k):
+        try:
+            self.path(k).unlink()
+        except FileNotFoundError:
+            pass
+
+    def beat(self, k):
+        try:
+            os.utime(self.path(k))
+        except FileNotFoundError:
+            pass
 
 
 class Loop:
@@ -337,7 +423,7 @@ class Loop:
             self.aside(data, records, log)
         log.parent.mkdir(parents=True, exist_ok=True)
         self.log(f"it{self.n} self-play {name}: {'resuming ' if resuming else ''}{games} games, "
-                 f"seed {seed}")
+                 f"seed {seed}" + (f" ({self.owner})" if self.option("shared_selfplay") else ""))
         extra = list(selfplay.time_model_options(self.args.time_model))
         # Validation keeps the settings every earlier iteration's was played
         # with, so its losses stay comparable across iterations.
@@ -352,7 +438,7 @@ class Loop:
         extra += self.option("wave2_options").engine_args()
         command = selfplay.engine_command(self.args.selfplay_engine, self.generator_sp1, games, seed,
                                           data, records, self.args.parallel_games, extra)
-        with log.open("a" if resuming else "w") as stream:
+        with log.open("a" if resuming else "w") as stream, self.heartbeat():
             if subprocess.run(command, cwd=ENGINE_DIR, stdout=stream, stderr=subprocess.STDOUT).returncode:
                 raise StageFailed(f"self-play {name} failed (see {log})")
         lines = log.read_text(errors="replace").splitlines()
@@ -392,6 +478,102 @@ class Loop:
 
     def games_played(self):
         return sum(json.loads(marker.read_text())["games"] for marker in (self.it / "stages").glob("seg*.done"))
+
+    # --shared-selfplay: segments claimed through the shared filesystem.
+    @property
+    def owner(self):
+        return f"{socket.gethostname()}:{os.getpid()}:job{os.environ.get('SLURM_JOB_ID', '-')}"
+
+    def heartbeat(self):
+        """While the claimed segment plays, keep its claim fresh."""
+        k = getattr(self, "claimed", None)
+        if k is None:
+            return contextlib.nullcontext()
+        claims, stop = Claims(self.it / "stages", self.owner), threading.Event()
+
+        def beat():
+            while not stop.wait(HEARTBEAT_SECONDS):
+                claims.beat(k)
+
+        @contextlib.contextmanager
+        def running():
+            thread = threading.Thread(target=beat, daemon=True)
+            thread.start()
+            try:
+                yield
+            finally:
+                stop.set()
+                thread.join()
+        return running()
+
+    def next_claim(self):
+        """Claim the next local segment still needed, as (k, games), or None once
+        the finished and the live-claimed games reach --games."""
+        claims = Claims(self.it / "stages", self.owner)
+        while True:
+            live = claims.live()
+            committed = self.games_played() + sum(live.values())
+            if committed >= self.args.games:
+                return None
+            k = 0
+            while self.done(f"seg{k:02d}") or k in live:
+                k += 1
+            if k >= 999:
+                raise StageFailed("out of local self-play seeds")
+            games = min(self.args.segment_games, self.args.games - committed)
+            # A segment taken over from a dead claim resumes with the count its checkpoint holds.
+            progress = self.it / "search" / "train_run" / f"seg{k:02d}" / "checkpoint" / "progress"
+            if self.checkpoint_selfplay and progress.is_file():
+                games = checkpoint_games(progress)
+            if claims.take(k, games):
+                return k, games
+            time.sleep(1)  # another process claimed k first, or its claim is still being written
+
+    def shared_segment(self):
+        """Claim and play one segment: False when none is needed any more."""
+        claim = self.next_claim()
+        if claim is None:
+            return False
+        k, games = claim
+        name = f"seg{k:02d}"
+        self.claimed = k
+        try:
+            self.attempt(self.selfplay, name, games, 1000 * self.n + k, self.it / "search" / "train" / name,
+                         self.it / "search" / "train_run" / name)
+        finally:
+            self.claimed = None
+        Claims(self.it / "stages", self.owner).release(k)
+        return True
+
+    def run_hook(self):
+        hook = self.option("selfplay_hook")
+        if not hook:
+            return
+        self.log(f"it{self.n}: self-play hook: {hook}")
+        result = subprocess.run(hook, shell=True, cwd=PROJECT_ROOT, capture_output=True, text=True,
+                                env={**os.environ, "RL_ITERATION": str(self.n), "RL_RUNS": str(self.runs)})
+        for line in (result.stdout + result.stderr).splitlines():
+            self.log(f"it{self.n}: hook: {line}")
+        if result.returncode:
+            self.log(f"it{self.n}: the self-play hook failed ({result.returncode}): playing on without it")
+
+    def work(self):
+        """--selfplay-worker: play segments of the iteration now in self-play, then exit."""
+        n = next_iteration(self.runs)
+        self.n, self.it = n, self.runs / f"rl-it{n}"
+        self.arms = self.it / "arms"
+        if not (self.it / "stages" / "generator").is_file():
+            self.log(f"worker {self.owner}: it{n} has not started; exiting")
+            return 0
+        self.log(f"worker {self.owner}: joining it{n} self-play")
+        played = 0
+        while True:
+            self.check_stop()
+            if not self.shared_segment():
+                break
+            played += 1
+        self.log(f"worker {self.owner}: it{n} needs no more segments; played {played}, exiting")
+        return played
 
     def publish(self, accepting):
         order = {"protocol": PROTOCOL, "iteration": self.n, "accepting": accepting, "games": self.args.games,
@@ -658,6 +840,19 @@ class Loop:
         args = self.args
         if self.exchange:
             self.distributed_selfplay()
+        elif self.option("shared_selfplay"):
+            if self.games_played() < args.games:
+                self.run_hook()
+            while self.games_played() < args.games:
+                if self.shared_segment():
+                    continue
+                # Workers hold every segment still needed: play validation meanwhile, then wait.
+                if not self.done("val"):
+                    self.attempt(self.selfplay, "val", args.val_games, 1000 * n + 999, self.it / "search" / "val",
+                                 self.it / "search" / "val_run")
+                else:
+                    self.check_stop()
+                    time.sleep(POLL_SECONDS)
         else:
             k = 0
             played = self.games_played()
@@ -816,6 +1011,15 @@ def main():
                              "hf://NAMESPACE/NAME (a Hugging Face dataset) or a shared directory")
     parser.add_argument("--no-local-selfplay", action="store_true",
                         help="With --distributed, leave self-play to contributors")
+    parser.add_argument("--shared-selfplay", action="store_true",
+                        help="Claim each local self-play segment on the shared filesystem first, so "
+                             "--selfplay-worker processes on other GPUs can play segments of the same iteration")
+    parser.add_argument("--selfplay-worker", action="store_true",
+                        help="Only play claimed segments of the iteration now in self-play, then exit "
+                             "(implies --shared-selfplay; give it the main loop's settings)")
+    parser.add_argument("--selfplay-hook", default=None,
+                        help="With --shared-selfplay, a shell command run at the start of each iteration's "
+                             "self-play (RL_ITERATION and RL_RUNS in its environment), e.g. to submit workers")
     parser.add_argument("--selfplay-engine", type=Path, default=selfplay.DEFAULT_ENGINE)
     parser.add_argument("--match-engine", type=Path, default=MATCH_ENGINE)
     parser.add_argument("--lr", default=None,
@@ -866,7 +1070,13 @@ def main():
         if value is not None and not 0 < float(value) <= 1:
             parser.error(f"--{name.replace('_', '-')} must be in (0, 1]")
     if not args.wave2_options.is_stock and args.distributed:
-        parser.error("--distributed does not carry the wave 2 options to contributors yet")
+        parser.error("--distributed does not carry the wave 2 options to contributors yet "
+                     "(on one cluster, use --shared-selfplay with --selfplay-worker jobs)")
+    args.shared_selfplay = args.shared_selfplay or args.selfplay_worker
+    if args.shared_selfplay and args.distributed:
+        parser.error("--shared-selfplay and --distributed are two ways to share self-play: pick one")
+    if args.selfplay_hook and not args.shared_selfplay:
+        parser.error("--selfplay-hook needs --shared-selfplay")
     if not -1 < args.resign_threshold <= 0:
         parser.error("--resign-threshold must be in (-1, 0]")
     if args.new_passes <= 0 or args.replay_passes < 0:
@@ -918,6 +1128,18 @@ def main():
             args.wave2_options = wave2.STOCK
 
     loop = Loop(args, generator=args.generator, checkpoint=args.generator_checkpoint)
+    if args.selfplay_worker:
+        # No lock, no stop-file clearing, no archive or upload: those are the main loop's. The worker loads
+        # its own copy of the generator, so its TensorRT cache is its own too.
+        args.keep_selfplay, args.no_upload = True, True
+        own = args.runs / "workers" / re.sub(r"[^A-Za-z0-9._-]", "_", loop.owner)
+        own.mkdir(parents=True, exist_ok=True)
+        loop.generator_sp1 = own / selfplay.one_worker_copy(args.generator).name
+        try:
+            loop.work()
+        finally:
+            shutil.rmtree(own, ignore_errors=True)
+        return
     skipped = unarchived = None
     if not args.no_upload:
         from huggingface_hub import HfApi, get_token
