@@ -1151,25 +1151,23 @@ SeatClockGameResult play_seat_clock_game(
                 });
             sample.nodes = static_cast<uint32_t>(std::min<uint64_t>(
                 actualVisits, std::numeric_limits<uint32_t>::max()));
-            edges = selfplay_policy_edges(edges, agent.root_type(), choice, agent.certified_choice());
             // Spec v6: the root's hybrid sit (the action passing on both
             // boards of a triggered search) is the game's action at most,
             // never a policy target; it is sampled only if it qualified.
+            // Review fix: the sit is dropped before the solved-root filter
+            // (hybrid_policy_edges), so a root proven only through the sit
+            // cannot leave the sit as the whole target.
             const HybridReport& hybrid = agent.hybrid_report();
-            std::vector<RootEdgeStats> sampleEdges = edges;
+            std::vector<RootEdgeStats> sampleEdges = selfplay_policy_edges(
+                edges, agent.root_type(), choice, agent.certified_choice());
             if (hybrid.trigger.mask != 0) {
-                const auto isSit = [](const RootEdgeStats& edge) {
-                    return edge.action.moveA == Stockfish::MOVE_NONE
-                        && edge.action.moveB == Stockfish::MOVE_NONE;
-                };
-                if (std::any_of(edges.begin(), edges.end(),
-                                [&](const RootEdgeStats& edge) { return !isSit(edge); })) {
-                    std::erase_if(edges, isSit);
-                }
-                const bool sitQualifies = hybrid.qualifies;
-                if (!sitQualifies) {
+                edges = hybrid_policy_edges(
+                    edges, agent.root_type(), choice, agent.certified_choice());
+                if (!hybrid.qualifies) {
                     sampleEdges = edges;
                 }
+            } else {
+                edges = sampleEdges;
             }
             const float rootQ = agent.root_q();
             sample.rootQ = rootQ;
