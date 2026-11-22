@@ -8710,7 +8710,7 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                  << " q_sit " << hybrid.qSit << " q_act " << hybrid.qAct
                  << " visits " << hybrid.visitsSit << "/" << hybrid.visitsTotal
                  << " (" << hybrid.reason
-                 << (hybrid.kept && hybrid.proven ? ", proven (assumes event)" : "") << ")"
+                 << (hybrid.kept && hybrid.proven ? " (assumes event)" : "") << ")"
                  << endl;
         }
     }
