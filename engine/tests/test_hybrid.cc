@@ -640,6 +640,9 @@ TEST_F(HybridRules, SelfPlayHybridPassEndsAtTheWake) {
 }
 
 // ---- 2.x searches on it13 --------------------------------------------------------------
+// ONNX Runtime only, like the other it13 search tests: the TensorRT build on PACE
+// failed loadNetwork on this file (w2c_build 15996137); the parity scripts cover TensorRT.
+#if defined(HIVEMIND_BACKEND_ONNXRUNTIME)
 
 class HybridIt13 : public ::testing::Test {
 protected:
@@ -918,6 +921,8 @@ TEST_F(HybridIt13, ReviewFix_ReuseRetainsThePlayedChild) {
         EXPECT_FALSE(AgentHybridPeer::retains(agent, children[playedIdx].get()));
     }
 }
+
+#endif  // HIVEMIND_BACKEND_ONNXRUNTIME
 
 }  // namespace
 
