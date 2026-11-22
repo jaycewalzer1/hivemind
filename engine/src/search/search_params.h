@@ -954,7 +954,24 @@ struct RuntimeConfig {
     // for the workers' copy; every caller's config leaves it empty.
     std::array<Stockfish::Move, 2> rootPlanMove{Stockfish::MOVE_NONE, Stockfish::MOVE_NONE};
     float rootPlanWeight = 0.0f;
+    // Spec v6 H3 (HybridMode gate, docs/custom_engine_spec_v6_hybrid.md):
+    // the boards where this search's root may sit although the v3 gate
+    // forbids it (bit 0 = A, bit 1 = B; 0 = none), the prior floor of that
+    // pass at the root, the board whose thinking opponent seat must land a
+    // move at depth 1 (-1 = none) and below which root children
+    // (HYBRID_EVENT_LANDS_*). Read only at the root and its children.
+    // Agent::run_search fills them for the workers' copy of a triggered
+    // search; every other config leaves them empty.
+    uint8_t hybridSitBoards = 0;
+    float hybridPassPriorWeight = 0.0f;
+    int8_t hybridEventBoard = -1;
+    uint8_t hybridEventLands = 0;
 };
+
+/// RuntimeConfig::hybridEventLands: below every root child, below the hybrid sit only, never.
+constexpr uint8_t HYBRID_EVENT_LANDS_ALL = 0;
+constexpr uint8_t HYBRID_EVENT_LANDS_SIT = 1;
+constexpr uint8_t HYBRID_EVENT_LANDS_NONE = 2;
 
 // =============================================================================
 // Utility Functions

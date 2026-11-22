@@ -309,6 +309,23 @@ public:
     }
     bool sit_gate() const { return sitGate_; }
 
+    /**
+     * @brief Spec v6 H3 (HybridMode gate, HybridEventLands): this state
+     * with the hybrid's event mark for @p board (0 = A, 1 = B; -1 clears).
+     * A triggered search puts it on the depth-1 states below its root: the
+     * opponent seat thinking on that board lands a move there, so the tree
+     * forbids its pass on it (JointActionRules::mustMoveBoards). One-shot:
+     * the next advance() clears it, and it enters exact_key() only while
+     * set, so depth-2 states are plain v3 states again.
+     */
+    TimeState with_hybrid_event(int board) const {
+        TimeState next = *this;
+        next.hybridEvent_ = board == 0 ? 1 : board == 1 ? 2 : 0;
+        return next;
+    }
+    /** The board with the hybrid's event mark (with_hybrid_event), -1 = none. */
+    int hybrid_event_board() const { return hybridEvent_ == 0 ? -1 : hybridEvent_ - 1; }
+
     /** Upstream's sit right, lead > 0, whatever the gate: the network's sit plane. */
     bool lead_sit_right(Stockfish::Color team) const {
         return lead_ms(team) > 0;
@@ -371,6 +388,8 @@ public:
      * acting team is used up by this action, whether or not it pays.
      */
     void advance(Stockfish::Color actingTeam, bool actingTeamOnBothBoards) {
+        // Spec v6: the hybrid's event mark lasts one ply.
+        hybridEvent_ = 0;
         if (durative_.active) {
             // A caller that does not say which boards moved (the mate
             // provers, tree reuse) reasons in v3 alternation: from here on
@@ -446,6 +465,7 @@ public:
                         Stockfish::PieceType handB = Stockfish::NO_PIECE_TYPE,
                         Stockfish::Move plannedA = Stockfish::MOVE_NONE,
                         Stockfish::Move plannedB = Stockfish::MOVE_NONE) {
+        hybridEvent_ = 0;
         Durative& d = durative_;
         const Turn turn = turn_at_node();
         const bool actA = turn.acts[BOARD_A_IDX]
@@ -795,6 +815,8 @@ public:
     int32_t seat_ready_ms(int seat) const { return durative_.readyMs[seat]; }
     /** Whether a seat on turn is in a pass (durative states). */
     bool seat_sitting(int seat) const { return durative_.sitting[seat]; }
+    /** A pass lasts at most this many times the passing seat's action time (durative states). */
+    int32_t pass_cap_k() const { return durative_.passCapK; }
     /** Who is to move on @p board, as this durative state has tracked it. */
     Stockfish::Color side_on(int board) const { return durative_.side[board]; }
     bool at_root() const { return durative_.atRoot; }
@@ -911,6 +933,12 @@ public:
         }
         if (!sitGate_) {
             key ^= 0x5349544f4646ULL * 0xd6e8feb86659fd93ULL;
+        }
+        if (hybridEvent_ != 0) {
+            // Spec v6: a depth-1 state of a triggered hybrid search, whose
+            // event board's seat must move, never shares a node with a plain
+            // one. Unset (every other state), the key is as before.
+            key ^= (0x4859425249440000ULL | hybridEvent_) * 0x9fb21c651e98df25ULL;
         }
         if (durative_.active) {
             key ^= durative_.key();
@@ -1198,5 +1226,8 @@ private:
     int32_t nextMoveTimeMs_ = 0;
     // Wave 2. Defaults keep every state stock v3.0.3.
     bool sitGate_ = true;
+    // Spec v6 (hybrid): 0 = none, 1 = board A, 2 = board B; see
+    // with_hybrid_event(). In the padding after sitGate_.
+    uint8_t hybridEvent_ = 0;
     Durative durative_;
 };

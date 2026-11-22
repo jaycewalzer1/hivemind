@@ -716,7 +716,8 @@ public:
                              uint32_t expansionKey = 0,
                              int plannedBoard = -1,
                              const std::vector<uint8_t>& handTypesA = {},
-                             const std::vector<uint8_t>& handTypesB = {}) {
+                             const std::vector<uint8_t>& handTypesB = {},
+                             uint8_t mustMoveBoards = 0) {
         std::unique_lock<std::shared_mutex> guard(nodeMutex);
         
         // Already expanded by another thread
@@ -757,6 +758,24 @@ public:
                 }
             }
         }
+        // Spec v6 H3: a triggered root may sit on its masked board although
+        // the gate forbids it. The network's sit plane says it may not, so
+        // the pass's prior is near 0; it is floored as a carried move is
+        // (after the noise), or the pass would get no visits.
+        const uint8_t hybridSitBoards = m_depth.load(std::memory_order_relaxed) == 0
+            ? config.hybridSitBoards : 0;
+        if (hybridSitBoards != 0 && config.hybridPassPriorWeight > 0.0f) {
+            for (int boardIndex : {0, 1}) {
+                const std::vector<Stockfish::Move>& actions = boardIndex == 0 ? actionsA : actionsB;
+                const auto pass = std::find(actions.begin(), actions.end(), Stockfish::MOVE_NONE);
+                if (((hybridSitBoards >> boardIndex) & 1u) && actions.size() > 1
+                    && pass != actions.end()) {
+                    mix_root_plan(boardIndex == 0 ? rootPriorsA : rootPriorsB,
+                                  static_cast<size_t>(std::distance(actions.begin(), pass)),
+                                  config.hybridPassPriorWeight);
+                }
+            }
+        }
 
         candidateGenerator.initialize(actionsA, actionsB, rootPriorsA, rootPriorsB,
                           teamHasTimeAdvantage, boardAOnTurn, boardBOnTurn,
@@ -767,7 +786,8 @@ public:
                                   ? config.rootJointPolicyTopK
                                   : config.jointPolicyTopK)),
                           config.jointPolicyResidualScale,
-                          plannedBoard, handTypesA, handTypesB);
+                          plannedBoard, handTypesA, handTypesB,
+                          hybridSitBoards, mustMoveBoards);
         expandedCount = 0;
         expandedPriorSum = 0.0f;
         visitedPolicySum = 0.0f;
@@ -1254,12 +1274,15 @@ public:
      * 
      * @param qVetoDelta Threshold for Q-value veto (0 = disabled)
      * @param qValueWeight Weight for Q-value adjustment (0 = pure visits)
+     * @param excludeIdx A child never picked (spec v6: a hybrid sit that
+     *        does not qualify); -1 = none
      * @return Index of the best move considering Q-values
      */
     int get_best_move_idx_with_q_weight(
         float qVetoDelta = SearchParams::Q_VETO_DELTA,
         float qValueWeight = SearchParams::Q_VALUE_WEIGHT,
-        bool avoidSolvedDraw = false) const {
+        bool avoidSolvedDraw = false,
+        int excludeIdx = -1) const {
         std::shared_lock<std::shared_mutex> guard(nodeMutex);
         
         if (edges.empty()) return -1;
@@ -1270,6 +1293,7 @@ public:
             int bestIdx = -1;
             int shortestPly = INT32_MAX;
             for (size_t i = 0; i < childNodeTypes.size(); i++) {
+                if (static_cast<int>(i) == excludeIdx) continue;
                 if (childNodeTypes[i] == NodeType::LOSS) {
                     if (children[i] && children[i]->get_end_in_ply() < shortestPly) {
                         shortestPly = children[i]->get_end_in_ply();
@@ -1298,7 +1322,7 @@ public:
             float bestScore = -std::numeric_limits<float>::infinity();
             for (const RootGumbelEntry& entry : rootGumbelActive) {
                 const int childIdx = entry.childIdx;
-                if (childIdx < 0
+                if (childIdx < 0 || childIdx == excludeIdx
                     || static_cast<size_t>(childIdx) >= children.size()
                     || !children[childIdx]
                     || children[childIdx]->get_node_type() == NodeType::WIN
@@ -1331,6 +1355,9 @@ public:
                 return child && child->get_node_type() != NodeType::WIN;
             });
         auto isEligible = [&](size_t index) {
+            if (static_cast<int>(index) == excludeIdx) {
+                return false;
+            }
             if (!children[index]) {
                 return true;
             }

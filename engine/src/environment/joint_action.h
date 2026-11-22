@@ -50,6 +50,15 @@ struct JointActionRules {
     bool teamHasTimeAdvantage = false;
     bool boardACanMove = false;
     bool boardBCanMove = false;
+    // Spec v6 (hybrid), bit 0 = A, bit 1 = B; 0 = the rules above alone.
+    // hybridSitBoards: at a triggered search's root, the one-board double
+    // sit (a pass on the board on turn, the forced pass on the other) is
+    // legal on these boards whatever teamHasTimeAdvantage says.
+    // mustMoveBoards: at a depth-1 node of a triggered search, a pass on
+    // these boards is illegal while the board can move (a forced pass stays
+    // legal, as for RequireMoveOn).
+    uint8_t hybridSitBoards = 0;
+    uint8_t mustMoveBoards = 0;
 };
 
 inline bool is_joint_action_legal(const JointActionRules& rules,
@@ -72,7 +81,17 @@ inline bool is_joint_action_legal(const JointActionRules& rules,
         && g_requiredMoveBoard == REQUIRE_MOVE_BOARD_B) {
         return false;
     }
+    if ((sitsOnA && rules.boardACanMove && (rules.mustMoveBoards & 1u))
+        || (sitsOnB && rules.boardBCanMove && (rules.mustMoveBoards & 2u))) {
+        return false;
+    }
     if (sitsOnA && sitsOnB) {
+        // A hybrid root sit: on turn on one board only, that board's bit
+        // set. Both boards on turn never make a double sit legal.
+        if (rules.hybridSitBoards != 0 && rules.boardAOnTurn != rules.boardBOnTurn
+            && (rules.hybridSitBoards & (rules.boardAOnTurn ? 1u : 2u))) {
+            return true;
+        }
         return is_double_sit_legal(
             rules.teamHasTimeAdvantage, rules.boardAOnTurn, rules.boardBOnTurn);
     }
@@ -785,6 +804,7 @@ public:
      * @param isBOnTurn True if it's this team's turn on board B
      * @param capturesA Per-move capture flags for board 0 (missing entries count as non-captures)
      * @param capturesB Per-move capture flags for board 1 (missing entries count as non-captures)
+     * @param hybridSitBoards, mustMoveBoards Spec v6 masks (JointActionRules); 0 = none
      */
     void initialize(const std::vector<Stockfish::Move>& actionsA,
                     const std::vector<Stockfish::Move>& actionsB,
@@ -802,7 +822,9 @@ public:
                     float jointResidualScale = 1.0f,
                     int plannedBoardIndex = -1,
                     const std::vector<uint8_t>& handTypesA = {},
-                    const std::vector<uint8_t>& handTypesB = {}) {
+                    const std::vector<uint8_t>& handTypesB = {},
+                    uint8_t hybridSitBoards = 0,
+                    uint8_t mustMoveBoards = 0) {
         // Clear previous state
         sortedActionsA.clear();
         sortedActionsB.clear();
@@ -836,6 +858,8 @@ public:
         };
         rules.boardACanMove = isAOnTurn && hasRealMove(actionsA);
         rules.boardBCanMove = isBOnTurn && hasRealMove(actionsB);
+        rules.hybridSitBoards = hybridSitBoards;
+        rules.mustMoveBoards = mustMoveBoards;
         // Fix 2: a planned board is never one the team acts on now.
         plannedBoard = plannedBoardIndex == 0 && !isAOnTurn ? 0
             : plannedBoardIndex == 1 && !isBOnTurn ? 1 : -1;
