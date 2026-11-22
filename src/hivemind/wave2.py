@@ -53,6 +53,21 @@ wave2-hivemind docs/wave2_engine.md "Diagnosis fixes"), off by default:
                        D5: a check a dropped piece could block is never mate,
                        as in the arena (UCI BlockableCheckNotMate); any tree
 
+Spec v6, the hybrid (talisman docs/custom_engine_spec_v6_hybrid.md,
+wave2-hivemind docs/wave2_engine.md "Wave 2d"), off by default:
+
+  --hybrid-mode        off or gate: the v3 tree's root may also sit, when it
+                       is behind and on turn on one board, to wait for the
+                       thinking opponent seat on the other (UCI HybridMode);
+                       needs durative_tree false and a base mix
+  --hybrid             the preset: --hybrid-mode gate
+  --hybrid-event-lands all, sit or none: below which root children the event
+                       seat must move (default all)
+  --hybrid-max-wait-ms, --hybrid-min-clock-ms, --hybrid-margin-permille,
+  --hybrid-pass-prior-permille
+                       the trigger's wait and clock bounds, the margin a sit
+                       must win by and the sit's root prior floor
+
 Every option's stock value reproduces v3.0.3, so `STOCK` is the engine with
 none of them. `WAVE2` is the setting the arena and self-play send.
 """
@@ -84,6 +99,14 @@ def format_base_mix(mix):
     return ",".join(f"{base}:{weight:g}" for base, weight in mix)
 
 
+# Spec v6: the hybrid's modes this engine builds (probe and priced are specified, not built), and its knobs.
+HYBRID_MODES = ("off", "gate")
+HYBRID_EVENT_LANDS = ("all", "sit", "none")
+HYBRID_KNOB_RANGES = {"hybrid_max_wait_ms": 10000, "hybrid_min_clock_ms": 600000,
+                      "hybrid_margin_permille": 1000, "hybrid_pass_prior_permille": 1000}
+HYBRID_KNOBS = ("hybrid_event_lands", *HYBRID_KNOB_RANGES)
+
+
 @dataclass(frozen=True)
 class Options:
     durative_tree: bool = False
@@ -103,6 +126,12 @@ class Options:
     own_pace_below_root: bool = False
     wait_node_acting_eval: bool = False
     blockable_check_not_mate: bool = False
+    hybrid_mode: str = "off"
+    hybrid_event_lands: str = "all"
+    hybrid_max_wait_ms: int = 1000
+    hybrid_min_clock_ms: int = 3000
+    hybrid_margin_permille: int = 20
+    hybrid_pass_prior_permille: int = 150
 
     def __post_init__(self):
         if not 1 <= self.pass_cap_k <= 64:
@@ -135,6 +164,18 @@ class Options:
         if self.team_tree_reuse and not (self.durative_tree and self.base_mix):
             # The engine refuses it too: it acts on durative seat-clock games only.
             raise ValueError("team_tree_reuse needs durative_tree and a base_mix")
+        # Spec v6, the hybrid: only gate is built; it adds to the v3 tree and reads the seat clocks.
+        if self.hybrid_mode not in HYBRID_MODES:
+            raise ValueError(f"hybrid_mode must be one of {HYBRID_MODES}")
+        if self.hybrid_event_lands not in HYBRID_EVENT_LANDS:
+            raise ValueError(f"hybrid_event_lands must be one of {HYBRID_EVENT_LANDS}")
+        for knob, high in HYBRID_KNOB_RANGES.items():
+            if not 0 <= getattr(self, knob) <= high:
+                raise ValueError(f"{knob} must be in 0..{high}")
+        if self.hybrid_mode == "off" and any(getattr(self, knob) != defaults[knob] for knob in HYBRID_KNOBS):
+            raise ValueError("a hybrid knob needs hybrid_mode gate")
+        if self.hybrid_mode != "off" and (self.durative_tree or not self.base_mix):
+            raise ValueError("hybrid_mode needs durative_tree false and a base_mix")
         if self.flag_loss and not self.base_mix:
             # Without seat clocks nothing can flag: the option would do nothing.
             raise ValueError("flag_loss needs a base_mix (real seat clocks)")
@@ -206,6 +247,11 @@ def from_args(args):
         changes["joint_plan_free_permille"] = args.joint_plan_free_permille
     if getattr(args, "plan_carry_permille", None) is not None:
         changes["plan_carry_permille"] = args.plan_carry_permille
+    if getattr(args, "hybrid", False):
+        changes["hybrid_mode"] = "gate"
+    for name in ("hybrid_mode", *HYBRID_KNOBS):
+        if getattr(args, name, None) is not None:
+            changes[name] = getattr(args, name)
     return replace(base, **changes)
 
 
@@ -227,6 +273,17 @@ def add_arguments(parser):
                        help="Wave 2c: prior share of decide-later under --joint-plans (default 500)")
     group.add_argument("--plan-carry-permille", type=int, default=None,
                        help="Wave 2c: prior weight of the carried move under --plan-carry (default 300)")
+    group.add_argument("--hybrid-mode", choices=HYBRID_MODES, default=None,
+                       help="Spec v6: gate lets the v3 root sit to wait for a landing on the other board "
+                            "(needs --durative-tree false and a base mix; default off)")
+    group.add_argument("--hybrid", action="store_true",
+                       help="Spec v6: --hybrid-mode gate (an explicit --hybrid-mode overrides it)")
+    group.add_argument("--hybrid-event-lands", choices=HYBRID_EVENT_LANDS, default=None,
+                       help="Spec v6: below which root children the event seat must move (default all)")
+    for knob, default in (("hybrid_max_wait_ms", 1000), ("hybrid_min_clock_ms", 3000),
+                          ("hybrid_margin_permille", 20), ("hybrid_pass_prior_permille", 150)):
+        group.add_argument("--" + knob.replace("_", "-"), type=int, default=None,
+                           help=f"Spec v6 knob (default {default}; needs --hybrid-mode gate)")
     group.add_argument("--continuity", action="store_true",
                        help="Wave 2c: --team-tree-reuse, --joint-plans, --plan-carry, "
                             "--own-pace-below-root and --blockable-check-not-mate true at once "

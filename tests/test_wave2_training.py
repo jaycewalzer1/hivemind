@@ -195,6 +195,40 @@ def test_diagnosis_fix_options():
         "--own-pace-below-root", "--wait-node-acting-eval", "--blockable-check-not-mate"]
 
 
+def test_hybrid_options():
+    """Spec v6, the hybrid: off by default and never sent then; gate needs the v3 tree and a
+    base mix; a knob needs the mode; --hybrid is the gate preset; probe and priced are not built."""
+    assert wave2.STOCK.hybrid_mode == wave2.WAVE2.hybrid_mode == "off"
+    assert not any(arg.startswith("--hybrid") for arg in wave2.WAVE2.engine_args())
+    parser = argparse.ArgumentParser()
+    wave2.add_arguments(parser)
+    nodur = ["--wave2", "--durative-tree", "false", "--sit-gate", "true"]
+    options = wave2.from_args(parser.parse_args([*nodur, "--hybrid", "--hybrid-margin-permille", "50",
+                                                 "--hybrid-event-lands", "sit"]))
+    pairs = dict(zip(options.engine_args()[::2], options.engine_args()[1::2]))
+    assert pairs["--hybrid-mode"] == "gate"
+    assert pairs["--hybrid-margin-permille"] == "50"
+    assert pairs["--hybrid-event-lands"] == "sit"
+    assert "--hybrid-max-wait-ms" not in pairs
+    explicit = wave2.from_args(parser.parse_args([*nodur, "--hybrid", "--hybrid-mode", "off"]))
+    assert explicit.hybrid_mode == "off"
+    with pytest.raises(ValueError):
+        wave2.Options(hybrid_mode="gate")                      # no base mix
+    with pytest.raises(ValueError):
+        wave2.replace(wave2.WAVE2, hybrid_mode="gate")         # durative tree on
+    with pytest.raises(ValueError):
+        wave2.Options(hybrid_margin_permille=50)               # knob without the mode
+    with pytest.raises(ValueError):
+        wave2.Options(hybrid_mode="probe", base_mix=((30000, 1.0),))
+    with pytest.raises(ValueError):
+        wave2.Options(hybrid_mode="gate", base_mix=((30000, 1.0),), hybrid_max_wait_ms=10001)
+    gate = wave2.Options(hybrid_mode="gate", base_mix=((30000, 1.0),))
+    assert gate.engine_args() == ["--base-mix", "30000:1", "--hybrid-mode", "gate"]
+    assert wave2.missing_engine_options(options, "--durative-tree --sit-gate --flag-loss --instant-transfer "
+                                        "--base-mix --seat-move-times") == [
+        "--hybrid-mode", "--hybrid-event-lands", "--hybrid-margin-permille"]
+
+
 def test_continuity_knob_needs_its_switch():
     """A wave 2c knob without its switch does nothing, and the engine would
     still take it as a search change and switch a stock run to the clock time
@@ -232,6 +266,11 @@ def test_continuity_flags_are_in_the_engine_help():
         "--joint-plan-free-permille", "300", "--plan-carry-permille", "450",
         "--wait-node-acting-eval", "true"]))
     assert wave2.missing_engine_options(every, text) == []
+    hybrid = wave2.from_args(parser.parse_args([
+        "--wave2", "--durative-tree", "false", "--sit-gate", "true", "--hybrid",
+        "--hybrid-event-lands", "none", "--hybrid-max-wait-ms", "500", "--hybrid-min-clock-ms", "4000",
+        "--hybrid-margin-permille", "30", "--hybrid-pass-prior-permille", "100"]))
+    assert wave2.missing_engine_options(hybrid, text) == []
 
 
 def test_missing_options_are_read_off_the_engine_help():
