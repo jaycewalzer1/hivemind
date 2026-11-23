@@ -3,11 +3,13 @@
 A stub engine (self-play, tournaments) and a stub trainer stand in for the real ones; the controller
 (talisman cluster/search_balance.py) and `hivemind balance accounting` run for real, and the torch/engine stages
 (`hivemind balance probe|minitrain|score`) are stubbed with the files and markers they write. Without the flag the
-loop must give the same commands, markers and log as the committed rl_loop.py (git HEAD)."""
+loop must give the same commands, markers and log as the committed rl_loop.py (git HEAD, or the revision in
+RL_LOOP_PARITY_REF, e.g. the parent of a change under review)."""
 
 import importlib.util
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -30,11 +32,12 @@ pytestmark = pytest.mark.skipif(CONTROLLER is None, reason="talisman cluster/sea
 
 @pytest.fixture(scope="module")
 def head():
-    """The committed rl_loop.py, loaded as its own module."""
-    source = REAL_RUN(["git", "show", "HEAD:src/hivemind/cli/rl_loop.py"], cwd=PROJECT_ROOT, capture_output=True,
+    """The committed rl_loop.py (HEAD, or RL_LOOP_PARITY_REF), loaded as its own module."""
+    ref = os.environ.get("RL_LOOP_PARITY_REF") or "HEAD"
+    source = REAL_RUN(["git", "show", f"{ref}:src/hivemind/cli/rl_loop.py"], cwd=PROJECT_ROOT, capture_output=True,
                       text=True)
     if source.returncode:
-        pytest.skip("no git HEAD for rl_loop.py")
+        pytest.skip(f"no rl_loop.py at git {ref}")
     path = Path(__file__).parent / "__pycache__" / "rl_loop_head_snapshot.py"
     path.parent.mkdir(exist_ok=True)
     path.write_text(source.stdout)
@@ -238,21 +241,25 @@ def test_without_the_flag_commands_markers_and_log_are_heads(tmp_path, monkeypat
     old = run_world(tmp_path, "head", head, monkeypatch, variant)
     new = run_world(tmp_path, "new", rl_loop, monkeypatch, variant)
     assert new.commands == old.commands
-    files = snapshot(new)
+    files, old_files = snapshot(new), snapshot(old)
     if variant == "shared":
-        # The one addition: a shared iteration records that it began shared (rl-loop's "switching" rule).
+        # The one addition since 0d6b72e: a shared iteration records that it began shared (rl-loop's "switching"
+        # rule). A reference revision that already has it (HEAD from 81681ed on) must write the same marker.
         for n in (1, 2):
-            assert json.loads(files.pop(f"runs/rl-it{n}/stages/selfplay_mode.done")) == {
-                "shared": True, "segment_games": 2}
-    assert files == snapshot(old)
+            marker = f"runs/rl-it{n}/stages/selfplay_mode.done"
+            assert json.loads(files.pop(marker)) == {"shared": True, "segment_games": 2}
+            if marker in old_files:
+                assert json.loads(old_files.pop(marker)) == {"shared": True, "segment_games": 2}
+    assert files == old_files
     assert not (new.root / "balance").exists()
     assert len([c for c in new.commands if c[1] == "selfplay"]) == 2 * 3  # 2 segments + val, 2 iterations
 
 
 def test_the_defaults_are_off(head):
     assert rl_loop.WAVE2_DEFAULTS["search_balance"] is False
+    # Every other default is the reference revision's (which, from 0d6b72e on, has the search_balance keys too).
     assert {k: v for k, v in rl_loop.WAVE2_DEFAULTS.items() if not k.startswith("search_balance")} \
-        == head.WAVE2_DEFAULTS
+        == {k: v for k, v in head.WAVE2_DEFAULTS.items() if not k.startswith("search_balance")}
     # A claim without a balance entry is the same JSON as before.
     assert rl_loop.Claims.take.__defaults__ == (None,)
 
