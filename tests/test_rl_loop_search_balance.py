@@ -238,7 +238,13 @@ def test_without_the_flag_commands_markers_and_log_are_heads(tmp_path, monkeypat
     old = run_world(tmp_path, "head", head, monkeypatch, variant)
     new = run_world(tmp_path, "new", rl_loop, monkeypatch, variant)
     assert new.commands == old.commands
-    assert snapshot(new) == snapshot(old)
+    files = snapshot(new)
+    if variant == "shared":
+        # The one addition: a shared iteration records that it began shared (rl-loop's "switching" rule).
+        for n in (1, 2):
+            assert json.loads(files.pop(f"runs/rl-it{n}/stages/selfplay_mode.done")) == {
+                "shared": True, "segment_games": 2}
+    assert files == snapshot(old)
     assert not (new.root / "balance").exists()
     assert len([c for c in new.commands if c[1] == "selfplay"]) == 2 * 3  # 2 segments + val, 2 iterations
 
@@ -426,6 +432,7 @@ def test_workers_play_the_planned_segments_with_their_flags(tmp_path, monkeypatc
     for directory in ("stages", "search", "arms", "models"):
         (main.it / directory).mkdir(parents=True)
     main.balance_plan()
+    main.mark("selfplay_mode", {"shared": True, "segment_games": 2})
     (main.it / "stages" / "generator").write_text(rl_loop.sha256(world.generator) + "\n")
     # A worker started with the loop's settings but without --search-balance.
     world.args = SimpleNamespace(**{**vars(world.args), "search_balance": False})

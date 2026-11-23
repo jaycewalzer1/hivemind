@@ -50,6 +50,15 @@ of the iteration in self-play until the claimed and finished games reach
 --games, then exits; the main loop plays validation while workers finish, then
 trains and gates as before. --selfplay-hook runs a shell command at the start of
 each iteration's self-play (the cluster uses it to submit the worker jobs).
+An iteration plays its self-play the way it began, so a run can switch to or
+from --shared-selfplay at any point: an iteration begun shared leaves
+stages/selfplay_mode.done ({"shared": true, "segment_games": S}, written
+before its generator marker) and is finished shared, with segments of S games,
+by any later process, with or without the flag (without it, no hook runs and
+the main loop claims what is left alone). An iteration begun without the flag
+(no such marker) is finished one segment after another by the main loop, with
+the segment size it began with, even under --shared-selfplay: the marker then
+records {"shared": false}, no hook runs and workers leave it alone.
 
 With --gate-sprt ELO0,ELO1 (talisman fork) the match against the generator is
 sequential: it plays --gate-chunk games at a time and stops as soon as a
@@ -725,6 +734,39 @@ class Loop:
         return any(not self.done(name) for name in planned)
 
     # --shared-selfplay: segments claimed through the shared filesystem.
+    def selfplay_mode(self):
+        """stages/selfplay_mode.done: how the iteration began its self-play, or None (begun without
+        --shared-selfplay by a loop that never ran with it, or not begun)."""
+        try:
+            return json.loads((self.it / "stages" / "selfplay_mode.done").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def shared_iteration(self):
+        """Whether this iteration's self-play is shared: only when it began shared."""
+        return bool((self.selfplay_mode() or {}).get("shared"))
+
+    def legacy_segment_games(self):
+        """The segment size an iteration begun without --shared-selfplay was playing: its seg00's game
+        count (finished or checkpointed), else this loop's --segment-games."""
+        try:
+            return int(json.loads((self.it / "stages" / "seg00.done").read_text())["games"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        progress = self.it / "search" / "train_run" / "seg00" / "checkpoint" / "progress"
+        if progress.is_file():
+            try:
+                return checkpoint_games(progress)
+            except (OSError, ValueError, StageFailed):
+                pass
+        return self.args.segment_games
+
+    def iteration_segment_games(self):
+        """Games per unplanned segment: the size the iteration recorded when it began (selfplay_mode),
+        else --segment-games (a loop that never ran with --shared-selfplay: exactly as before)."""
+        recorded = (self.selfplay_mode() or {}).get("segment_games")
+        return int(recorded) if recorded else self.args.segment_games
+
     @property
     def owner(self):
         return f"{socket.gethostname()}:{os.getpid()}:job{os.environ.get('SLURM_JOB_ID', '-')}"
@@ -776,7 +818,7 @@ class Loop:
                     k += 1
                 if k >= 999:
                     raise StageFailed("out of local self-play seeds")
-                games = min(self.args.segment_games, self.args.games - committed)
+                games = min(self.iteration_segment_games(), self.args.games - committed)
             # A segment taken over from a dead claim resumes with the count its checkpoint holds.
             progress = self.it / "search" / "train_run" / f"seg{k:02d}" / "checkpoint" / "progress"
             if self.checkpoint_selfplay and progress.is_file():
@@ -822,6 +864,10 @@ class Loop:
         self.arms = self.it / "arms"
         if not (self.it / "stages" / "generator").is_file():
             self.log(f"worker {self.owner}: it{n} has not started; exiting")
+            return 0
+        if not self.shared_iteration():
+            self.log(f"worker {self.owner}: it{n} began without --shared-selfplay (no shared "
+                     f"stages/selfplay_mode.done): its main loop plays it alone; exiting")
             return 0
         self.log(f"worker {self.owner}: joining it{n} self-play")
         played = 0
@@ -1436,18 +1482,27 @@ class Loop:
         if not (self.it / "stages" / "generator").is_file():
             if self.option("search_balance"):
                 self.balance_plan()  # first: workers join once the generator marker exists
+            if self.option("shared_selfplay") and not self.done("selfplay_mode"):
+                # Also before the generator marker: a worker that sees the iteration sees how it plays.
+                self.mark("selfplay_mode", {"shared": True, "segment_games": self.args.segment_games})
             (self.it / "stages" / "generator").write_text(sha256(self.generator) + "\n")
         elif self.option("search_balance") and not self.done("balance_plan"):
             self.mark("balance_plan", {"skipped": "the iteration started without --search-balance"})
             self.log(f"it{n}: started without --search-balance: it plays and trains as it began, "
                      f"without balance stages")
+        if self.option("shared_selfplay") and not self.done("selfplay_mode"):
+            began = self.legacy_segment_games()
+            self.mark("selfplay_mode", {"shared": False, "segment_games": began,
+                                        "skipped": "the iteration started without --shared-selfplay"})
+            self.log(f"it{n}: started without --shared-selfplay: its self-play finishes in this job, one "
+                     f"segment after another ({began} games each), with no workers")
         self.archive(*range(1, n + 1))
         args = self.args
         planned = self.planned_segments()
         if self.exchange:
             self.distributed_selfplay()
-        elif self.option("shared_selfplay"):
-            if self.selfplay_left():
+        elif self.shared_iteration():
+            if self.selfplay_left() and self.option("shared_selfplay"):
                 self.run_hook()
             while self.selfplay_left():
                 if self.shared_segment():
@@ -1466,13 +1521,14 @@ class Loop:
         else:
             k = 0
             played = self.games_played()
+            size = self.iteration_segment_games()
             while played < args.games:
                 while self.done(f"seg{k:02d}"):
                     k += 1
                 if k >= 999:
                     raise StageFailed("out of local self-play seeds")
                 name = f"seg{k:02d}"
-                self.attempt(self.selfplay, name, min(args.segment_games, args.games - played),
+                self.attempt(self.selfplay, name, min(size, args.games - played),
                              1000 * n + k, self.it / "search" / "train" / name,
                              self.it / "search" / "train_run" / name)
                 played = self.games_played()
