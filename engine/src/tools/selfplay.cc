@@ -409,8 +409,14 @@ JointActionCandidate sample_raw_policy_action(
                 static_cast<double>(probabilitiesA[iA]) * static_cast<double>(probabilitiesB[iB]));
         }
     }
+    if (legalPairs.empty()) {
+        // No legal pair at all: the caller ends raw initialization and searches.
+        return candidate;
+    }
     if (std::accumulate(weights.begin(), weights.end(), 0.0) <= 0.0) {
-        throw std::runtime_error("Raw policy produced no legal joint action");
+        // Every legal pair has zero policy mass (it3 seg04 seed 3004): sample
+        // the legal pairs uniformly instead of failing the game.
+        std::fill(weights.begin(), weights.end(), 1.0);
     }
     std::discrete_distribution<size_t> legalSample(weights.begin(), weights.end());
     const auto [indexA, indexB] = legalPairs[legalSample(randomEngine)];
@@ -1251,7 +1257,8 @@ SeatClockGameResult play_seat_clock_game(
             const JointActionCandidate rawAction = sample_raw_policy_action(
                 rawPolicyEngine, rawPolicyEvaluator, board, team, clock,
                 sample_raw_policy_temperature(config, randomEngine), randomEngine);
-            if (!action_leads_to_terminal(board, rawAction, team, clock)) {
+            if (rawAction.jointPrior >= 0.0f
+                && !action_leads_to_terminal(board, rawAction, team, clock)) {
                 action = rawAction;
                 ++result.rawPolicyMacroPlies;
             } else {
@@ -2025,7 +2032,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                     const JointActionCandidate rawAction = sample_raw_policy_action(
                         rawPolicyEngine, rawPolicyEvaluator, board, team, time,
                         sample_raw_policy_temperature(config, randomEngine), randomEngine);
-                    if (!action_leads_to_terminal(board, rawAction, team, time)) {
+                    if (rawAction.jointPrior >= 0.0f
+                        && !action_leads_to_terminal(board, rawAction, team, time)) {
                         time.advance(team, board.on_turn_on_both_boards(team));
                         if (rawAction.moveA != Stockfish::MOVE_NONE) {
                             append_pgn_move(
