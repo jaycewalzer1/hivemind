@@ -20,8 +20,17 @@ order, after policyProbability:
 
 A 78-plane chunk is widened from its pocket planes and this block (no block:
 no timing, presence planes only); a 130-plane chunk's own extra planes are
-used as written and cut off for the narrow layout."""
+used as written and cut off for the narrow layout.
 
+Spec v7 (think_gain head): a chunk directory may hold `think_labels.npz`
+(hivemind.think labels) next to its chunks: `record_index` [M] int, `label`
+[M, 2] float (boards A, B), `mask` [M, 2] bool. record_index is the record's
+position among the directory's records in chunk order (chunk_paths order, as
+the engine wrote them). read_chunk then adds `think_gain` [N, 2] float32 and
+`has_think_gain` [N, 2] bool for the chunk's rows; chunks without the file
+get neither, and DistillDataset fills in unlabelled rows."""
+
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +56,7 @@ LEGACY_PLANES = NUM_BUGHOUSE_CHANNELS
 WIDE_PLANES = NUM_WIDE_CHANNELS
 POLICY_SIZE = 4672
 LAYOUT_PLANES = {"narrow": PLANES, "wide": WIDE_PLANES}
+THINK_LABELS_NAME = "think_labels.npz"
 
 
 def _header(raw, path):
@@ -134,7 +144,50 @@ def read_chunk(path, layout="narrow"):
     elif layout == "narrow" and planes == WIDE_PLANES:
         chunk["plane_bits"] = narrow_planes(chunk["plane_bits"])
         chunk["plane_values"] = narrow_planes(chunk["plane_values"])
+    attach_think_labels(path, chunk)
     return chunk
+
+
+@lru_cache(maxsize=64)
+def _think_labels(directory, stamp):
+    """(labels by record_index, first record_index of each chunk path) of a
+    directory's think_labels.npz; `stamp` (the file's mtime and size) keys the
+    cache so a rewritten file is read again."""
+    with np.load(Path(directory) / THINK_LABELS_NAME) as data:
+        index = np.asarray(data["record_index"], np.int64)
+        label = np.asarray(data["label"], np.float32).reshape(-1, 2)
+        mask = np.asarray(data["mask"], bool).reshape(-1, 2)
+    if not (len(index) == len(label) == len(mask)):
+        raise ValueError(f"{directory}/{THINK_LABELS_NAME}: record_index, label and mask lengths differ")
+    firsts, offset = {}, 0
+    for chunk in chunk_paths([directory]):
+        firsts[chunk.name] = offset
+        offset += chunk_positions(chunk)
+    if len(index) and (index.min() < 0 or index.max() >= offset):
+        raise ValueError(f"{directory}/{THINK_LABELS_NAME}: record_index beyond the directory's {offset} records")
+    return index, label, mask, firsts
+
+
+def attach_think_labels(path, chunk):
+    """Adds `think_gain` and `has_think_gain` [N, 2] to a chunk read from a
+    directory with think_labels.npz (module docstring); leaves others alone."""
+    path = Path(path)
+    labels = path.parent / THINK_LABELS_NAME
+    if not labels.is_file():
+        return
+    stat = labels.stat()
+    index, label, mask, firsts = _think_labels(str(path.parent), (stat.st_mtime_ns, stat.st_size))
+    if path.name not in firsts:
+        return
+    n = len(chunk["value"])
+    rows = index - firsts[path.name]
+    inside = (rows >= 0) & (rows < n)
+    gain = np.zeros((n, 2), np.float32)
+    has = np.zeros((n, 2), bool)
+    gain[rows[inside]] = label[inside]
+    has[rows[inside]] = mask[inside]
+    chunk["think_gain"] = np.where(has, gain, 0).astype(np.float32)
+    chunk["has_think_gain"] = has
 
 
 def widen_planes(chunk):
@@ -191,7 +244,7 @@ def head_chunk(chunk, count):
     entries = int(chunk["policy_count"][:count].astype(np.int64).sum())
     per_position = {"plane_bits", "plane_values", "value", "wdl", "moves_left", "ply", "outcome",
                     "policy_count", "arrivals", "has_arrivals", "seat_clocks_ms", "elapsed_ms",
-                    "recent_landed"}
+                    "recent_landed", "think_gain", "has_think_gain"}
     return {key: array[:count] if key in per_position else array[:entries]
             for key, array in chunk.items()}
 
@@ -228,6 +281,11 @@ class DistillDataset:
         self.plane_count = self.plane_bits.shape[1]
         self.arrivals = torch.from_numpy(cat("arrivals").astype(np.float32)).to(device)
         self.has_arrivals = torch.from_numpy(cat("has_arrivals").astype(bool)).to(device)
+        # Spec v7: think_gain labels where a chunk has them, masked elsewhere.
+        think = [c.get("think_gain", np.zeros((len(c["value"]), 2), np.float32)) for c in chunks]
+        has_think = [c.get("has_think_gain", np.zeros((len(c["value"]), 2), bool)) for c in chunks]
+        self.think_gain = torch.from_numpy(np.concatenate(think).astype(np.float32)).to(device)
+        self.has_think_gain = torch.from_numpy(np.concatenate(has_think).astype(bool)).to(device)
         self.shifts = torch.arange(64, device=device, dtype=torch.int64)
 
     def __len__(self):
@@ -276,5 +334,7 @@ class DistillDataset:
             "policy": [self.policy_targets(index, board) for board in (0, 1)],
             "arrivals": self.arrivals[index],
             "has_arrivals": self.has_arrivals[index],
+            "think_gain": self.think_gain[index],
+            "has_think_gain": self.has_think_gain[index],
             "source": torch.full((len(index),), self.source, device=self.device, dtype=torch.int8),
         }

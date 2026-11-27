@@ -38,7 +38,7 @@ from hivemind.constants import NUM_CLOCKED_CHANNELS_PER_BOARD, NUM_WIDE_CHANNELS
 from hivemind.paths import PROJECT_ROOT
 
 
-TERMS = ("policy_a", "policy_b", "wdl", "value", "moves_left", "arrivals")
+TERMS = ("policy_a", "policy_b", "wdl", "value", "moves_left", "arrivals", "think_gain")
 # Wave 2b arrivals loss: per piece type P, N, B, R, Q, the same in all four
 # pockets; a lost queen in a partner's pocket matters most.
 ARRIVALS_TYPE_WEIGHTS = (1.0, 2.0, 2.0, 2.0, 4.0)
@@ -48,6 +48,17 @@ def arrivals_loss(predicted, target):
     """Per-row weighted mean squared error over the 20 arrival counts."""
     weights = predicted.new_tensor(ARRIVALS_TYPE_WEIGHTS).repeat(4)
     return ((predicted.float() - target) ** 2 * weights).sum(1) / weights.sum()
+
+
+def think_gain_loss(logits, target, mask):
+    """Spec v7 think_gain term: binary cross-entropy on the two logits [A, B],
+    labelled boards only. Per row: (mean BCE over its labelled boards, number
+    of labelled boards), so the normalized term is the mean over labelled
+    boards and a row without labels contributes no loss and no gradient."""
+    bce = F.binary_cross_entropy_with_logits(logits.float(), target.float(), reduction="none")
+    mask = mask.float()
+    count = mask.sum(1)
+    return (bce * mask).sum(1) / count.clamp_min(1), count
 
 
 def layout(model):
@@ -105,8 +116,11 @@ def _loss_rows(model, batch, q_blend=0.0):
     # A resigned game has a result but no length: MOVES_LEFT_UNKNOWN (< 0).
     has_moves_left = has_wdl * (batch["moves_left"] >= 0).float()
     per_row["moves_left"] = ((plys.float().squeeze(1) - batch["moves_left"]) ** 2, has_moves_left)
-    if len(outputs) > 5 and "arrivals" in batch:
+    if getattr(model, "arrivals_head", None) is not None and "arrivals" in batch:
         per_row["arrivals"] = (arrivals_loss(outputs[5], batch["arrivals"]), batch["has_arrivals"].float())
+    if getattr(model, "think_gain_head", None) is not None and "think_gain" in batch:
+        # The think_gain head is always the last output.
+        per_row["think_gain"] = think_gain_loss(outputs[-1], batch["think_gain"], batch["has_think_gain"])
     return per_row, (value, policy_a, policy_b)
 
 
@@ -182,8 +196,9 @@ def evaluate(model, dataset, weights, batch_size=2048):
     return metrics
 
 
-# The arrivals head (wave 2b) starts from zero, so it trains at the heads' rate.
-HEADS = ("policy_head.", "value_head.", "arrivals_head.")
+# The arrivals head (wave 2b) and the think_gain head (spec v7) start from
+# zero, so they train at the heads' rate.
+HEADS = ("policy_head.", "value_head.", "arrivals_head.", "think_gain_head.")
 
 
 def parameter_groups(model, lr, trunk_lr=None):
@@ -307,6 +322,10 @@ def main():
     parser.add_argument("--wide", action="store_true",
                         help="Wave 2b: widen the --init network to the wide planes and add the arrivals "
                              "head (zero-initialised; a wide checkpoint stays wide without this)")
+    parser.add_argument("--think-weight", type=float, default=0.0,
+                        help="Spec v7: weight of the think_gain loss (masked BCE on rows labelled by "
+                             "hivemind.think labels, think_labels.npz next to the chunks). Above 0, a "
+                             "network without the head gets a fresh one (p = 1/3). 0 (default): off")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip torch.compile of the residual blocks (about 1.5x slower)")
@@ -315,6 +334,8 @@ def main():
         parser.error("--batch-size and --eval-batch-size must be positive")
     if not 0 <= args.search_q_blend <= 1:
         parser.error("--search-q-blend must be in [0, 1]")
+    if args.think_weight < 0:
+        parser.error("--think-weight must be >= 0")
 
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -322,12 +343,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.out.mkdir(parents=True, exist_ok=True)
     raw_weights = {"policy_a": 1.0, "policy_b": 1.0, "wdl": 1.0, "value": 1.0,
-                   "moves_left": args.moves_left_weight, "arrivals": args.arrivals_weight}
+                   "moves_left": args.moves_left_weight, "arrivals": args.arrivals_weight,
+                   "think_gain": args.think_weight}
     search_moves_left = (args.moves_left_weight if args.search_moves_left_weight is None
                          else args.search_moves_left_weight)
     search_weights = {"policy_a": args.search_policy_weight, "policy_b": args.search_policy_weight,
                       "wdl": args.search_wdl_weight, "value": args.search_value_weight,
-                      "moves_left": search_moves_left, "arrivals": args.arrivals_weight}
+                      "moves_left": search_moves_left, "arrivals": args.arrivals_weight,
+                      "think_gain": args.think_weight}
     weights = {"raw": raw_weights, "search": search_weights}
 
     pool = chunk_paths(args.data)
@@ -364,11 +387,15 @@ def main():
     if args.init:
         # A network from before the clock planes starts reading them with
         # zero weights, computing exactly what it did until training moves them.
-        model, size, variant = load_twin_board_checkpoint(args.init, wide=True if args.wide else None)
+        # --think-weight > 0 adds a fresh think_gain head to a network without one.
+        model, size, variant = load_twin_board_checkpoint(args.init, wide=True if args.wide else None,
+                                                          think_gain=True if args.think_weight > 0 else None)
         print(f"starting from {args.init} ({size}, {variant})", flush=True)
     else:
         if args.wide:
             variant.update(planes_per_board=NUM_WIDE_CHANNELS_PER_BOARD, arrivals=True)
+        if args.think_weight > 0:
+            variant.update(think_gain=True)
         model = get_twin_board_model(size, **variant)
     planes_layout = layout(model)
 
@@ -498,11 +525,15 @@ OUTPUT_NAMES = ("value", "pi_a", "pi_b", "auxiliary_out", "wdl_out", "moves_left
 # Wave 2b: wide networks add this output last; the engine matches outputs by
 # name and does not read it.
 ARRIVALS_OUTPUT = "arrivals"
+# Spec v7: a network with the think_gain head adds this output last (after
+# arrivals): [batch, 2] logits, boards A and B.
+THINK_GAIN_OUTPUT = "think_gain"
 
 
 def export(out, size, checkpoint_name="best.pt", path=None, fp32_path=None):
     """ONNX export with the teacher's inputs and outputs (value, pi_a, pi_b,
-    wdl_out, moves_left, and arrivals for a wide network); FP16 weights with
+    wdl_out, moves_left, arrivals for a wide network, think_gain for a network
+    with that head); FP16 weights with
     FP32 inputs and outputs, plus an all-FP32 copy at `fp32_path` if given."""
     import onnx
     from onnxruntime.transformers.float16 import convert_float_to_float16
@@ -512,7 +543,8 @@ def export(out, size, checkpoint_name="best.pt", path=None, fp32_path=None):
 
     model, size, _ = load_twin_board_checkpoint(out / checkpoint_name)
     model.eval()
-    names = OUTPUT_NAMES + ((ARRIVALS_OUTPUT,) if model.arrivals_head is not None else ())
+    names = (OUTPUT_NAMES + ((ARRIVALS_OUTPUT,) if model.arrivals_head is not None else ())
+             + ((THINK_GAIN_OUTPUT,) if getattr(model, "think_gain_head", None) is not None else ()))
     path = Path(path) if path else out / f"distill-{size}-v3.0.onnx"
     torch.onnx.export(model, (torch.ones(1, 2 * model.planes_per_board, 8, 8),), str(path),
                       input_names=["data"], output_names=list(names),

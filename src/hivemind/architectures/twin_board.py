@@ -17,6 +17,8 @@ training position teaches both boards.
 Inputs and outputs match the earlier RISEv3 networks, so the engine and the ONNX export
 treat it as a drop-in replacement.
 """
+import math
+
 import torch
 from torch import nn
 from torch.nn import BatchNorm2d, Conv2d, Module, Sequential
@@ -161,6 +163,34 @@ class _ArrivalsHead(Module):
         return torch.cat((per_board[:batch_size], per_board[batch_size:]), dim=1)
 
 
+class _ThinkGainHead(Module):
+    """Spec v7: the chance, per board, that searching that board's decision
+    4x longer changes the move (two logits [A, B]).
+
+    Like the arrivals head, each board's pooled features with the other
+    board's give that board's logit through the same weights, so swapping the
+    boards swaps the two logits. The last layer's weights start at zero and
+    its bias at -ln 2: p = 1/3 on every position, which the time policy reads
+    as scale 1.0, so a fresh head changes nothing until it trains."""
+
+    INITIAL_BIAS = -math.log(2.0)
+
+    def __init__(self, channels, hidden=64):
+        super().__init__()
+        self.body = Sequential(
+            nn.Linear(2 * channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.constant_(self.body[-1].bias, self.INITIAL_BIAS)
+
+    def forward(self, x, batch_size):
+        pooled = x.mean(dim=(2, 3))
+        per_board = self.body(torch.cat((pooled, _swap_boards(pooled, batch_size)), dim=1))
+        return torch.cat((per_board[:batch_size], per_board[batch_size:]), dim=1)
+
+
 class _DenseResidualBlock(Module):
     """Two dense 3x3 convolutions and a residual (two fused kernels in TensorRT,
     against three for the depthwise bottleneck)."""
@@ -202,6 +232,8 @@ class TwinBoardNet(Module):
         layout (hivemind.domain.wide_planes)
     :param arrivals: add wave 2b's arrivals head; forward then returns it as
         a sixth output
+    :param think_gain: add spec v7's think_gain head (two logits [A, B]);
+        forward returns it last, after arrivals when both are present
     """
 
     def __init__(self, channels=192, channels_operating=384, kernels=(3,) * 10,
@@ -209,7 +241,8 @@ class TwinBoardNet(Module):
                  attention_heads=4, channels_policy_head=73, channels_value_head=16,
                  value_fc_size=256, se_every=4, mid_attention=False, value_diff=False,
                  block="bottleneck", attention_style="full",
-                 planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False):
+                 planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False,
+                 think_gain=False):
         super().__init__()
         planes = self.planes_per_board = planes_per_board
         self.stem = _Stem(channels=channels, nb_input_channels=planes)
@@ -246,6 +279,7 @@ class TwinBoardNet(Module):
             "relu", False, planes,
             use_wdl=True, use_plys_to_end=True)
         self.arrivals_head = _ArrivalsHead(channels) if arrivals else None
+        self.think_gain_head = _ThinkGainHead(channels) if think_gain else None
         # The exporter reads these.
         self.joint_policy_rank = 0
 
@@ -272,10 +306,12 @@ class TwinBoardNet(Module):
             value_input = torch.cat((value_input, (board_a_features - board_b_features).abs()), dim=1)
         value, wdl, plys = self.value_head(value_input)
         auxiliary = torch.cat((wdl, plys), dim=1)
+        outputs = (value, (policy_a, policy_b), auxiliary, wdl, plys)
         if self.arrivals_head is not None:
-            arrivals = self.arrivals_head(out, batch_size)
-            return value, (policy_a, policy_b), auxiliary, wdl, plys, arrivals
-        return value, (policy_a, policy_b), auxiliary, wdl, plys
+            outputs += (self.arrivals_head(out, batch_size),)
+        if self.think_gain_head is not None:
+            outputs += (self.think_gain_head(out, batch_size),)
+        return outputs
 
 
 TWIN_BOARD_SIZES = {
@@ -289,7 +325,8 @@ TWIN_BOARD_SIZES = {
 def get_twin_board_model(size="twin-m", mid_attention=False, value_diff=False,
                          block="bottleneck", attention_style="full", se_every=4,
                          channels=None, blocks=None, attention_dim=None,
-                         planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False):
+                         planes_per_board=NUM_CLOCKED_CHANNELS_PER_BOARD, arrivals=False,
+                         think_gain=False):
     """A named size, optionally overriding its shape (channels, blocks,
     attention_dim) and design options. Dense blocks use 3x3 kernels only."""
     base_channels, operating, base_blocks, base_attention = TWIN_BOARD_SIZES[size]
@@ -305,7 +342,8 @@ def get_twin_board_model(size="twin-m", mid_attention=False, value_diff=False,
                         attention_heads=max(1, attention // 32) if attention else 1,
                         mid_attention=mid_attention, value_diff=value_diff, se_every=se_every,
                         block=block, attention_style=attention_style,
-                        planes_per_board=planes_per_board, arrivals=arrivals)
+                        planes_per_board=planes_per_board, arrivals=arrivals,
+                        think_gain=think_gain)
 
 
 STEM_WEIGHT = "stem.body.0.weight"
@@ -340,14 +378,19 @@ def widen_to_wide_planes(state_dict):
     return {**state_dict, STEM_WEIGHT: torch.cat((weight, padding), dim=1)}
 
 
-def load_twin_board_checkpoint(checkpoint, map_location="cpu", wide=None):
+def load_twin_board_checkpoint(checkpoint, map_location="cpu", wide=None, think_gain=None):
     """The network in a training checkpoint (a path or a loaded dict), widened
     to the clock planes when it predates them, with its size and variant. The
     returned variant records the widened input, so saving it keeps the shape.
 
     A checkpoint whose variant is wide (65 planes per board, wave 2b) stays
     wide; `wide=True` widens a narrow one and adds the arrivals head (its last
-    layer zero, so every output it had is unchanged)."""
+    layer zero, so every output it had is unchanged).
+
+    `think_gain=True` adds a fresh think_gain head (spec v7) to a checkpoint
+    without one; every other output is unchanged and the head says p = 1/3. A
+    checkpoint with the head keeps it unless `think_gain=False`, which drops
+    it. None keeps what the checkpoint has."""
     if not isinstance(checkpoint, dict):
         checkpoint = torch.load(checkpoint, map_location=map_location)
     size = checkpoint["size"]
@@ -360,10 +403,15 @@ def load_twin_board_checkpoint(checkpoint, map_location="cpu", wide=None):
     else:
         variant = {**stored, "planes_per_board": NUM_CLOCKED_CHANNELS_PER_BOARD}
         state = widen_to_clock_planes(checkpoint["model"])
+    if think_gain is not None:
+        variant["think_gain"] = think_gain
+    if not variant.get("think_gain"):
+        variant.pop("think_gain", None)
+        state = {key: value for key, value in state.items() if not key.startswith("think_gain_head.")}
     model = get_twin_board_model(size, **variant)
     missing, unexpected = model.load_state_dict(state, strict=False)
-    # Only a freshly added arrivals head may be missing.
-    if unexpected or any(not key.startswith("arrivals_head.") for key in missing):
+    # Only a freshly added arrivals or think_gain head may be missing.
+    if unexpected or any(not key.startswith(("arrivals_head.", "think_gain_head.")) for key in missing):
         raise RuntimeError(f"checkpoint does not fit {size} {variant}: missing {missing}, "
                            f"unexpected {unexpected}")
     return model, size, variant
