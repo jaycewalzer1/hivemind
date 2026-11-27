@@ -1119,8 +1119,9 @@ void UCI::policy() {
 
     // Run inference
     std::vector<float> arrivals(loadedBatchSize * NB_ARRIVALS_VALUES, 0.0f);
+    std::vector<float> thinkGain(loadedBatchSize * Engine::NB_THINK_GAIN_VALUES, 0.0f);
     if (!engine->runInference(obs, value, piA, piB, wdl, movesLeft, 0, wideExtras.data(),
-                              arrivals.data())) {
+                              arrivals.data(), thinkGain.data())) {
         cerr << "Inference failed" << endl;
         delete[] obs;
         delete[] value;
@@ -1148,6 +1149,11 @@ void UCI::policy() {
             cout << " " << arrivals[index];
         }
         cout << endl;
+    }
+    if (engine->hasThinkGain()) {
+        // Spec v7: the think_gain head's probabilities (sigmoid), boards A and B.
+        cout << "Think gain: " << 1.0f / (1.0f + std::exp(-thinkGain[0])) << " "
+             << 1.0f / (1.0f + std::exp(-thinkGain[1])) << endl;
     }
     cout << endl;
 
