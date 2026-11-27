@@ -353,6 +353,48 @@ def test_labels_on_a_fake_reanalyse(iteration, monkeypatch, capsys):
     assert calls == []
 
 
+def test_labels_search_at_the_reference_budget_under_think_policy(iteration, monkeypatch, capsys):
+    """Self-play under --think-policy writes think_ref_nodes (the budget at think scale 1): base and repeat search
+    at it and deep at 4x it, whatever scale the generator's head chose (target_nodes)."""
+    it, model, total = iteration
+    states = it / "search" / "train_run" / "seg00" / "states.jsonl"
+    lines = []
+    for line in states.read_text().splitlines():
+        state = json.loads(line)
+        if state["type"] == "record" and state["target_nodes"] > 0:
+            ref = state["target_nodes"] // 2 + 1
+            line = line[:-1] + f', "think_ref_nodes": {ref}}}'
+        lines.append(line)
+    states.write_text("\n".join(lines) + "\n")
+    calls = []
+
+    def fake_search(job, dump, indices, offsets, wave2_args, root, prefix):
+        calls.append((prefix, [dump.records[i] for i in sorted(indices)]))
+        return {i: (1, None) for i in indices}, {"gpu_s": 0.0}
+
+    monkeypatch.setattr(think, "search", fake_search)
+    assert think.main(["labels", "--it", str(it), "--iteration", "2", "--model", str(model), "--engine", "hm",
+                       "--fraction", "0.5", "--factor", "4"]) == 0
+    by_prefix = {prefix: records for prefix, records in calls}
+    assert set(by_prefix) == {"base", "deep", "repeat"}
+    for base_line, deep_line in zip(by_prefix["base"], by_prefix["deep"]):
+        base, deep = json.loads(base_line), json.loads(deep_line)
+        assert base["target_nodes"] == base["think_ref_nodes"] and deep["target_nodes"] == 4 * base["think_ref_nodes"]
+    for line in by_prefix["repeat"]:
+        state = json.loads(line)
+        assert state["target_nodes"] == state["think_ref_nodes"]
+
+
+def test_reference_dump_keeps_lines_without_a_reference_byte_exact():
+    from types import SimpleNamespace
+    dump = SimpleNamespace(records={0: '{"type": "record", "target_nodes": 800, "x": 1}',
+                                    1: '{"type": "record", "target_nodes": 900, "think_ref_nodes": 600}'})
+    out = think.reference_dump(dump)
+    assert out.records[0] == dump.records[0]
+    assert json.loads(out.records[1])["target_nodes"] == 600
+    assert dump.records[1].count("900") == 1  # the source dump is untouched
+
+
 # --- add-head ----------------------------------------------------------------------------------
 
 def test_add_head_round_trip_and_onnx_output(tmp_path):

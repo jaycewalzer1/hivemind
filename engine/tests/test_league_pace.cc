@@ -418,6 +418,68 @@ TEST_F(LeaguePaceSelfPlay, ThinkPolicyWithoutAHeadSearchesAtScaleOne) {
 #endif
 }
 
+TEST_F(LeaguePaceSelfPlay, ThinkPolicyStatesRecordTheBudgetAtScaleOne) {
+#if __has_include("tools/think_policy.h")
+    // think_probe.onnx: p 1/3 on board A (scale 1), 3/4 on board B (scale 1.625). The think labels search at
+    // think_ref_nodes and 4x it, the budget the clock gives before the head's own scale.
+    const auto probe = std::filesystem::path(__FILE__).parent_path() / "data" / "think_probe.onnx";
+    Engine headed(0, 1);
+    ASSERT_TRUE(headed.loadNetwork(probe.string(), ""));
+    SelfPlayConfig c = paced("thinkref", 2);
+    c.thinkPolicy = true;
+    c.pace.maxNodes = 4096;
+    c.recordStateOutput = root / "thinkref" / "games" / "states.jsonl";
+    std::vector<SearchObservation> seen;
+    c.searchObserver = [&seen](const SearchObservation& s) { seen.push_back(s); };
+    testing::internal::CaptureStdout();
+    const int status = run_selfplay({&headed}, c);
+    testing::internal::GetCapturedStdout();
+    ASSERT_EQ(status, 0);
+    ASSERT_FALSE(seen.empty());
+    std::vector<size_t> expected;
+    size_t scaled = 0;
+    for (const SearchObservation& s : seen) {
+        int32_t clockNow = 0;
+        for (int seat = 0; seat < 4; ++seat) {
+            clockNow = s.deciding[seat] ? std::max(clockNow, s.clocksMs[seat]) : clockNow;
+        }
+        expected.push_back(pace_node_budget(c.pace, s.jitteredNodes, s.k, 1.0, clockNow, 20000));
+        scaled += s.thinkScale != 1.0 ? 1 : 0;
+    }
+    EXPECT_GT(scaled, 0u);
+    std::vector<size_t> written;
+    size_t differ = 0;
+    const std::string states = read_text(c.recordStateOutput);
+    std::istringstream in(states);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find("\"type\": \"record\"") == std::string::npos) {
+            continue;
+        }
+        const size_t at = line.find("\"think_ref_nodes\": ");
+        ASSERT_NE(at, std::string::npos) << line;
+        written.push_back(std::stoull(line.substr(at + 19)));
+        const size_t target = std::stoull(line.substr(line.find("\"target_nodes\": ") + 16));
+        differ += written.back() != target ? 1 : 0;
+    }
+    EXPECT_GT(differ, 0u);
+    std::sort(expected.begin(), expected.end());
+    std::sort(written.begin(), written.end());
+    EXPECT_EQ(written, expected);
+#else
+    GTEST_SKIP() << "no tools/think_policy.h";
+#endif
+}
+
+TEST_F(LeaguePaceSelfPlay, StatesWithoutThinkPolicyHaveNoReferenceBudget) {
+    SelfPlayConfig c = paced("noref", 1);
+    c.recordStateOutput = root / "noref" / "games" / "states.jsonl";
+    run(c);
+    const std::string states = read_text(c.recordStateOutput);
+    EXPECT_NE(states.find("\"target_nodes\": "), std::string::npos);
+    EXPECT_EQ(states.find("think_ref_nodes"), std::string::npos);
+}
+
 TEST_F(LeaguePaceSelfPlay, Validation) {
     auto refused = [this](const SelfPlayConfig& c, bool league) {
         try {

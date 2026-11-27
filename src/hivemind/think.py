@@ -10,7 +10,8 @@ p = 1/3, s = 1, so it changes nothing until it trains.
       For every finished non-val segment with a state dump (selfplay --record-state-output, added by
       selfplay_args when --think-labels is on), a hashed fraction of its searched records is searched again
       with the engine's reanalyse command at the recorded budget and at --factor x it (same generator, the
-      segment's wave 2 options, no noise). Per board on turn: label 1 when the two searches' most-visited
+      segment's wave 2 options, no noise). Under --think-policy the recorded budget is the state line's
+      think_ref_nodes, the budget before the generator's head scaled it, so the labels do not feed back on it. Per board on turn: label 1 when the two searches' most-visited
       entries differ (a pass counts as an entry), else 0; boards not on turn are masked. A repeat of the base
       search on 5% of them gives noise_rate (how often the base search disagrees with itself). Writes
       think_labels.npz into the segment's chunk dir (hivemind.distill.data reads it) and prints one JSON line
@@ -171,6 +172,27 @@ def disagreement(base, repeat):
     return compared, differ
 
 
+def reference_dump(dump):
+    """A copy of a reanalyse StateDump whose chosen record lines ask for their think_ref_nodes (self-play under
+    --think-policy: the budget at think scale 1) instead of their target_nodes, so a label measures the gain of
+    4x the clock's budget, not of 4x the budget the generator's own head chose. Lines without think_ref_nodes
+    (no --think-policy) are kept byte-exact."""
+    import copy
+    import re
+    target = re.compile(r'("target_nodes":\s*)(\d+)')
+    reference = re.compile(r'"think_ref_nodes":\s*(\d+)')
+    out = copy.copy(dump)
+    out.records = {}
+    for index, line in dump.records.items():
+        found = reference.search(line)
+        if found:
+            line, count = target.subn(lambda m: m.group(1) + found.group(1), line, count=1)
+            if count != 1:
+                raise RuntimeError(f"record {index}: no target_nodes in its state line")
+        out.records[index] = line
+    return out
+
+
 def scaled_dump(dump, factor):
     """A copy of a reanalyse StateDump whose chosen record lines ask for factor x their target_nodes (the
     engine's reanalyse with --nodes 0 searches each record at its own target_nodes)."""
@@ -243,7 +265,7 @@ def label_segment(args, it, name, job, log):
         log(f"{name}: no records chosen")
         return {"segment": name, "records": total, "labelled": 0, "positives": [0.0, 0.0], "boards": [0, 0],
                 "compared": 0, "differ": 0, "gpu_s": 0.0}
-    dump = reanalyse.read_states(states, total, wanted=set(chosen))
+    dump = reference_dump(reanalyse.read_states(states, total, wanted=set(chosen)))
     work = it / "search" / WORK_NAME
     reanalyse.aside(work / name, work / "aborted")
     base, base_stats = search(job, dump, chosen, offsets, wave2_args, work / name / "base", "base")

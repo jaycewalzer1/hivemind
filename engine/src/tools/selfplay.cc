@@ -885,6 +885,10 @@ struct StateLine {
     uint64_t noiseSeed = 0;
     size_t baseNodes = 0;    // the jittered base budget
     size_t targetNodes = 0;  // what the search was given
+    // --think-policy only: the budget at think scale 1 (pace, clock and cap
+    // as for targetNodes). The think labels compare a search at it with one
+    // at 4x it, so they do not depend on the scale the head itself chose.
+    std::optional<size_t> thinkRefNodes;
     size_t minNewNodes = 1;
     float epsilon = 0.0f;
     bool deep = false;
@@ -1001,7 +1005,11 @@ void write_state_lines(const std::filesystem::path& path, size_t gameNumber,
         uint32_t epsilonBits = 0;
         std::memcpy(&epsilonBits, &state.epsilon, sizeof(epsilonBits));
         stream << ", \"noise_seed\": " << state.noiseSeed << ", \"base_nodes\": " << state.baseNodes
-               << ", \"target_nodes\": " << state.targetNodes
+               << ", \"target_nodes\": " << state.targetNodes;
+        if (state.thinkRefNodes) {
+            stream << ", \"think_ref_nodes\": " << *state.thinkRefNodes;
+        }
+        stream
                << ", \"min_new_nodes\": " << state.minNewNodes
                << ", \"epsilon_bits\": " << epsilonBits
                << ", \"deep\": " << (state.deep ? 1 : 0) << ", \"masked\": " << (state.masked ? 1 : 0)
@@ -1458,6 +1466,20 @@ SeatClockGameResult play_seat_clock_game(
             // Playout cap: with it off, the base budget and configured noise.
             const CapDecision cap = cap_decision(config, runId, gameIndex, decisions, baseNodes);
             searchOptions.targetNodes = cap.targetNodes;
+            size_t thinkRefNodes = cap.targetNodes;
+            if (config.thinkPolicy && thinkScale != 1.0) {
+                // The same budget at scale 1 (cap_decision draws from its own
+                // stream, so a second call changes nothing).
+                size_t refBase = jitteredNodes;
+                if (pace) {
+                    int32_t clockNow = 0;
+                    for (int seat = 0; seat < 4; ++seat) {
+                        clockNow = event.seats[seat] ? std::max(clockNow, game.clock_ms(seat)) : clockNow;
+                    }
+                    refBase = pace_node_budget(config.pace, refBase, k, 1.0, clockNow, game.start().baseMs);
+                }
+                thinkRefNodes = cap_decision(config, runId, gameIndex, decisions, refBase).targetNodes;
+            }
             searchOptions.retainForReuse = false;
             if (teamTreeReuse) {
                 // Fix 1: the adopted visits count toward the budget, as
@@ -1504,6 +1526,9 @@ SeatClockGameResult play_seat_clock_game(
                 state.noiseSeed = searchOptions.search.rootNoiseSeed;
                 state.baseNodes = baseNodes;
                 state.targetNodes = searchOptions.targetNodes;
+                if (config.thinkPolicy) {
+                    state.thinkRefNodes = thinkRefNodes;
+                }
                 state.minNewNodes = searchOptions.minNewNodes;
                 state.epsilon = searchOptions.search.rootDirichletEpsilon;
                 state.deep = cap.deep;
