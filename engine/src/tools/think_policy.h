@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <stdexcept>
+#include <vector>
 
 #include "environment/board.h"
 #include "environment/constants.h"
@@ -42,10 +45,38 @@ inline double think_scale(const ThinkPolicy& policy, float p) {
  */
 inline bool evaluate_think_gain(Engine& engine, Board& board, Stockfish::Color team,
                                 const TimeState& clock, std::array<float, 2>& out) {
-    (void)engine;
-    (void)board;
-    (void)team;
-    (void)clock;
-    (void)out;
-    return false;
+    if (!engine.hasThinkGain()) {
+        return false;
+    }
+    // Per-thread buffers sized to the engine's batch; rows past 0 stay zero.
+    struct Buffers {
+        size_t batch = 0;
+        std::vector<float> obs, extras, value, piA, piB, wdl, movesLeft, thinkGain;
+    };
+    thread_local Buffers buffers;
+    const size_t batch = static_cast<size_t>(engine.getBatchSize());
+    if (buffers.batch != batch) {
+        buffers.batch = batch;
+        buffers.obs.assign(batch * NB_INPUT_VALUES(), 0.0f);
+        buffers.extras.assign(batch * NB_WIDE_EXTRA_VALUES, 0.0f);
+        buffers.value.assign(batch, 0.0f);
+        buffers.piA.assign(batch * NB_POLICY_VALUES(), 0.0f);
+        buffers.piB.assign(batch * NB_POLICY_VALUES(), 0.0f);
+        buffers.wdl.assign(batch * 3, 0.0f);
+        buffers.movesLeft.assign(batch, 0.0f);
+        buffers.thinkGain.assign(batch * Engine::NB_THINK_GAIN_VALUES, 0.0f);
+    }
+    board_to_planes(board, buffers.obs.data(), team, clock);
+    if (engine.wideInputs()) {
+        wide_extra_planes(board, team, clock, buffers.extras.data());
+    }
+    if (!engine.runInference(buffers.obs.data(), buffers.value.data(), buffers.piA.data(),
+                             buffers.piB.data(), buffers.wdl.data(), buffers.movesLeft.data(), 0,
+                             buffers.extras.data(), nullptr, buffers.thinkGain.data())) {
+        throw std::runtime_error("think_gain inference failed");
+    }
+    for (int index = 0; index < Engine::NB_THINK_GAIN_VALUES; ++index) {
+        out[index] = 1.0f / (1.0f + std::exp(-buffers.thinkGain[index]));
+    }
+    return true;
 }

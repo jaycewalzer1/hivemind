@@ -69,7 +69,13 @@ public:
         // Wave 2b arrivals head (NB_ARRIVALS_VALUES per position), when the
         // network has it. Read and handed out; the search does not use it.
         const __half* arrivals = nullptr;
+        // Spec v7 think_gain head (NB_THINK_GAIN_VALUES logits per position,
+        // boards A and B), when the network has it. Not used by the search.
+        const __half* thinkGain = nullptr;
     };
+
+    /// Values per position of the think_gain output (one logit per board).
+    static constexpr int NB_THINK_GAIN_VALUES = 2;
 
     explicit Engine(int deviceId, int batchSize = SearchParams::BATCH_SIZE);
     ~Engine();
@@ -86,7 +92,8 @@ public:
      */
     bool runInference(float* obs, float* value, float* piA, float* piB,
                       float* wdl, float* movesLeft, size_t workerIndex = 0,
-                      const float* wideExtras = nullptr, float* arrivals = nullptr);
+                      const float* wideExtras = nullptr, float* arrivals = nullptr,
+                      float* thinkGain = nullptr);
 
     bool runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,
                           size_t workerIndex = 0, const float* wideExtras = nullptr);
@@ -122,6 +129,8 @@ public:
     bool wideInputs() const { return m_inputChannels == NB_WIDE_INPUT_CHANNELS; }
     /// Whether the loaded network has the wave 2b arrivals head.
     bool hasArrivals() const { return !m_arrivalsName.empty(); }
+    /// Whether the loaded network has the spec v7 think_gain head.
+    bool hasThinkGain() const { return !m_thinkGainName.empty(); }
 
     /// Human-readable backend name, e.g. "TensorRT" or "ONNX Runtime".
     static const char* backendName();
@@ -152,6 +161,9 @@ private:
         void* deviceArrivalsBuffer = nullptr;
         void* hostArrivalsHalf = nullptr;
         void* spareArrivalsHalf = nullptr;
+        void* deviceThinkGainBuffer = nullptr;
+        void* hostThinkGainHalf = nullptr;
+        void* spareThinkGainHalf = nullptr;
         void* hostValueHalf = nullptr;
         void* hostPolicyAHalf = nullptr;
         void* hostPolicyBHalf = nullptr;
@@ -200,6 +212,7 @@ private:
     std::string m_jointFactorsAName;
     std::string m_jointFactorsBName;
     std::string m_arrivalsName;
+    std::string m_thinkGainName;
     size_t m_jointFactorRank = 0;
 
 #if defined(HIVEMIND_BACKEND_TENSORRT)

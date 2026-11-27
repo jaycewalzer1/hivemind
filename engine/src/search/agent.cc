@@ -27,6 +27,7 @@
 #include "common/utils.h"
 #include "common/globals.h"
 #include "common/thread_priority.h"
+#include "tools/think_policy.h"
 
 using namespace std;
 
@@ -259,6 +260,33 @@ std::vector<InternalMateProbeTarget> collect_internal_probe_targets(
  * @param isChildNode True if the node follows one of the root team's actions,
  *        which is one more ply of the line.
  */
+/**
+ * Spec v7 6.3: after a verbose search, `info string think_gain <pa> <pb>`
+ * (probabilities, 4 decimals) for the search's root when the network has the
+ * think_gain head. One extra network evaluation, not counted in nodes; the
+ * search's workers have stopped, so engine worker 0 is free. Nothing is
+ * printed for a network without the head.
+ */
+static void print_think_gain(const vector<Engine*>& engines, Board& board,
+                             Stockfish::Color teamSide, const TimeState& time) {
+    if (engines.empty() || !engines[0] || !engines[0]->hasThinkGain()) {
+        return;
+    }
+    std::array<float, 2> gain{};
+    try {
+        if (!evaluate_think_gain(*engines[0], board, teamSide, time, gain)) {
+            return;
+        }
+    } catch (const std::exception& error) {
+        cout << "info string think_gain failed: " << error.what() << endl;
+        return;
+    }
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(4) << "info string think_gain "
+         << gain[0] << " " << gain[1];
+    cout << line.str() << endl;
+}
+
 static int mate_moves(const Node& node, bool isChildNode) {
     const int plies = node.get_end_in_ply() + (isChildNode ? 1 : 0);
     const bool rootTeamWins = (node.get_node_type() == NodeType::WIN)
@@ -7744,6 +7772,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             cout << "info depth " << plyToMate << " score mate " << mateScore
                  << " nodes 1 nps 1000 time 0 pv "
                  << (proofPv.empty() ? bestMoveStr : proofPv) << endl;
+            if (!options.background) {
+                print_think_gain(engines, board, teamSide, searchTime_);
+            }
             cout << "bestmove " << bestMoveStr << endl;
             if (const string scanSummary = root_scan_summary();
                 !scanSummary.empty()) {
@@ -7886,6 +7917,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
             cout << "info depth " << rootLossPly << " score mate -"
                  << mateScore << " nodes 1 nps 1000 time 0 pv "
                  << (proofPv.empty() ? bestMoveStr : proofPv) << endl;
+            if (!options.background) {
+                print_think_gain(engines, board, teamSide, searchTime_);
+            }
             cout << "bestmove " << bestMoveStr << endl;
             if (const string scanSummary = root_scan_summary();
                 !scanSummary.empty()) {
@@ -8755,6 +8789,9 @@ JointActionCandidate Agent::run_search(Board& board, const vector<Engine*>& engi
                 + ")"
             : extract_best_move(board);
         string ponderMoveStr = options.enablePonder ? extract_ponder_move(board) : "";
+        if (!options.background) {
+            print_think_gain(engines, board, teamSide, searchTime_);
+        }
         if (!ponderMoveStr.empty()) {
             cout << "bestmove " << bestMoveStr << " ponder " << ponderMoveStr << endl;
         } else {

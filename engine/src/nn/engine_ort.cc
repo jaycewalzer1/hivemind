@@ -194,6 +194,7 @@ struct Engine::OrtState {
     int jointFactorsAIdx = -1;
     int jointFactorsBIdx = -1;
     int arrivalsIdx = -1;
+    int thinkGainIdx = -1;
 };
 
 const char* Engine::backendName() { return "ONNX Runtime"; }
@@ -338,7 +339,11 @@ bool Engine::loadNetwork(const std::string& onnxFile,
             const std::string norm = lowered(state.outputNameStorage[i]);
             const int idx = static_cast<int>(i);
             // Order matters: "jointfactors_a" also contains "_a".
-            if (matches(norm, {"arrival"})) {
+            if (norm == "think_gain") {
+                // Spec v7 think_gain head: 2 logits per row, read on request.
+                state.thinkGainIdx = idx;
+                m_thinkGainName = state.outputNameStorage[i];
+            } else if (matches(norm, {"arrival"})) {
                 state.arrivalsIdx = idx;
                 m_arrivalsName = state.outputNameStorage[i];
             } else if (matches(norm, {"jointfactor", "joint_factor"})) {
@@ -545,6 +550,7 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsB = at(state.jointFactorsBIdx);
     outputs.jointFactorRank = outputs.jointFactorsA ? m_jointFactorRank : 0;
     outputs.arrivals = at(state.arrivalsIdx);
+    outputs.thinkGain = at(state.thinkGainIdx);
     return outputs.value && outputs.policyA && outputs.policyB;
 }
 
@@ -556,7 +562,7 @@ bool Engine::runInferenceHalf(const __half* obs, HalfInferenceOutputs& outputs,
 
 bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
                           float* wdl, float* movesLeft, size_t workerIndex,
-                          const float* wideExtras, float* arrivals) {
+                          const float* wideExtras, float* arrivals, float* thinkGain) {
     const size_t inputElements =
         static_cast<size_t>(m_batchSize) * NB_INPUT_VALUES();
     std::vector<__half> halfInput(inputElements);
@@ -577,5 +583,6 @@ bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
     copy(outputs.wdl, wdl, batch * 3);
     copy(outputs.movesLeft, movesLeft, batch);
     copy(outputs.arrivals, arrivals, batch * NB_ARRIVALS_VALUES);
+    copy(outputs.thinkGain, thinkGain, batch * NB_THINK_GAIN_VALUES);
     return true;
 }

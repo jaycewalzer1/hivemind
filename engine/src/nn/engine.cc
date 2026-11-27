@@ -324,6 +324,7 @@ Engine::ExecutionState::~ExecutionState() {
     if (deviceJointFactorsABuffer) cudaFree(deviceJointFactorsABuffer);
     if (deviceJointFactorsBBuffer) cudaFree(deviceJointFactorsBBuffer);
     if (deviceArrivalsBuffer) cudaFree(deviceArrivalsBuffer);
+    if (deviceThinkGainBuffer) cudaFree(deviceThinkGainBuffer);
     if (hostObsHalf) cudaFreeHost(hostObsHalf);
     if (hostLegacyObsHalf) cudaFreeHost(hostLegacyObsHalf);
     if (hostValueHalf) cudaFreeHost(hostValueHalf);
@@ -334,9 +335,10 @@ Engine::ExecutionState::~ExecutionState() {
     if (hostJointFactorsAHalf) cudaFreeHost(hostJointFactorsAHalf);
     if (hostJointFactorsBHalf) cudaFreeHost(hostJointFactorsBHalf);
     if (hostArrivalsHalf) cudaFreeHost(hostArrivalsHalf);
+    if (hostThinkGainHalf) cudaFreeHost(hostThinkGainHalf);
     for (void* spare : {spareValueHalf, sparePolicyAHalf, sparePolicyBHalf, spareWdlHalf,
                         spareMovesLeftHalf, spareJointFactorsAHalf, spareJointFactorsBHalf,
-                        spareArrivalsHalf}) {
+                        spareArrivalsHalf, spareThinkGainHalf}) {
         if (spare) cudaFreeHost(spare);
     }
     if (stream) cudaStreamDestroy(stream);
@@ -641,6 +643,7 @@ bool Engine::initializeResources() {
     m_jointFactorsAName.clear();
     m_jointFactorsBName.clear();
     m_arrivalsName.clear();
+    m_thinkGainName.clear();
     m_jointFactorRank = 0;
 
     auto normalizedName = [](std::string name) {
@@ -683,6 +686,9 @@ bool Engine::initializeResources() {
             } else if ((lowerName == "moves_left" || lowerName == "plys_to_end_out") &&
                        outputElements == 1) {
                 m_movesLeftName = tensorName;
+            } else if (lowerName == "think_gain" && outputElements == NB_THINK_GAIN_VALUES) {
+                // Spec v7 think_gain head: copied back, read by think_policy.h.
+                m_thinkGainName = tensorName;
             } else if (lowerName.find("arrival") != std::string::npos &&
                        outputElements == NB_ARRIVALS_VALUES) {
                 // Wave 2b arrivals head: copied back, not used by the search.
@@ -760,6 +766,7 @@ bool Engine::initializeResources() {
     size_t jointFactorsSize = m_batchSize * m_jointFactorRank
         * (NB_POLICY_VALUES() + 1) * sizeof(__half);
     size_t arrivalsSize = m_batchSize * NB_ARRIVALS_VALUES * sizeof(__half);
+    size_t thinkGainSize = m_batchSize * NB_THINK_GAIN_VALUES * sizeof(__half);
 
     m_executionStates.reserve(SearchParams::NUM_SEARCH_THREADS);
     for (int workerIndex = 0; workerIndex < SearchParams::NUM_SEARCH_THREADS; ++workerIndex) {
@@ -782,6 +789,12 @@ bool Engine::initializeResources() {
             (!checkCuda(cudaMalloc(&state->deviceArrivalsBuffer, arrivalsSize), "cudaMalloc(arrivals)") ||
              !checkCuda(cudaMallocHost(&state->hostArrivalsHalf, arrivalsSize), "cudaMallocHost(arrivals)") ||
              !checkCuda(cudaMallocHost(&state->spareArrivalsHalf, arrivalsSize), "cudaMallocHost(spare arrivals)"))) {
+            return false;
+        }
+        if (!m_thinkGainName.empty() &&
+            (!checkCuda(cudaMalloc(&state->deviceThinkGainBuffer, thinkGainSize), "cudaMalloc(think gain)") ||
+             !checkCuda(cudaMallocHost(&state->hostThinkGainHalf, thinkGainSize), "cudaMallocHost(think gain)") ||
+             !checkCuda(cudaMallocHost(&state->spareThinkGainHalf, thinkGainSize), "cudaMallocHost(spare think gain)"))) {
             return false;
         }
         state->context.reset(m_engine->createExecutionContext());
@@ -835,6 +848,11 @@ bool Engine::initializeResources() {
             std::cerr << "Failed to bind the arrivals output" << std::endl;
             return false;
         }
+        if (!m_thinkGainName.empty() &&
+            !state->context->setTensorAddress(m_thinkGainName.c_str(), state->deviceThinkGainBuffer)) {
+            std::cerr << "Failed to bind the think_gain output" << std::endl;
+            return false;
+        }
 
         // TensorRT graph capture mutates execution-context state and its
         // documented capture recipe uses global mode.  Doing this lazily in
@@ -870,7 +888,7 @@ bool Engine::initializeResources() {
 
 bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
                           float* wdl, float* movesLeft, size_t workerIndex,
-                          const float* wideExtras, float* arrivals) {
+                          const float* wideExtras, float* arrivals, float* thinkGain) {
     if (!obs || !value || !piA || !piB || !wdl || !movesLeft ||
         workerIndex >= m_executionStates.size()) {
         return false;
@@ -898,6 +916,9 @@ bool Engine::runInference(float* obs, float* value, float* piA, float* piB,
     halvesToFloats(outputs.movesLeft, movesLeft, movesLeftElements);
     if (arrivals && outputs.arrivals && hasArrivals()) {
         halvesToFloats(outputs.arrivals, arrivals, m_batchSize * NB_ARRIVALS_VALUES);
+    }
+    if (thinkGain && outputs.thinkGain && hasThinkGain()) {
+        halvesToFloats(outputs.thinkGain, thinkGain, m_batchSize * NB_THINK_GAIN_VALUES);
     }
 
     return true;
@@ -994,6 +1015,15 @@ bool Engine::enqueueInferenceHalfImpl(const __half* obs, size_t workerIndex,
         state.inferencePending = false;
         return false;
     }
+    if (!m_thinkGainName.empty() &&
+        !checkCuda(cudaMemcpyAsync(state.hostThinkGainHalf, state.deviceThinkGainBuffer,
+                                   m_batchSize * NB_THINK_GAIN_VALUES * sizeof(__half),
+                                   cudaMemcpyDeviceToHost, state.stream),
+                   "cudaMemcpyAsync(think gain)")) {
+        cudaStreamSynchronize(state.stream);
+        state.inferencePending = false;
+        return false;
+    }
     if (m_jointFactorRank > 0 &&
         (!checkCuda(cudaMemcpyAsync(state.hostJointFactorsAHalf, state.deviceJointFactorsABuffer, jointFactorsSize, cudaMemcpyDeviceToHost, state.stream),
                     "cudaMemcpyAsync(joint factors A)") ||
@@ -1036,6 +1066,7 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     outputs.jointFactorsB = static_cast<const __half*>(state.hostJointFactorsBHalf);
     outputs.jointFactorRank = m_jointFactorRank;
     outputs.arrivals = static_cast<const __half*>(state.hostArrivalsHalf);
+    outputs.thinkGain = static_cast<const __half*>(state.hostThinkGainHalf);
     // The caller reads these until its next synchronize; the next enqueue
     // writes the other set.
     std::swap(state.hostValueHalf, state.spareValueHalf);
@@ -1046,6 +1077,7 @@ bool Engine::synchronizeInferenceHalf(HalfInferenceOutputs& outputs,
     std::swap(state.hostJointFactorsAHalf, state.spareJointFactorsAHalf);
     std::swap(state.hostJointFactorsBHalf, state.spareJointFactorsBHalf);
     std::swap(state.hostArrivalsHalf, state.spareArrivalsHalf);
+    std::swap(state.hostThinkGainHalf, state.spareThinkGainHalf);
 
     return true;
 }
