@@ -93,11 +93,31 @@ skipped, never fatal (the controller then plans failsafe). Without a prior
 today's recipe and plans no challenger, so self-play and training run exactly
 as without the flag.
 
+With --gate2 (talisman fork; talisman docs/custom_engine_spec_v7_league.md section 3)
+the candidate is promoted by the real-clock two-score gate instead of the 100 ms
+match (which still plays, unchanged): after match_generator, the stage gate2
+runs talisman cluster/gate2_match.sh (--gate2-script) every --gate2-poll-s for
+the candidate and the incumbent; it submits each network's arena matches against
+upstream-it13 to PACE (arms equal and free, cached per network in
+RUN/gate2/nets/<sha16>, RUN = the parent of --runs) and merges them. Once both
+networks are done, hivemind.gate2 decides (promote iff both arms are complete
+and neither drops, and d_equal + d_free >= 0); not done by --gate2-timeout-h
+(from stages/gate2.started, so a resumed job keeps the clock) is not promoted.
+A failing script is logged and called again at the next poll, never fatal.
+
+With --league/--pace (hivemind.league) and --think-* (hivemind.think) the loop
+calls those modules' hooks (spec v7 3.5): a league plan frozen in
+stages/league_plan.done like the search balance plan, the plan's and the think
+policy's engine flags on every self-play segment but validation, a
+think_labels stage before training (non-fatal) and the think trainer flags.
+The modules are imported only when their flags are given (or for --help).
+
 Stop between stages with: touch RUNS/rl-loop.stop"""
 
 import argparse
 import contextlib
 from datetime import datetime
+import importlib
 import json
 import math
 import os
@@ -110,6 +130,7 @@ import sys
 import threading
 import time
 
+from hivemind import gate2 as two_score
 from hivemind import wave2
 from hivemind.cli import selfplay, train
 from hivemind.constants import NUM_WIDE_CHANNELS
@@ -300,12 +321,40 @@ WAVE2_DEFAULTS = {"wave2_options": wave2.STOCK, "label_check": False, "no_gate":
                   "gate_max_games": None, "search_balance": False, "search_balance_controller": None,
                   "search_balance_prior": None, "search_balance_mini_steps": 200, "search_balance_probe_games": 150,
                   "search_balance_minigate_games": 100, "search_balance_gpus": 1.0, "search_balance_device": "auto"}
+# Spec v7 (league, think policy, real-clock gate), kept apart so WAVE2_DEFAULTS stays comparable with earlier
+# revisions; Loop.option reads both.
+V7_DEFAULTS = {"gate2": False, "gate2_script": None, "gate2_games": 400, "gate2_parts": 4, "gate2_base_ms": 60000,
+               "gate2_free_k": 160, "gate2_equal_k": 110, "gate2_seed_base": 7000, "gate2_opp_sit": "observed",
+               "gate2_drop_margin": two_score.DROP_MARGIN, "gate2_min_pairs": two_score.MIN_PAIRS,
+               "gate2_poll_s": 300.0, "gate2_timeout_h": 10.0, "league_on": False, "think_on": False}
+GATE2_ARMS = "equal free"
 
 
 # --search-balance: engine flags of the playout cap and the state dump, which validation never gets.
 CAP_FLAGS = ("--deep-fraction", "--deep-multiplier", "--fast-nodes", "--fast-policy-mask", "--fast-dirichlet",
              "--deep-dirichlet", "--cap-seed-salt", "--record-state-output")
 STEPS_RULES = ("positions", "policy_positions")  # functions of the same name in hivemind.cli.train
+# Spec v7: league, pace and think policy flags, which validation never gets either (its losses stay comparable).
+VAL_STOCK_FLAGS = ("--pace-k-min", "--opponent-model", "--think-policy", "--record-state-output")
+
+
+def hook(name):
+    """hivemind.league (WP3) or hivemind.think (WP4), imported on first use so a missing module only matters when
+    its flags are on."""
+    return importlib.import_module(f"hivemind.{name}")
+
+
+def gate2_script(explicit=None):
+    """--gate2: the matches script, `explicit` (None if it does not exist), else $HIVEMIND_GATE2_SCRIPT, else
+    cluster/gate2_match.sh in the first directory above the fork that has one (as search_balance_controller)."""
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        return path if path.is_file() else None
+    if os.environ.get("HIVEMIND_GATE2_SCRIPT"):
+        path = Path(os.environ["HIVEMIND_GATE2_SCRIPT"]).expanduser().resolve()
+        return path if path.is_file() else None
+    return next((parent / "cluster" / "gate2_match.sh" for parent in PROJECT_ROOT.parents
+                 if (parent / "cluster" / "gate2_match.sh").is_file()), None)
 
 
 def search_balance_controller(explicit=None):
@@ -557,9 +606,11 @@ class Loop:
         self.resume_matches = engine_supports(args.match_engine, "games.tsv")
         self.api = None
         self.exchange = None  # set for --distributed
+        # League segments: this process's copies of opponent networks (a worker uses its own directory).
+        self.opponent_dir = self.runs / "league_opponents"
 
     def option(self, name):
-        return getattr(self.args, name, WAVE2_DEFAULTS[name])
+        return getattr(self.args, name, WAVE2_DEFAULTS[name] if name in WAVE2_DEFAULTS else V7_DEFAULTS[name])
 
     def log(self, message):
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}"
@@ -632,14 +683,19 @@ class Loop:
         else:
             self.aside(data, records, log)
         log.parent.mkdir(parents=True, exist_ok=True)
-        # --search-balance: the plan's segment (None for validation and without a plan).
+        # --search-balance or --league: the plan's segment (None for validation and without a plan).
         planned = self.planned_segments()
         spec = None if planned is None else planned.get(name)
-        cap = [] if spec is None else [str(a).replace("{segment_dir}", str(records)) for a in spec["engine_args"]]
+        league = planned is not None and self.balance_segments() is None
+        cap = [] if spec is None else self.segment_args(spec, records)
+        # --think-*: the think policy's engine flags (and the state dump for labels), never for validation.
+        think = ([str(a).replace("{segment_dir}", str(records)) for a in hook("think").selfplay_args(self.args)]
+                 if self.option("think_on") and name != "val" else [])
         self.log(f"it{self.n} self-play {name}: {'resuming ' if resuming else ''}{games} games, "
                  f"seed {seed}" + (f" ({self.owner})" if self.option("shared_selfplay") else "")
-                 + ("" if spec is None else f", search balance arm {spec['theta']}"
-                    + (f" {' '.join(cap)}" if cap else " (stock)")))
+                 + ("" if spec is None else f", {'league' if league else 'search balance arm'} {spec['theta']}"
+                    + (f" {' '.join(cap)}" if cap else " (stock)"))
+                 + (f", think {' '.join(think)}" if think else ""))
         extra = list(selfplay.time_model_options(self.args.time_model))
         # Validation keeps the settings every earlier iteration's was played
         # with, so its losses stay comparable across iterations.
@@ -653,13 +709,16 @@ class Loop:
         # The wave 2 rules hold for validation too: its games are this iteration's game.
         extra += self.option("wave2_options").engine_args()
         extra += cap
+        extra += think
         command = selfplay.engine_command(self.args.selfplay_engine, self.generator_sp1, games, seed,
                                           data, records, self.args.parallel_games, extra)
         if planned is not None:
             if spec is None and any(flag in command for flag in CAP_FLAGS):
                 raise StageFailed(f"{name} must play stock under search balance: {command}")
-            if cap and not engine_supports(self.args.selfplay_engine, "--deep-fraction"):
+            if cap and not league and not engine_supports(self.args.selfplay_engine, "--deep-fraction"):
                 raise StageFailed(f"{name}: {self.args.selfplay_engine} lacks the playout-cap flags {cap}")
+        if name == "val" and any(flag in command for flag in VAL_STOCK_FLAGS):
+            raise StageFailed(f"validation must play without league, pace or think flags: {command}")
         started = time.monotonic()
         with log.open("a" if resuming else "w") as stream, self.heartbeat():
             if subprocess.run(command, cwd=ENGINE_DIR, stdout=stream, stderr=subprocess.STDOUT).returncode:
@@ -697,7 +756,14 @@ class Loop:
             self.log(f"it{self.n} {name} timing: {attached['rewritten']} of {attached['chunks']} chunks "
                      f"to v3, {attached['labelled']} of {attached['records']} records with arrivals labels")
             marker["timing"] = attached
-        if planned is not None:
+        if league:
+            if spec is not None and not self.league_failsafe():
+                try:
+                    marker["league"] = hook("league").segment_summary(log, spec)
+                except Exception as error:  # a summary is telemetry: the segment's games still count
+                    self.log(f"it{self.n} {name}: league segment summary failed: {error!r}")
+                    marker["league"] = {"theta": spec["theta"], "error": repr(error)}
+        elif planned is not None:
             if spec is not None:
                 marker["balance"] = {"theta": spec["theta"], "engine_args": cap,
                                      **({"twin": spec["twin"]} if spec.get("twin") else {}),
@@ -720,12 +786,81 @@ class Loop:
         except (OSError, ValueError):
             return None
 
+    def balance_segments(self):
+        return (self.balance_plan_marker() or {}).get("segments") or None
+
     def planned_segments(self):
         """{segNN: {"theta", "seed", "games", "engine_args"}} when the iteration
         has a search balance plan (workers read it whatever their own flags),
-        else None: self-play then plays --games in --segment-games segments."""
-        marker = self.balance_plan_marker()
-        return (marker or {}).get("segments") or None
+        else the league plan's table (--league/--pace, the same rules), else
+        None: self-play then plays --games in --segment-games segments."""
+        return self.balance_segments() or (self.league_plan_marker() or {}).get("segments") or None
+
+    # --league/--pace: the iteration's league plan, frozen in stages/league_plan.done.
+    def league_plan_marker(self):
+        try:
+            return json.loads((self.it / "stages" / "league_plan.done").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def league_failsafe(self):
+        return "failsafe" in (self.league_plan_marker() or {})
+
+    def segment_args(self, spec, records):
+        """A planned segment's engine flags: {segment_dir} is the segment's records directory, {opponent_model}
+        this process's copy of the segment's opponent network."""
+        args = [str(a).replace("{segment_dir}", str(records)) for a in spec["engine_args"]]
+        if any("{opponent_model}" in a for a in args):
+            copy = self.opponent_copy(spec.get("opponent_model"))
+            args = [a.replace("{opponent_model}", str(copy)) for a in args]
+        return args
+
+    def opponent_copy(self, source):
+        """A league opponent's network as this process's own file (TensorRT caches are per file), named by its
+        sha256 so two opponents never share a cache."""
+        path = Path(source) if source else None
+        if path is None or not path.is_file():
+            raise StageFailed(f"league opponent network {source} not found")
+        copy = selfplay.one_worker_copy(self.opponent_dir / f"opponent-{sha256(path)[:16]}{path.suffix}")
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        selfplay.refresh_copy(path, copy)
+        return copy
+
+    def league_plan(self):
+        """`league.plan(...)` frozen in stages/league_plan.done (before the iteration's generator marker, so a
+        worker that sees the iteration sees the plan). If the plan fails, a failsafe table: plain segments, no
+        league or pace flags."""
+        if self.done("league_plan"):
+            return
+        args, n = self.args, self.n
+        try:
+            plan = hook("league").plan(args, self.runs, n, self.generator, self.fixed, args.segment_games)
+            table = {}
+            for name, s in sorted(plan["segments"].items()):
+                if not re.fullmatch(r"seg\d{2}", name):
+                    raise ValueError(f"segment name {name!r}")
+                engine_args = [str(a) for a in s.get("engine_args") or []]
+                opponent = s.get("opponent_model")
+                if any("{opponent_model}" in a for a in engine_args) and not opponent:
+                    raise ValueError(f"{name} plays {{opponent_model}} without an opponent_model")
+                table[name] = {"theta": str(s["theta"]), "seed": int(s["seed"]), "games": int(s["games"]),
+                               "engine_args": engine_args,
+                               "opponent_model": None if opponent is None else str(opponent),
+                               **({"league": s["league"]} if s.get("league") else {})}
+            if not table:
+                raise ValueError("no segments")
+            marker = {"segments": table, "summary": plan.get("summary")}
+            self.log(f"it{n} league plan: {plan.get('summary') or ''}; " + ", ".join(
+                f"{name} {s['theta']} {s['games']} games" for name, s in table.items()))
+        except Exception as error:
+            segments = -(-args.games // args.segment_games)
+            table = {f"seg{k:02d}": {"theta": "self", "seed": 1000 * n + k, "engine_args": [], "opponent_model": None,
+                                     "games": min(args.segment_games, args.games - k * args.segment_games)}
+                     for k in range(segments)}
+            marker = {"failsafe": f"{type(error).__name__}: {error}", "segments": table}
+            self.log(f"it{n} league plan failed ({marker['failsafe']}): failsafe, plain self-play segments without "
+                     f"league or pace flags this iteration")
+        self.mark("league_plan", marker)
 
     def selfplay_left(self):
         planned = self.planned_segments()
@@ -1018,7 +1153,8 @@ class Loop:
                                         lr=self.option("lr"), trunk_lr=self.option("trunk_lr"),
                                         extra=(["--arrivals-weight", str(self.option("arrivals_weight"))]
                                                if self.option("wide") else [])
-                                        + [str(a) for a in (balance or {}).get("trainer_args") or []])
+                                        + [str(a) for a in (balance or {}).get("trainer_args") or []]
+                                        + self.think_trainer_args())
         with log.open("w") as stream:
             if subprocess.run(command, cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
                               env={**os.environ, **train.TRAINING_ENV}).returncode:
@@ -1033,11 +1169,52 @@ class Loop:
         if balance is not None:
             marker["search_balance"] = {"steps_rule": rule, "trainer_args": balance.get("trainer_args") or [],
                                         "main_mix": self.main_mix()}
+        if self.option("think_on"):
+            marker["think_trainer_args"] = self.think_trainer_args()
         self.mark("train", marker)
         self.archive(self.n, *replays)
         if not self.args.keep_selfplay:
             for directory in self.teacher_val:
                 archive.evict(directory)
+
+    def think_trainer_args(self):
+        return [str(a) for a in hook("think").trainer_args(self.args)] if self.option("think_on") else []
+
+    def think_labels(self):
+        """--think-labels: `think.label_command(...)` after self-play, before training. Retried like a stage, but
+        never fatal: after the retries the stage is marked {"failed": reason} and training runs without labels.
+        The marker is the JSON line the command printed last."""
+        if self.done("think_labels"):
+            return
+        command = hook("think").label_command(self.args, self.n, self.it, self.generator, self.args.selfplay_engine)
+        if command is None:
+            return
+        self.check_stop()
+        command = [str(c) for c in command]
+        log = self.it / "search" / "logs" / "think_labels.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        self.wait_for_quiet()
+        self.log(f"it{self.n} think labels: {' '.join(command)}")
+        reason = None
+        for count in range(1, ATTEMPTS + 1):
+            try:
+                result = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
+                stdout, output, status = result.stdout, result.stdout + result.stderr, result.returncode
+            except OSError as error:
+                stdout, output, status = "", f"{error!r}\n", 127
+            with log.open("a") as stream:
+                stream.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} attempt {count}: exit {status}\n{output}")
+            report = last_json_line(stdout)
+            if not status and report is not None:
+                self.log(f"it{self.n} think labels: {json.dumps(report)}")
+                self.mark("think_labels", report)
+                return
+            reason = f"exit {status}" if status else "no JSON report"
+            self.log(f"it{self.n}: think labels failed ({reason}; see {log}; attempt {count} of {ATTEMPTS})")
+            if count < ATTEMPTS:
+                time.sleep(RETRY_SECONDS)
+        self.log(f"it{self.n}: think labels skipped after {ATTEMPTS} attempts: training without them")
+        self.mark("think_labels", {"failed": reason})
 
     def match(self, name, baseline, baseline_time_model=None):
         """baseline_time_model "flag" makes a clocked match's baseline search on
@@ -1151,6 +1328,111 @@ class Loop:
         self.log(f"it{self.n} vs {name}: {json.dumps(summary)}")
         self.mark(f"match_{name}", summary)
 
+    # --gate2: the real-clock two-score gate (talisman cluster/gate2_match.sh, hivemind.gate2).
+    @property
+    def gate2_root(self):
+        """RUN/gate2 of the launcher layout runs/full/RUN/runs."""
+        return self.runs.parent / "gate2"
+
+    def gate2_settings(self):
+        """What the gate's networks play (the script's GATE2_* and every net dir's config.json settings)."""
+        return {"games": self.option("gate2_games"), "parts": self.option("gate2_parts"),
+                "base_ms": self.option("gate2_base_ms"), "free_k": self.option("gate2_free_k"),
+                "equal_k": self.option("gate2_equal_k"), "seed_base": self.option("gate2_seed_base"),
+                "opp_sit": self.option("gate2_opp_sit"), "arms": GATE2_ARMS.split()}
+
+    def write_once(self, path, value):
+        """Write `value` as JSON to `path` unless it is there; refuse other content already there."""
+        if path.is_file():
+            try:
+                there = json.loads(path.read_text())
+            except ValueError:
+                there = None
+            if there != value:
+                raise StageFailed(f"{path} holds {there}, not this run's {value}: refused (never mixed)")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.with_suffix(".tmp").write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+        path.with_suffix(".tmp").replace(path)
+
+    def gate2_call(self, script, label, onnx):
+        """One call of the matches script for one network: it submits what is missing and merges what is finished.
+        A failure is logged; the next poll calls it again."""
+        settings = self.gate2_settings()
+        env = {**os.environ, "GATE2_GAMES": str(settings["games"]), "GATE2_PARTS": str(settings["parts"]),
+               "GATE2_BASE_MS": str(settings["base_ms"]), "GATE2_FREE_K": str(settings["free_k"]),
+               "GATE2_EQUAL_K": str(settings["equal_k"]), "GATE2_SEED_BASE": str(settings["seed_base"]),
+               "GATE2_OPP_SIT": settings["opp_sit"], "GATE2_ARMS": GATE2_ARMS}
+        try:
+            result = subprocess.run(["bash", str(script), str(self.runs.parent), label, str(onnx)],
+                                    cwd=script.parent.parent, env=env, capture_output=True, text=True)
+            output, status = result.stdout + result.stderr, result.returncode
+        except OSError as error:
+            output, status = repr(error), 127
+        for line in output.splitlines():
+            self.log(f"it{self.n} gate2: {line}")
+        if status:
+            self.log(f"it{self.n} gate2: {script.name} {label} failed (exit {status}): trying again at the next poll")
+
+    def gate2(self):
+        """Stage gate2 (after match_generator, before promote): poll the matches script for the candidate and the
+        incumbent until both net dirs are done or --gate2-timeout-h has passed since stages/gate2.started, then
+        decide (hivemind.gate2.decide; a timeout is never a promotion)."""
+        if self.done("gate2"):
+            return
+        self.check_stop()
+        stages = self.it / "stages"
+        settings = self.gate2_settings()
+        self.write_once(self.gate2_root / "wave2.json", self.option("wave2_options").as_dict())
+        self.write_once(self.gate2_root / "settings.json", settings)
+        script = gate2_script(self.option("gate2_script"))
+        if script is None:
+            raise StageFailed(f"no gate2 matches script ({self.option('gate2_script') or 'cluster/gate2_match.sh'})")
+        if not (stages / "gate2.started").is_file():
+            (stages / "gate2.started").write_text(f"{time.time()}\n")
+        started = float((stages / "gate2.started").read_text())
+        timeout = 3600 * self.option("gate2_timeout_h")
+        candidate = self.it / "models" / "C.onnx"
+        generator = (stages / "generator").read_text().strip()
+        # The incumbent is the generator this iteration played; its file still is the generator before promotion.
+        incumbent = next((path for path in (self.generator, self.generator_sp1)
+                          if path.is_file() and sha256(path) == generator), None)
+        nets = {"candidate": (f"it{self.n}-candidate", candidate, sha256(candidate)),
+                "incumbent": (f"it{self.n}-incumbent", incumbent, generator)}
+        dirs = {role: self.gate2_root / "nets" / sha[:16] for role, (_, _, sha) in nets.items()}
+        self.log(f"it{self.n} gate2: candidate {dirs['candidate'].name}, incumbent {dirs['incumbent'].name}, "
+                 f"{json.dumps(settings, sort_keys=True)}, timeout {self.option('gate2_timeout_h'):g} h")
+        timed_out = False
+        while True:
+            for role, (label, onnx, _) in nets.items():
+                if (dirs[role] / "done").is_file():
+                    continue
+                if onnx is None:
+                    self.log(f"it{self.n} gate2: no file of the incumbent {generator[:16]} to submit")
+                    continue
+                self.gate2_call(script, label, onnx)
+            if all((d / "done").is_file() for d in dirs.values()):
+                break
+            if time.time() - started >= timeout:
+                timed_out = True
+                break
+            self.check_stop()
+            time.sleep(self.option("gate2_poll_s"))
+        decision = two_score.decide(dirs["candidate"], dirs["incumbent"], self.option("gate2_drop_margin"),
+                                    self.option("gate2_min_pairs"))
+        if timed_out:
+            decision["promoted"] = False
+            decision["reason"] = (f"incomplete: not done after {self.option('gate2_timeout_h'):g} h "
+                                  f"({', '.join(r for r in dirs if not (dirs[r] / 'done').is_file())}); "
+                                  f"{decision['reason']}")
+        marker = {key: decision[key] for key in ("candidate", "incumbent", "arms", "promoted", "reason")}
+        marker["settings"] = {**settings, "drop_margin": self.option("gate2_drop_margin"),
+                              "min_pairs": self.option("gate2_min_pairs"),
+                              "timeout_h": self.option("gate2_timeout_h")}
+        marker["hours"] = round((time.time() - started) / 3600, 3)
+        self.log(f"it{self.n} gate2: {'promote' if decision['promoted'] else 'no promotion'} ({decision['reason']})")
+        self.mark("gate2", marker)
+
     def promote(self):
         if self.done("promote"):
             return
@@ -1163,6 +1445,11 @@ class Loop:
         if decision in ("H0", "H1"):
             promoted = decision == "H1"
         why = f"score {score}" + (f", SPRT {decision}" if "sprt" in result else "")
+        # --gate2: the real-clock two-score gate decides; the 100 ms score stays in the marker for old readers.
+        gate = json.loads((self.it / "stages" / "gate2.done").read_text()) if self.option("gate2") else None
+        if gate is not None:
+            promoted = gate["promoted"]
+            why += f", gate2 {gate['reason']}"
         if promoted:
             install(self.it / "models" / "C.onnx", self.generator)
             install(self.it / "models" / "C.onnx", self.generator_sp1)
@@ -1171,7 +1458,9 @@ class Loop:
         else:
             self.log(f"it{self.n} not promoted ({why}): the generator stays")
         self.mark("promote", {"promoted": promoted, "score": score,
-                              **({"sprt": decision} if "sprt" in result else {})})
+                              **({"sprt": decision} if "sprt" in result else {}),
+                              **({"gate2": {"promoted": gate["promoted"], "arms": gate["arms"],
+                                            "reason": gate["reason"]}} if gate is not None else {})})
 
     def upload(self):
         """Not fatal: the next iteration's upload retries whatever is missing."""
@@ -1482,6 +1771,8 @@ class Loop:
         if not (self.it / "stages" / "generator").is_file():
             if self.option("search_balance"):
                 self.balance_plan()  # first: workers join once the generator marker exists
+            if self.option("league_on"):
+                self.league_plan()  # likewise
             if self.option("shared_selfplay") and not self.done("selfplay_mode"):
                 # Also before the generator marker: a worker that sees the iteration sees how it plays.
                 self.mark("selfplay_mode", {"shared": True, "segment_games": self.args.segment_games})
@@ -1490,6 +1781,9 @@ class Loop:
             self.mark("balance_plan", {"skipped": "the iteration started without --search-balance"})
             self.log(f"it{n}: started without --search-balance: it plays and trains as it began, "
                      f"without balance stages")
+        if self.option("league_on") and not self.done("league_plan"):
+            self.mark("league_plan", {"skipped": "the iteration started without --league/--pace"})
+            self.log(f"it{n}: started without --league/--pace: it plays as it began, without league segments")
         if self.option("shared_selfplay") and not self.done("selfplay_mode"):
             began = self.legacy_segment_games()
             self.mark("selfplay_mode", {"shared": False, "segment_games": began,
@@ -1536,6 +1830,8 @@ class Loop:
                      self.it / "search" / "val_run")
         if self.exchange:
             self.gather()
+        if self.option("think_on"):
+            self.think_labels()
         self.attempt(self.train)
         self.balance_after_train()
         if self.option("no_gate"):
@@ -1544,6 +1840,8 @@ class Loop:
             self.mark("iteration", {"gate": False})
             return
         self.attempt(self.match, "generator", self.generator)
+        if self.option("gate2"):
+            self.attempt(self.gate2)
         self.promote()
         self.balance_finish()
         self.upload()
@@ -1586,7 +1884,12 @@ class Loop:
                     f"{self.option('gate_chunk')} up to {self.option('gate_max_games') or self.args.match_games} games"
                     if self.option("gate_sprt") else "")
                  + (f", search balance (controller {self.balance_controller}, files in "
-                    f"{self.balance_file()})" if self.option("search_balance") else ""))
+                    f"{self.balance_file()})" if self.option("search_balance") else "")
+                 + (f", real-clock gate {self.option('gate2_games')} games a network and arm at "
+                    f"{self.option('gate2_base_ms')} ms (k {self.option('gate2_equal_k')}/"
+                    f"{self.option('gate2_free_k')}, "
+                    f"{gate2_script(self.option('gate2_script'))}, files in {self.gate2_root})"
+                    if self.option("gate2") else ""))
         n = first
         while last is None or n <= last:
             self.iteration(n)
@@ -1628,6 +1931,24 @@ def onnx_input_planes(path):
         return model.graph.input[0].type.tensor_type.shape.dim[1].dim_value or None
     except Exception:
         return None
+
+
+def hook_modules(argv):
+    """{"league": module or None, "think": ...}: a module is imported when one of its flags is given (it must then
+    exist) or for --help (when it exists), so runs without the flags never import it."""
+    wanted = {"league": any(a.startswith(("--league", "--pace")) for a in argv),
+              "think": any(a.startswith("--think") for a in argv)}
+    helping = any(a in ("-h", "--help") for a in argv)
+    modules = {}
+    for name, used in wanted.items():
+        modules[name] = None
+        if used or helping:
+            try:
+                modules[name] = hook(name)
+            except ImportError as error:
+                if used:
+                    sys.exit(f"rl-loop: the {name} flags need hivemind.{name}, which cannot be imported: {error}")
+    return modules
 
 
 def main():
@@ -1771,12 +2092,55 @@ def main():
                              "the chunks and training adds the arrivals loss")
     parser.add_argument("--arrivals-weight", type=float, default=0.05,
                         help="With --wide, the weight of the arrivals loss (default 0.05)")
+    parser.add_argument("--gate2", action="store_true",
+                        help="Promote by the real-clock two-score gate (talisman cluster/gate2_match.sh on PACE, "
+                             "hivemind.gate2) instead of the 100 ms match, which still plays (default: off)")
+    parser.add_argument("--gate2-script", type=Path, default=None,
+                        help="With --gate2, the matches script (default: $HIVEMIND_GATE2_SCRIPT, else "
+                             "cluster/gate2_match.sh of the talisman repo above the fork)")
+    parser.add_argument("--gate2-games", type=even_int, default=400,
+                        help="With --gate2, games per network and arm (default: %(default)s)")
+    parser.add_argument("--gate2-parts", type=positive_int, default=4,
+                        help="With --gate2, jobs per network and arm (default: %(default)s)")
+    parser.add_argument("--gate2-base-ms", type=positive_int, default=60000,
+                        help="With --gate2, each seat's starting clock (default: %(default)s)")
+    parser.add_argument("--gate2-free-k", type=positive_int, default=160,
+                        help="With --gate2, our clock_k in the free arm, think head on (default: %(default)s)")
+    parser.add_argument("--gate2-equal-k", type=positive_int, default=110,
+                        help="With --gate2, our clock_k in the equal arm (default: %(default)s)")
+    parser.add_argument("--gate2-seed-base", type=int, default=7000,
+                        help="With --gate2, part k plays seed SEED_BASE + k (default: %(default)s)")
+    parser.add_argument("--gate2-opp-sit", choices=("observed", "own_k"), default="observed",
+                        help="With --gate2, how our side reads an opponent's sit (default: %(default)s)")
+    parser.add_argument("--gate2-drop-margin", type=float, default=two_score.DROP_MARGIN,
+                        help="With --gate2, a drop is d below minus this and clearly so (default: %(default)s)")
+    parser.add_argument("--gate2-min-pairs", type=positive_int, default=two_score.MIN_PAIRS,
+                        help="With --gate2, shared pairs an arm needs to count (default: %(default)s)")
+    parser.add_argument("--gate2-poll-s", type=float, default=300.0,
+                        help="With --gate2, seconds between calls of the matches script (default: %(default)s)")
+    parser.add_argument("--gate2-timeout-h", type=float, default=10.0,
+                        help="With --gate2, hours after which an unfinished gate does not promote "
+                             "(default: %(default)s)")
     wave2.add_arguments(parser)
+    # Spec v7 hooks: --league/--pace (hivemind.league) and --think-* (hivemind.think) add their own flags.
+    modules = hook_modules(sys.argv[1:])
+    module_dests = {}
+    for name, module in modules.items():
+        if module is not None:
+            before = {action.dest for action in parser._actions}
+            module.add_arguments(parser)
+            module_dests[name] = [action.dest for action in parser._actions if action.dest not in before]
     args = parser.parse_args()
     try:
         args.wave2_options = wave2.from_args(args)
     except ValueError as error:
         parser.error(str(error))
+    for module in modules.values():
+        if module is not None:
+            module.validate(args, parser)
+    args.league_on = modules["league"] is not None and bool(modules["league"].active(args))
+    args.think_on = modules["think"] is not None and any(
+        getattr(args, dest) != parser.get_default(dest) for dest in module_dests.get("think", ()))
     args.label_check = args.label_check == "on"
     if args.wave2:
         args.lr = args.lr or "1e-4"
@@ -1839,6 +2203,30 @@ def main():
             "search_balance_probe_games", "search_balance_minigate_games", "search_balance_gpus",
             "search_balance_device")):
         parser.error("the --search-balance-* options need --search-balance")
+    if args.league_on:
+        if args.search_balance:
+            parser.error("--league/--pace and --search-balance both plan the segments: pick one")
+        if args.distributed:
+            parser.error("--league/--pace plan local segments: use them without --distributed")
+        if not args.wave2 or not args.wave2_options.base_mix:
+            parser.error("--league/--pace need --wave2 and a base mix (real seat clocks)")
+    if args.gate2:
+        if args.no_gate:
+            parser.error("--gate2 is a gate: it does not go with --no-gate")
+        if args.gate2_games % (2 * args.gate2_parts):
+            parser.error("--gate2-games must split into colour-swapped pairs over --gate2-parts")
+        if args.gate2_min_pairs > args.gate2_games // 2:
+            parser.error("--gate2-min-pairs is more pairs than --gate2-games plays")
+        if not (args.gate2_drop_margin >= 0 and args.gate2_poll_s >= 0 and args.gate2_timeout_h > 0):
+            parser.error("--gate2-drop-margin and --gate2-poll-s must be non-negative, --gate2-timeout-h positive")
+        script = gate2_script(args.gate2_script)
+        if script is None:
+            parser.error(f"--gate2: no matches script at "
+                         f"{args.gate2_script or 'cluster/gate2_match.sh above ' + str(PROJECT_ROOT)}")
+        args.gate2_script = script
+    elif any(getattr(args, name) != parser.get_default(name) for name in V7_DEFAULTS
+             if name.startswith("gate2_")):
+        parser.error("the --gate2-* options need --gate2")
 
     args.generator = args.generator.resolve()
     args.generator_checkpoint = args.generator_checkpoint.resolve()
@@ -1882,6 +2270,7 @@ def main():
         own = args.runs / "workers" / re.sub(r"[^A-Za-z0-9._-]", "_", loop.owner)
         own.mkdir(parents=True, exist_ok=True)
         loop.generator_sp1 = own / selfplay.one_worker_copy(args.generator).name
+        loop.opponent_dir = own
         try:
             loop.work()
         finally:
