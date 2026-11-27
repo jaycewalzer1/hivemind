@@ -39,7 +39,12 @@ add_executable(
   test_diag_fixes.cc
   test_hybrid.cc
   test_search_balance.cc
+  test_league_pace.cc
 )
+# Spec v7 WP4's engine test, once it exists.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_think_policy.cc)
+  target_sources(hivemind_tests PRIVATE test_think_policy.cc)
+endif()
 target_link_libraries(hivemind_tests PRIVATE hivemind_lib gtest_main)
 
 include(GoogleTest)

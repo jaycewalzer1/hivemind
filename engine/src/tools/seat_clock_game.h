@@ -462,6 +462,59 @@ public:
         return plannedMs_[seat];
     }
 
+    /**
+     * @brief Spec v7 pace mode: each team plays at pace k (@p teamK, white
+     * then black): a seat's move time is its clock / k, from the start
+     * (replacing the drawn move times, also as the first observed pace).
+     */
+    void apply_pace(const std::array<double, 2>& teamK) {
+        for (int seat = 0; seat < 4; ++seat) {
+            const double k = teamK[static_cast<int>(TimeState::team_of_seat(seat))];
+            const int32_t paced = paced_ms(clockMs_[seat], k, 1.0);
+            moveTimeMs_[seat] = paced;
+            paceMs_[seat] = paced;
+            start_.moveTimesMs[seat] = paced;
+        }
+    }
+
+    /**
+     * Pace mode's plan_cost: draws the jitter and lag exactly as plan_cost
+     * does, then costs @p seat's action at its clock now / @p k x @p scale
+     * (see rescale_pace_cost).
+     */
+    int32_t plan_pace_cost(int seat, double k, double scale, std::mt19937_64& random) {
+        double factor = 1.0;
+        if (options_.paceJitter > 0.0) {
+            const double span = std::log1p(options_.paceJitter);
+            factor = std::exp(std::uniform_real_distribution<double>(-span, span)(random));
+        }
+        int32_t lag = 0;
+        if (options_.lagMaxMs > 0) {
+            lag = std::uniform_int_distribution<int32_t>(0, options_.lagMaxMs)(random);
+        }
+        jitter_[seat] = factor;
+        lag_[seat] = lag;
+        return rescale_pace_cost(seat, k, scale);
+    }
+
+    /**
+     * Re-costs @p seat's planned action at think scale @p scale with the
+     * draws plan_pace_cost made: max(minMoveMs, clock / k x scale x jitter)
+     * + lag. The seat's move time becomes the unjittered clock / k x scale,
+     * so its pass cap (PassCapK x move time) follows the pace.
+     */
+    int32_t rescale_pace_cost(int seat, double k, double scale) {
+        const double paced = static_cast<double>(clockMs_[seat]) / k * scale;
+        moveTimeMs_[seat] = paced_ms(clockMs_[seat], k, scale);
+        int64_t cost = std::max<int64_t>(options_.minMoveMs, std::llround(paced * jitter_[seat]));
+        cost += lag_[seat];
+        plannedMs_[seat] = static_cast<int32_t>(std::min<int64_t>(cost, TimeState::MAX_LEAD_MS));
+        return plannedMs_[seat];
+    }
+
+    /** The planned cost of @p seat's current decision. */
+    int32_t planned_ms(int seat) const { return plannedMs_[seat]; }
+
     /** @p seat decided to move: it lands after its planned cost. */
     void commit_move(int seat) {
         lastDecisionMs_[seat] = nowMs_;
@@ -685,6 +738,12 @@ public:
     }
 
 private:
+    static int32_t paced_ms(int32_t clockMs, double k, double scale) {
+        const double paced = static_cast<double>(clockMs) / k * scale;
+        return static_cast<int32_t>(std::clamp<double>(std::llround(paced), 1.0,
+                                                       static_cast<double>(TimeState::MAX_LEAD_MS)));
+    }
+
     void come_on_turn(int seat) {
         kind_[seat] = EventType::DECIDE;
         eventAt_[seat] = nowMs_;
@@ -730,6 +789,9 @@ private:
     Stockfish::Color tieNext_ = Stockfish::WHITE;
     int lastCapture_ = -1;
     bool wideInputs_ = false;
+    // Pace mode: the jitter factor and lag plan_pace_cost drew per seat.
+    std::array<double, 4> jitter_{1.0, 1.0, 1.0, 1.0};
+    std::array<int32_t, 4> lag_{0, 0, 0, 0};
     std::array<int64_t, 2> lastLandMs_{0, 0};
     std::vector<Landing> landings_;
 };

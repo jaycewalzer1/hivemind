@@ -2,7 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 #include "search/search_params.h"
@@ -10,6 +14,48 @@
 #include "tools/seat_clock_game.h"
 
 class Engine;
+
+/**
+ * @brief Spec v7 pace mode (docs/custom_engine_spec_v7_league.md section 5):
+ * per game each team draws a pace k log-uniformly from [kMin, kMax]; a
+ * decision then costs the deciding seat's clock / k (x the think scale s)
+ * and searches clamp(N x (refK / k) x s x clock / base, minNodes, maxNodes)
+ * nodes, N the jittered --nodes. kMin 0 is off.
+ */
+struct PaceSampling {
+    int32_t kMin = 0;
+    int32_t kMax = 0;
+    double refK = 110.0;
+    size_t minNodes = 200;
+    size_t maxNodes = 3200;
+
+    bool active() const { return kMin > 0; }
+};
+
+/** Pace mode's node budget for a decision (see PaceSampling). */
+inline size_t pace_node_budget(const PaceSampling& pace, size_t baseNodes, double k, double scale,
+                               int32_t clockMs, int32_t baseMs) {
+    const double nodes = static_cast<double>(baseNodes) * (pace.refK / k) * scale
+        * static_cast<double>(std::max(0, clockMs)) / static_cast<double>(std::max(1, baseMs));
+    const double clamped = std::clamp(std::round(nodes), static_cast<double>(pace.minNodes),
+                                      static_cast<double>(pace.maxNodes));
+    return std::max<size_t>(1, static_cast<size_t>(clamped));
+}
+
+/// What SelfPlayConfig::searchObserver sees of a search (tests).
+struct SearchObservation {
+    int team = 0;               // 0 white, 1 black
+    bool opponent = false;      // the league's opponent, on its own engines
+    size_t jitteredNodes = 0;   // N: --nodes with its jitter
+    size_t targetNodes = 0;     // the search's budget
+    double k = 0.0;             // the team's pace (0 without pace mode)
+    double thinkScale = 1.0;
+    int32_t baseMs = 0;
+    std::array<bool, 4> deciding{};
+    std::array<int32_t, 4> clocksMs{};
+    std::array<int32_t, 4> plannedMs{};
+    std::array<int32_t, 4> moveTimesMs{};
+};
 
 struct SelfPlayConfig {
     size_t games = 1;
@@ -89,6 +135,28 @@ struct SelfPlayConfig {
     // root exactly. Empty: off.
     std::filesystem::path recordStateOutput;
 
+    // Spec v7 (section 5), all off by default; off, a run is byte-identical
+    // to a build without them (nothing new is drawn from a game's stream).
+    // Pace mode (seat-clock games): the cost and budget of every decision
+    // follow the team's pace; replaces --seat-move-times' move times.
+    PaceSampling pace;
+    // League games: run_selfplay is given a second engine set (the
+    // opponent's network). Per game one team is the learner (-1: drawn from
+    // the game's stream, 0 white, 1 black); only its searched decisions are
+    // written. opponentK > 0 fixes the opponent team's pace (pace mode).
+    int learnerTeam = -1;
+    int32_t opponentK = 0;
+    // Scale each searched decision's budget by the think_gain head of the
+    // deciding team's network (tools/think_policy.h): nodes, and in pace
+    // mode the cost too. A network without the head searches at scale 1.
+    bool thinkPolicy = false;
+    // Tests: called before every search of a seat-clock game.
+    std::function<void(const SearchObservation&)> searchObserver;
+
+    bool league_options_changed() const {
+        return pace.active() || thinkPolicy || learnerTeam != -1 || opponentK != 0;
+    }
+
     size_t fast_nodes() const { return fastNodes == 0 ? nodes : fastNodes; }
     bool cap_active() const {
         return deepFraction > 0.0 || fast_nodes() != nodes || fastPolicyMask == 1;
@@ -124,7 +192,13 @@ inline uint64_t selfplay_seed(uint64_t seed, uint64_t value) {
     return seed ^ (value ^ (value >> 31));
 }
 
-int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& config);
+/**
+ * Plays config.games self-play games. @p opponentEngines non-empty makes
+ * them league games (spec v7): one opponent engine per main engine, the
+ * opponent team searching on them.
+ */
+int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& config,
+                 const std::vector<Engine*>& opponentEngines = {});
 class Board;
 struct RootEdgeStats;
 namespace distill { struct PolicyEntry; }

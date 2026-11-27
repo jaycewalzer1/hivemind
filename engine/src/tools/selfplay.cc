@@ -38,6 +38,14 @@
 #include "tools/distill_data.h"
 #include "tools/selfplay_policy.h"
 #include "tools/seat_clock_game.h"
+// Spec v7 6.3 (WP4): the think_gain head's budget scale. Without the header
+// --think-policy true is refused (run_selfplay).
+#if __has_include("tools/think_policy.h")
+#include "tools/think_policy.h"
+#define HIVEMIND_HAS_THINK_POLICY 1
+#else
+#define HIVEMIND_HAS_THINK_POLICY 0
+#endif
 
 namespace {
 
@@ -68,11 +76,21 @@ struct TrainingSample {
     int8_t outcome = 0;
     uint8_t wdl = 1;
     float rootQ = 0.0f;
+    // League games (spec v7): the searched decisions of both teams from
+    // this record's to the game's end, the moves-left count of a game whose
+    // opponent records are not written. 0: the records left (decisions_left).
+    size_t decisionsLeft = 0;
     std::array<uint8_t, NB_INPUT_VALUES()> planes{};
     std::vector<SparsePolicyEntry> policyA;
     std::vector<SparsePolicyEntry> policyB;
     std::vector<SparseJointPolicyEntry> jointPolicy;
 };
+
+/// The moves-left count of record @p index: the game's records from it to the end, or in a
+/// league game every searched decision from it (both teams), so the target keeps its scale.
+size_t decisions_left(const std::vector<TrainingSample>& samples, size_t index) {
+    return samples[index].decisionsLeft > 0 ? samples[index].decisionsLeft : samples.size() - index;
+}
 
 struct PgnMove {
     std::string token;
@@ -639,6 +657,10 @@ struct SeatClockRow {
     std::array<int32_t, 2> boardElapsed{};
     std::array<int, 20> recent{};
     std::array<int, 20> arrivals{};
+    // Spec v7 (pace / league / think policy runs only): the record team's
+    // pace k (0 without pace mode) and the search's think scale.
+    double k = 0.0;
+    double thinkScale = 1.0;
 };
 
 struct SeatClockSummary {
@@ -650,7 +672,24 @@ struct SeatClockSummary {
     std::vector<SeatClockRow> rows;
     // Spec v6 (--hybrid-mode): what the hybrid did in this game.
     HybridGameStats hybrid;
+    // Spec v7: the teams' paces (white, black; 0 without pace mode), the
+    // learner team of a league game (-1: none), and the think scales of the
+    // searches whose records were written (with --think-policy; searches of
+    // a network without the head count as missing, at scale 1).
+    std::array<double, 2> teamK{0.0, 0.0};
+    int learnerTeam = -1;
+    double thinkScaleSum = 0.0;
+    uint64_t thinkSearches = 0;
+    uint64_t thinkMissing = 0;
+
+    double mean_think_scale() const {
+        return thinkSearches > 0 ? thinkScaleSum / static_cast<double>(thinkSearches) : 1.0;
+    }
 };
+
+const char* team_name(int team) {
+    return team == 0 ? "white" : "black";
+}
 
 const char* seat_name(int seat) {
     static const char* const names[4] = {"Aw", "Ab", "Bw", "Bb"};
@@ -666,12 +705,21 @@ std::string four(const Values& values) {
     return text.str();
 }
 
-void write_seat_tags(std::ostream& stream, const SeatClockSummary& seats) {
+void write_seat_tags(std::ostream& stream, const SeatClockSummary& seats, bool spec7) {
     stream << "[BaseMs \"" << seats.start.baseMs << "\"]\n"
            << "[StartClocksMs \"" << four(seats.start.clocksMs) << "\"]\n"
            << "[SeatMoveTimesMs \"" << four(seats.start.moveTimesMs) << "\"]\n"
            << "[FinalClocksMs \"" << four(seats.finalClocks) << "\"]\n"
            << "[GameMs \"" << seats.gameMs << "\"]\n";
+    if (spec7) {
+        // Spec v7: the teams' paces, the league's learner team, the mean think scale.
+        stream << "[KWhiteTeam \"" << std::llround(seats.teamK[0]) << "\"]\n"
+               << "[KBlackTeam \"" << std::llround(seats.teamK[1]) << "\"]\n"
+               << "[LearnerTeam \"" << (seats.learnerTeam < 0 ? "none" : team_name(seats.learnerTeam))
+               << "\"]\n"
+               << "[MeanThinkScale \"" << std::fixed << std::setprecision(3)
+               << seats.mean_think_scale() << "\"]\n" << std::defaultfloat;
+    }
 }
 
 /**
@@ -684,7 +732,7 @@ void write_seat_tags(std::ostream& stream, const SeatClockSummary& seats) {
  * record team's view, each P N B R Q (SeatClockRow).
  */
 void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
-                     const SeatClockSummary& seats) {
+                     const SeatClockSummary& seats, bool spec7) {
     const bool fresh = !std::filesystem::exists(path);
     std::ofstream stream(path, std::ios::app);
     if (!stream) {
@@ -703,6 +751,9 @@ void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
                 }
             }
         }
+        if (spec7) {
+            stream << "\tk_team\tthink_scale";
+        }
         stream << '\n';
     }
     for (const SeatClockRow& row : seats.rows) {
@@ -718,6 +769,10 @@ void write_seat_rows(const std::filesystem::path& path, size_t gameNumber,
             for (int count : *counts) {
                 stream << '\t' << count;
             }
+        }
+        if (spec7) {
+            stream << '\t' << std::llround(row.k) << '\t' << std::fixed << std::setprecision(4) << row.thinkScale
+                   << std::defaultfloat;
         }
         stream << '\n';
     }
@@ -735,7 +790,8 @@ void append_pgn(
     const std::string& termination,
     const TimeState& initialTime,
     const TimeState& finalTime,
-    const SeatClockSummary* seats = nullptr) {
+    const SeatClockSummary* seats = nullptr,
+    bool spec7 = false) {
     std::ofstream stream(path, std::ios::app);
     if (!stream) {
         throw std::runtime_error("Unable to append " + path.string());
@@ -765,7 +821,7 @@ void append_pgn(
         stream << "[TimeAdvantage \"" << (startingTeam == 0 ? "Hivemind-B" : "Hivemind-A") << "\"]\n";
     }
     if (seats) {
-        write_seat_tags(stream, *seats);
+        write_seat_tags(stream, *seats, spec7);
     }
     stream << "[RawPolicyMacroPlies \"" << rawPolicyMacroPlies << "\"]\n"
            << "[RawPolicyEvents \"" << rawPolicyEvents << "\"]\n"
@@ -925,7 +981,7 @@ void write_state_lines(const std::filesystem::path& path, size_t gameNumber,
         uint16_t movesLeft = 0;
         if (finished) {
             wdl[static_cast<size_t>(outcome + 1)] = 1;
-            const size_t remaining = std::min<size_t>(samples.size() - index, 100);
+            const size_t remaining = std::min<size_t>(decisions_left(samples, index), 100);
             movesLeft = resigned ? distill::MOVES_LEFT_UNKNOWN
                                  : distill::half_bits(__float2half_rn(
                                        static_cast<float>(remaining) / 100.0f));
@@ -1118,7 +1174,45 @@ struct SeatClockGameResult {
     uint64_t planCarryApplied = 0;
     uint64_t planCarryRecorded = 0;
     std::map<std::string, uint64_t> planCarryDrops;
+    // Spec v7: every search of the game (both teams), and the league's
+    // opponent searches (not written).
+    uint64_t searches = 0;
+    uint64_t opponentSearches = 0;
 };
+
+/**
+ * @brief Spec v7 think policy: the budget scale of @p team's decision, the
+ * largest think_scale over the boards whose seats decide now. False (scale
+ * 1) when the network has no think_gain head.
+ */
+bool think_policy_scale(Engine& engine, Board& board, Stockfish::Color team, const TimeState& clock,
+                        const std::array<bool, 4>& deciding, double& scale) {
+    scale = 1.0;
+#if HIVEMIND_HAS_THINK_POLICY
+    std::array<float, 2> gain{};
+    if (!evaluate_think_gain(engine, board, team, clock, gain)) {
+        return false;
+    }
+    const ThinkPolicy policy;
+    double best = 0.0;
+    bool any = false;
+    for (int seat = 0; seat < 4; ++seat) {
+        if (deciding[seat]) {
+            best = std::max(best, think_scale(policy, gain[seat / 2]));
+            any = true;
+        }
+    }
+    scale = any ? best : 1.0;
+    return true;
+#else
+    (void)engine;
+    (void)board;
+    (void)team;
+    (void)clock;
+    (void)deciding;
+    return false;
+#endif
+}
 
 /**
  * @brief A wave 2 self-play game on four real seat clocks (--base-mix).
@@ -1139,6 +1233,7 @@ struct SeatClockGameResult {
 SeatClockGameResult play_seat_clock_game(
     const SelfPlayConfig& config,
     const std::vector<Engine*>& threadEngines,
+    const std::vector<Engine*>& opponentEngines,
     Agent (&agents)[2],
     RawPolicyEvaluator& rawPolicyEvaluator,
     std::vector<__half>& distillPlanes,
@@ -1162,6 +1257,35 @@ SeatClockGameResult play_seat_clock_game(
         && (config.resignDisableFraction <= 0.0
             || std::uniform_real_distribution<double>(0.0, 1.0)(randomEngine) >= config.resignDisableFraction);
     const bool checksResign = !canResign && config.resignThreshold < 0.0f;
+    // Spec v7, drawn after everything above and only when on, so a run
+    // without these options draws exactly what it always did. League: the
+    // learner team; pace mode: each team's k (white, then black).
+    const bool league = !opponentEngines.empty();
+    const bool pace = config.pace.active();
+    int learner = -1;
+    if (league) {
+        learner = config.learnerTeam >= 0
+            ? config.learnerTeam : (std::bernoulli_distribution(0.5)(randomEngine) ? 1 : 0);
+        result.seats.learnerTeam = learner;
+    }
+    std::array<double, 2> teamK{0.0, 0.0};
+    if (pace) {
+        for (double& k : teamK) {
+            k = sample_log_uniform(config.pace.kMin, config.pace.kMax, randomEngine);
+        }
+        if (league && config.opponentK > 0) {
+            teamK[1 - learner] = config.opponentK;
+        }
+        game.apply_pace(teamK);
+        result.seats.start = game.start();
+        result.seats.teamK = teamK;
+    }
+    // The league's learner keeps agents[0], its opponent agents[1] (each
+    // agent always searches on the same network); else one agent per team.
+    auto agent_index = [league, learner](Stockfish::Color team) -> size_t {
+        const int index = team == Stockfish::WHITE ? 0 : 1;
+        return league ? (index == learner ? 0 : 1) : static_cast<size_t>(index);
+    };
     std::array<size_t, 2> consecutiveResignPlies = {0, 0};
     size_t decisions = 0;
     for (Agent& teamAgent : agents) {
@@ -1242,13 +1366,18 @@ SeatClockGameResult play_seat_clock_game(
         if (decisions >= config.maxMacroPlies) {
             break;
         }
+        const double k = teamK[team == Stockfish::WHITE ? 0 : 1];
         for (int seat = 0; seat < 4; ++seat) {
             if (event.seats[seat]) {
-                game.plan_cost(seat, randomEngine);
+                if (pace) {
+                    game.plan_pace_cost(seat, k, 1.0, randomEngine);
+                } else {
+                    game.plan_cost(seat, randomEngine);
+                }
             }
         }
-        const TimeState clock = game.search_clock(team, sides, event.seats);
-        const bool hasTimeAdvantage = clock.can_sit(team);
+        TimeState clock = game.search_clock(team, sides, event.seats);
+        bool hasTimeAdvantage = clock.can_sit(team);
         JointActionCandidate action;
         bool searched = false;
         bool hybridSit = false;
@@ -1268,6 +1397,27 @@ SeatClockGameResult play_seat_clock_game(
             rawInitializationActive = false;
         }
         if (!rawInitializationActive) {
+            // Spec v7: the league's opponent searches on its own engines,
+            // and only the learner's searches are written.
+            const bool opponent = league && static_cast<int>(team) != learner;
+            const std::vector<Engine*>& teamEngines = opponent ? opponentEngines : threadEngines;
+            double thinkScale = 1.0;
+            bool thinkMissing = false;
+            if (config.thinkPolicy) {
+                thinkMissing = !think_policy_scale(*teamEngines.front(), board, team, clock,
+                                                   event.seats, thinkScale);
+                if (pace && thinkScale != 1.0) {
+                    // The scale moves the cost: re-cost with this decision's
+                    // draws; the search's clock follows.
+                    for (int seat = 0; seat < 4; ++seat) {
+                        if (event.seats[seat]) {
+                            game.rescale_pace_cost(seat, k, thinkScale);
+                        }
+                    }
+                    clock = game.search_clock(team, sides, event.seats);
+                    hasTimeAdvantage = clock.can_sit(team);
+                }
+            }
             const GameStatus status = adjudicate_game(board, team, clock);
             if (status != GameStatus::ONGOING) {
                 result.winner = adjudicated_winner(status, team);
@@ -1284,13 +1434,27 @@ SeatClockGameResult play_seat_clock_game(
                 sample.planes = encode_planes(board, team, clock);
             }
             const size_t teamIndex = team == Stockfish::WHITE ? 0 : 1;
-            Agent& agent = agents[teamIndex];
+            Agent& agent = agents[agent_index(team)];
             const bool teamTreeReuse = config.wave2.teamTreeReuse;
             if (!teamTreeReuse) {
                 agent.reset_search_state();
             }
             SearchOptions searchOptions;
-            const size_t baseNodes = randomized_node_budget(config, randomEngine);
+            const size_t jitteredNodes = randomized_node_budget(config, randomEngine);
+            size_t baseNodes = jitteredNodes;
+            if (pace) {
+                // Spec v7: the budget follows the pace and the clock left
+                // (the deciding seats' larger clock, as the cost does).
+                int32_t clockNow = 0;
+                for (int seat = 0; seat < 4; ++seat) {
+                    clockNow = event.seats[seat] ? std::max(clockNow, game.clock_ms(seat)) : clockNow;
+                }
+                baseNodes = pace_node_budget(config.pace, baseNodes, k, thinkScale, clockNow,
+                                             game.start().baseMs);
+            } else if (config.thinkPolicy) {
+                baseNodes = std::max<size_t>(1, static_cast<size_t>(std::llround(
+                    static_cast<double>(baseNodes) * thinkScale)));
+            }
             // Playout cap: with it off, the base budget and configured noise.
             const CapDecision cap = cap_decision(config, runId, gameIndex, decisions, baseNodes);
             searchOptions.targetNodes = cap.targetNodes;
@@ -1346,7 +1510,14 @@ SeatClockGameResult play_seat_clock_game(
                 state.masked = cap.masked;
             }
             const JointActionCandidate choice = agent.run_search(
-                board, threadEngines, team, hasTimeAdvantage, searchOptions);
+                board, teamEngines, team, hasTimeAdvantage, searchOptions);
+            ++result.searches;
+            result.opponentSearches += opponent ? 1 : 0;
+            if (!opponent && config.thinkPolicy) {
+                result.seats.thinkScaleSum += thinkScale;
+                ++result.seats.thinkSearches;
+                result.seats.thinkMissing += thinkMissing ? 1 : 0;
+            }
             if (teamTreeReuse && agent.team_tree_reuse().attempted) {
                 ++result.teamTreeSearches;
                 if (agent.team_tree_reuse().adopted) {
@@ -1375,6 +1546,25 @@ SeatClockGameResult play_seat_clock_game(
                 result.winner = adjudicated_winner(agent.search_status(), team);
                 result.termination = adjudicated_termination(agent.search_status());
                 break;
+            }
+            // Tests: every search that decided (and so wrote a record, unless
+            // it was the league opponent's).
+            if (config.searchObserver) {
+                SearchObservation seen;
+                seen.team = static_cast<int>(teamIndex);
+                seen.opponent = opponent;
+                seen.jitteredNodes = jitteredNodes;
+                seen.targetNodes = searchOptions.targetNodes;
+                seen.k = k;
+                seen.thinkScale = thinkScale;
+                seen.baseMs = game.start().baseMs;
+                seen.deciding = event.seats;
+                seen.clocksMs = game.clocks_ms();
+                for (int seat = 0; seat < 4; ++seat) {
+                    seen.plannedMs[seat] = game.planned_ms(seat);
+                    seen.moveTimesMs[seat] = game.move_time_ms(seat);
+                }
+                config.searchObserver(seen);
             }
             std::vector<RootEdgeStats> edges = agent.root_edge_stats();
             if (edges.empty()) {
@@ -1427,17 +1617,23 @@ SeatClockGameResult play_seat_clock_game(
                     record.policy[0].clear();
                     record.policy[1].clear();
                 }
-                result.distillRecords.push_back(std::move(record));
+                if (!opponent) {
+                    result.distillRecords.push_back(std::move(record));
+                }
             }
-            if (config.cap_active()) {
+            if (config.cap_active() && !opponent) {
                 ++result.cap.counts.records;
                 result.cap.counts.deep += cap.deep ? 1 : 0;
                 result.cap.counts.masked += cap.masked ? 1 : 0;
                 (cap.deep ? result.cap.counts.deepVisits : result.cap.counts.fastVisits) += actualVisits;
             }
-            if (!config.recordStateOutput.empty()) {
+            if (!config.recordStateOutput.empty() && !opponent) {
                 state.visits = sample.nodes;
                 result.cap.states.push_back(state);
+            }
+            if (league) {
+                // Turned into the decisions left at the game's end.
+                sample.decisionsLeft = static_cast<size_t>(result.searches - 1);
             }
             SeatClockRow row;
             row.sample = result.samples.size();
@@ -1454,8 +1650,12 @@ SeatClockGameResult play_seat_clock_game(
             row.recent = pocket_landing_counts(game.landings(), team,
                                                game.now_ms() - RECENT_LANDING_WINDOW_MS,
                                                game.now_ms(), MAX_RECENT_LANDINGS);
-            result.seats.rows.push_back(row);
-            result.samples.push_back(std::move(sample));
+            row.k = k;
+            row.thinkScale = thinkScale;
+            if (!opponent) {
+                result.seats.rows.push_back(row);
+                result.samples.push_back(std::move(sample));
+            }
 
             // Playout cap: only full-budget searches judge resigning.
             if (cap.feedsResign && checksResign && result.wouldResignTeam < 0) {
@@ -1531,6 +1731,12 @@ SeatClockGameResult play_seat_clock_game(
             game.landings(), row.team == 0 ? Stockfish::WHITE : Stockfish::BLACK,
             row.timeMs, row.timeMs + RECENT_LANDING_WINDOW_MS);
     }
+    if (league) {
+        // Each record's moves-left count: every search from its own on.
+        for (TrainingSample& sample : result.samples) {
+            sample.decisionsLeft = static_cast<size_t>(result.searches) - sample.decisionsLeft;
+        }
+    }
     result.seats.finalClocks = game.clocks_ms();
     result.seats.finalWhiteLeadMs = game.white_lead_ms();
     result.seats.gameMs = game.now_ms();
@@ -1578,7 +1784,8 @@ std::vector<distill::PolicyEntry> selfplay_distill_policy(
     return distill_search_policy(board, boardNumber, onTurn, edges);
 }
 
-int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& config) {
+int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& config,
+                 const std::vector<Engine*>& opponentEngines) {
     if (config.games == 0 || config.nodes == 0 || config.maxMacroPlies == 0) {
         throw std::invalid_argument("games, nodes, and max-macro-plies must be positive");
     }
@@ -1602,6 +1809,47 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         || config.fastPolicyMask < -1 || config.fastPolicyMask > 1) {
         throw std::invalid_argument("Invalid playout cap configuration");
     }
+    // Spec v7: pace mode, league games and the think policy.
+    const bool league = !opponentEngines.empty();
+    if (config.pace.active()) {
+        if (config.pace.kMin < 1 || config.pace.kMax < config.pace.kMin || config.pace.kMax > 100000
+            || !(config.pace.refK > 0.0) || config.pace.minNodes < 1
+            || config.pace.maxNodes < config.pace.minNodes) {
+            throw std::invalid_argument("Pace mode needs 1 <= --pace-k-min <= --pace-k-max, --pace-ref-k > 0"
+                                        " and 1 <= --pace-min-nodes <= --pace-max-nodes");
+        }
+    } else if (config.pace.kMax != 0) {
+        throw std::invalid_argument("--pace-k-max needs --pace-k-min");
+    }
+    if ((config.pace.active() || league) && !config.wave2.seat_clocks()) {
+        throw std::invalid_argument("--pace-k-min and --opponent-model need seat clocks (--base-mix)");
+    }
+    if (!league && (config.learnerTeam != -1 || config.opponentK != 0)) {
+        throw std::invalid_argument("--learner-team and --opponent-k need --opponent-model");
+    }
+    if (config.learnerTeam < -1 || config.learnerTeam > 1 || config.opponentK < 0) {
+        throw std::invalid_argument("Invalid --learner-team or --opponent-k");
+    }
+    if (config.opponentK != 0 && !config.pace.active()) {
+        throw std::invalid_argument("--opponent-k needs pace mode (--pace-k-min)");
+    }
+    if (config.thinkPolicy && !HIVEMIND_HAS_THINK_POLICY) {
+        throw std::invalid_argument(
+            "--think-policy true needs tools/think_policy.h (spec v7 WP4), which this build lacks");
+    }
+    if (league) {
+        std::set<Engine*> all(engines.begin(), engines.end());
+        all.insert(opponentEngines.begin(), opponentEngines.end());
+        if (opponentEngines.size() != engines.size() || all.count(nullptr)
+            || all.size() != engines.size() + opponentEngines.size()) {
+            throw std::invalid_argument("League self-play needs one distinct opponent engine per engine");
+        }
+        if (opponentEngines.front()->wideInputs() != engines.front()->wideInputs()) {
+            // The game hands both teams the same clock planes.
+            throw std::invalid_argument("The opponent network must match the learner's inputs (wide or not)");
+        }
+    }
+    const bool spec7 = config.pace.active() || league || config.thinkPolicy;
     const bool checkpointing = config.checkpointGames > 0;
     if ((checkpointing || config.resume) && config.writeTrainingChunks) {
         throw std::invalid_argument("Self-play checkpoints need --training-chunks false");
@@ -1801,6 +2049,11 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     // Spec v6 (--hybrid-mode): what the hybrid did, over all games.
     std::mutex hybridMutex;
     HybridGameStats hybridTotals;
+    // Spec v7 --think-policy, over the written searches (guarded by hybridMutex).
+    double thinkScaleTotal = 0.0;
+    uint64_t thinkSearchTotal = 0;
+    uint64_t thinkMissingTotal = 0;
+    std::atomic<uint64_t> opponentSearches{0};
     const auto writeGame = [&](size_t gameNumber, FinishedGame& game) {
         if (distillWriter) {
             // Finished games give WDL (loss, draw, win) and moves-left targets
@@ -1818,7 +2071,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 if (finished) {
                     record.wdl = {0.0f, 0.0f, 0.0f};
                     record.wdl[static_cast<size_t>(game.samples[index].outcome + 1)] = 1.0f;
-                    const size_t remaining = std::min<size_t>(game.samples.size() - index, 100);
+                    const size_t remaining = std::min<size_t>(decisions_left(game.samples, index), 100);
                     record.movesLeft = resigned
                         ? distill::MOVES_LEFT_UNKNOWN
                         : distill::half_bits(
@@ -1848,9 +2101,9 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             pgnPath, gameNumber + 1, game.pgnMoves, game.winner, game.startingTeam,
             game.rawPolicyMacroPlies, game.rawPolicyEvents,
             config.initialClockSeconds, game.termination,
-            game.initialTime, game.finalTime, game.seats ? &*game.seats : nullptr);
+            game.initialTime, game.finalTime, game.seats ? &*game.seats : nullptr, spec7);
         if (game.seats) {
-            write_seat_rows(seatRowsPath, gameNumber, *game.seats);
+            write_seat_rows(seatRowsPath, gameNumber, *game.seats, spec7);
         }
         if (checkpointing) {
             const size_t done = gameNumber + 1;
@@ -1896,6 +2149,30 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 std::lock_guard lock(hybridMutex);
                 hybridTotals.add(hybrid);
             }
+            if (spec7) {
+                // Spec v7 (hivemind.league.segment_summary reads these):
+                // the teams' paces, the league's learner and its result,
+                // the mean think scale of the written searches.
+                if (config.pace.active()) {
+                    std::cout << " k_white_team " << std::llround(seats.teamK[0])
+                              << " k_black_team " << std::llround(seats.teamK[1]);
+                }
+                if (seats.learnerTeam >= 0) {
+                    const char* learnerResult = game.winner < 0 ? "draw"
+                        : game.winner == seats.learnerTeam ? "win" : "loss";
+                    std::cout << " learner_team " << team_name(seats.learnerTeam)
+                              << " learner_result " << learnerResult;
+                }
+                if (config.thinkPolicy) {
+                    std::cout << " mean_s " << std::fixed << std::setprecision(3)
+                              << seats.mean_think_scale() << std::defaultfloat << " think_missing "
+                              << seats.thinkMissing;
+                    std::lock_guard lock(hybridMutex);
+                    thinkScaleTotal += seats.thinkScaleSum;
+                    thinkSearchTotal += seats.thinkSearches;
+                    thinkMissingTotal += seats.thinkMissing;
+                }
+            }
         } else if (game.initialTime.is_clocked()) {
             std::cout << " lead " << game.initialTime.lead_ms(Stockfish::WHITE)
                       << "->" << game.finalTime.lead_ms(Stockfish::WHITE) << " ms";
@@ -1918,7 +2195,8 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
         }
         std::cout << std::flush;
     };
-    auto playGames = [&](const std::vector<Engine*>& threadEngines) {
+    auto playGames = [&](const std::vector<Engine*>& threadEngines,
+                         const std::vector<Engine*>& threadOpponents) {
         std::vector<__half> distillPlanes(NB_INPUT_VALUES());
         Engine& rawPolicyEngine = *threadEngines.front();
         RawPolicyEvaluator rawPolicyEvaluator(
@@ -1982,8 +2260,9 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
             const bool recordStates = !config.recordStateOutput.empty();
             if (config.wave2.seat_clocks()) {
                 SeatClockGameResult played = play_seat_clock_game(
-                    config, threadEngines, agents, rawPolicyEvaluator, distillPlanes,
+                    config, threadEngines, threadOpponents, agents, rawPolicyEvaluator, distillPlanes,
                     distillWriter != nullptr, runId, gameIndex, randomEngine);
+                opponentSearches.fetch_add(played.opponentSearches, std::memory_order_relaxed);
                 samples = std::move(played.samples);
                 distillRecords = std::move(played.distillRecords);
                 pgnMoves = std::move(played.pgnMoves);
@@ -2264,7 +2543,7 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
                 sample.outcome = winner < 0 ? 0 : (sample.team == winner ? 1 : -1);
                 sample.wdl = static_cast<uint8_t>(sample.outcome + 1);
                 sample.movesLeft = static_cast<uint16_t>(std::min<size_t>(
-                    samples.size() - index, std::numeric_limits<uint16_t>::max()));
+                    decisions_left(samples, index), std::numeric_limits<uint16_t>::max()));
             }
             // Hand the game to the writer; games are written in index order, but a
             // finished thread starts its next game instead of waiting for earlier
@@ -2287,13 +2566,15 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     };
 
     if (gameThreads == 1) {
-        playGames(engines);
+        playGames(engines, opponentEngines);
     } else {
         std::vector<std::thread> threads;
         for (size_t threadIndex = 0; threadIndex < gameThreads; ++threadIndex) {
             threads.emplace_back([&, threadIndex] {
                 try {
-                    playGames({engines[threadIndex]});
+                    playGames({engines[threadIndex]},
+                              league ? std::vector<Engine*>{opponentEngines[threadIndex]}
+                                     : std::vector<Engine*>{});
                 } catch (...) {
                     const std::lock_guard<std::mutex> lock(outputMutex);
                     if (!failure) {
@@ -2366,6 +2647,16 @@ int run_selfplay(const std::vector<Engine*>& engines, const SelfPlayConfig& conf
     }
     if (config.wave2.hybrid.mode != HybridMode::OFF) {
         std::cout << "selfplay hybrid: " << hybridTotals.summary() << '\n';
+    }
+    if (league) {
+        std::cout << "selfplay league: learner records only, " << opponentSearches.load()
+                  << " opponent searches not written" << '\n';
+    }
+    if (config.thinkPolicy) {
+        std::cout << "selfplay think policy: mean scale " << std::fixed << std::setprecision(3)
+                  << (thinkSearchTotal > 0 ? thinkScaleTotal / static_cast<double>(thinkSearchTotal) : 1.0)
+                  << " over " << thinkSearchTotal << " searches, " << thinkMissingTotal
+                  << " without a think_gain head" << std::defaultfloat << '\n';
     }
     if (resignChecks > 0) {
         std::cout << "selfplay resign check: " << resignChecks

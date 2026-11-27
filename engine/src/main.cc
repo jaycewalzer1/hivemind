@@ -187,6 +187,16 @@ void printUsage(const char* progName) {
     cout << "    --hybrid-max-wait-ms <0..10000> --hybrid-min-clock-ms <0..600000> (defaults 1000, 3000)" << endl;
     cout << "    --hybrid-margin-permille <0..1000> --hybrid-pass-prior-permille <0..1000> (defaults 20, 150)" << endl;
     cout << "    tournament only: --hybrid-side both|contender|baseline (default both)" << endl;
+    cout << "    Spec v7, pace and league (docs/custom_engine_spec_v7_league.md; selfplay, --base-mix; all off):" << endl;
+    cout << "    --pace-k-min <k> --pace-k-max <k> (pace mode: each team draws k log-uniformly per game; a" << endl;
+    cout << "      decision costs clock / k and searches --nodes x (ref / k) x clock / base; 0 = off)" << endl;
+    cout << "    --pace-ref-k <k> --pace-min-nodes <n> --pace-max-nodes <n> (defaults 110, 200, 3200)" << endl;
+    cout << "    --opponent-model <onnx> (league games: the opponent team searches with this network;" << endl;
+    cout << "      only the learner team's decisions are written)" << endl;
+    cout << "    --learner-team random|white|black (default random per game) --opponent-k <k> (fix the" << endl;
+    cout << "      opponent team's pace in pace mode; 0 = drawn like the learner's)" << endl;
+    cout << "    --think-policy <bool> (scale each search's budget, and in pace mode its cost, by the" << endl;
+    cout << "      network's think_gain head; default false)" << endl;
     cout << "  searchdiag         Root candidates of searches at several node budgets, per FEN" << endl;
     cout << "    --model <onnx> --fens <file> --output <jsonl> --budgets 50,200,800 --positions <n> --every <n>" << endl;
     cout << "  reanalyse [options] Re-search the roots of selfplay --record-state-output as HDST records" << endl;
@@ -355,6 +365,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1 && string(argv[1]) == "selfplay") {
         SelfPlayConfig config;
         filesystem::path modelPath;
+        filesystem::path opponentPath;
         try {
             for (int i = 2; i < argc; ++i) {
                 const string option = argv[i];
@@ -402,6 +413,21 @@ int main(int argc, char* argv[]) {
                 else if (option == "--deep-dirichlet") config.deepDirichlet = parse_bool_argument(value);
                 else if (option == "--cap-seed-salt") config.capSeedSalt = stoull(value, nullptr, 0);
                 else if (option == "--record-state-output") config.recordStateOutput = value;
+                // Spec v7 pace mode, league games and the think policy, off by default.
+                else if (option == "--pace-k-min") config.pace.kMin = stoi(value);
+                else if (option == "--pace-k-max") config.pace.kMax = stoi(value);
+                else if (option == "--pace-ref-k") config.pace.refK = stod(value);
+                else if (option == "--pace-min-nodes") config.pace.minNodes = stoull(value);
+                else if (option == "--pace-max-nodes") config.pace.maxNodes = stoull(value);
+                else if (option == "--opponent-model") opponentPath = value;
+                else if (option == "--opponent-k") config.opponentK = stoi(value);
+                else if (option == "--think-policy") config.thinkPolicy = parse_bool_argument(value);
+                else if (option == "--learner-team") {
+                    if (value == "random") config.learnerTeam = -1;
+                    else if (value == "white") config.learnerTeam = 0;
+                    else if (value == "black") config.learnerTeam = 1;
+                    else throw invalid_argument("--learner-team expects random/white/black, got: " + value);
+                }
                 else if (parse_clock_option(option, value, config.clockModel, config.clock)) {}
                 else if (parse_wave2_option(option, value, config.wave2)) {}
                 else throw invalid_argument("Unknown selfplay option: " + option);
@@ -454,6 +480,32 @@ int main(int argc, char* argv[]) {
             cerr << "Failed to load an engine on any CUDA device" << endl;
             return EXIT_FAILURE;
         }
+        // Spec v7 league games: the opponent's network, one engine beside each main engine.
+        vector<Engine*> opponentEngines;
+        if (!opponentPath.empty()) {
+            if (!filesystem::is_regular_file(opponentPath)) {
+                cerr << "Opponent model not found: " << opponentPath << endl;
+                return EXIT_FAILURE;
+            }
+            for (int deviceId = 0; deviceId < deviceCount; ++deviceId) {
+                for (size_t copy = 0; copy < enginesPerDevice; ++copy) {
+                    auto engine = make_unique<Engine>(deviceId, config.batchSize);
+                    const string engineFile = getEnginePath(
+                        opponentPath.string(), "fp16", config.batchSize, deviceId, "v3");
+                    if (!engine->loadNetwork(opponentPath.string(), engineFile)) {
+                        cerr << "Failed to load the opponent engine on device " << deviceId << endl;
+                        return EXIT_FAILURE;
+                    }
+                    opponentEngines.push_back(engine.get());
+                    ownedEngines.push_back(std::move(engine));
+                }
+            }
+            if (opponentEngines.size() != engines.size()) {
+                cerr << "Failed to load an opponent engine beside every engine" << endl;
+                return EXIT_FAILURE;
+            }
+            cout << "League self-play against " << opponentPath.string() << endl;
+        }
         cout << "Self-play using " << engines.size() << " inference engine(s)" << endl;
         cout << "Fairy-Stockfish mate search "
              << (config.fairyStockfishMateNodes > 0
@@ -462,7 +514,7 @@ int main(int argc, char* argv[]) {
                  : "disabled")
              << endl;
         try {
-            return run_selfplay(engines, config);
+            return run_selfplay(engines, config, opponentEngines);
         } catch (const exception& error) {
             cerr << "Self-play failed: " << error.what() << endl;
             return EXIT_FAILURE;
