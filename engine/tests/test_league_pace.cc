@@ -15,6 +15,7 @@
 #include "common/globals.h"
 #include "common/utils.h"
 #include "nn/engine.h"
+#include "search/search_params.h"
 #include "tools/distill_data.h"
 #include "tools/seat_clock_game.h"
 #include "tools/selfplay.h"
@@ -262,10 +263,13 @@ TEST_F(LeaguePaceSelfPlay, OffModeKeepsBudgetsOutputsAndColumns) {
     const std::string rows = read_text(root / "off" / "games" / "seat_clocks.tsv");
     EXPECT_EQ(rows.find("k_team"), std::string::npos);
     EXPECT_EQ(read_text(root / "off" / "games" / "games.pgn").find("KWhiteTeam"), std::string::npos);
-    // The observer is only a probe: the same run without it writes the same records.
-    SelfPlayConfig again = config("off2", 2);
-    run(again);
-    EXPECT_EQ(count_records(root / "off"), count_records(root / "off2"));
+    // The observer is only a probe: the same run without it writes the same records. Only a one-worker build
+    // replays a game exactly (with several search workers a search's visits, so the game, vary from run to run).
+    if (SearchParams::NUM_SEARCH_THREADS == 1) {
+        SelfPlayConfig again = config("off2", 2);
+        run(again);
+        EXPECT_EQ(count_records(root / "off"), count_records(root / "off2"));
+    }
 }
 
 TEST_F(LeaguePaceSelfPlay, PaceSetsCostAndNodesPerDecision) {
